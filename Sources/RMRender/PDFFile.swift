@@ -38,6 +38,11 @@ public indirect enum PDFObject: Sendable, Equatable {
         }
     }
 
+    var integerValue: Int? {
+        if case .integer(let value) = self { return value }
+        return nil
+    }
+
     public var doubleValue: Double? {
         switch self {
         case .integer(let value): Double(value)
@@ -79,9 +84,10 @@ public indirect enum PDFObject: Sendable, Equatable {
 public enum PDFReadError: Error, Sendable, Equatable {
     case notAPDF
     case encrypted
-    /// A cross-reference of a kind this reader does not do: a stream rather
-    /// than a table. Both live documents examined carry tables, so
-    /// streams wait for a document that needs them.
+    /// Non-default page units require scaling that this renderer does not implement.
+    case unsupportedUserUnit
+    /// Not thrown: cross-reference streams are read. Kept so that callers
+    /// switching over the cases still compile.
     case crossReferenceStream
     case malformed(String)
 }
@@ -92,13 +98,18 @@ public enum PDFReadError: Error, Sendable, Equatable {
 /// this type exists precisely so that one need not be held in memory.
 public struct PDFFile: Sendable {
     public let bytes: Data
-    /// Object number to its offset in the file. Newer sections win, which is
+    /// Uncompressed object number to its offset. Packed objects are resolved by
+    /// `object(_:)` through their container. Newer sections win, which is
     /// what makes an already incrementally updated file read correctly.
     public let offsets: [Int: Int]
+    /// Generations of the live objects in the newest revision.
+    public let generations: [Int: Int]
+    private let compressed: [Int: (stream: Int, index: Int)]
     public let trailer: [String: PDFObject]
     /// Where the file's newest cross-reference section begins. An incremental
     /// update has to name it as its `/Prev`, or a reader stops at the update
     /// and sees a document of the few objects it changed.
+    var usesCrossReferenceStreams: Bool { !compressed.isEmpty || trailer["XRefStm"] != nil || trailer["Type"] != nil }
     let lastCrossReference: Int
 
     public init(url: URL) throws {
@@ -110,6 +121,9 @@ public struct PDFFile: Sendable {
         self.bytes = bytes
 
         var offsets: [Int: Int] = [:]
+        var generations: [Int: Int] = [:]
+        var compressed: [Int: (stream: Int, index: Int)] = [:]
+        var objects: Set<Int> = []
         var trailer: [String: PDFObject] = [:]
         let newest = try PDFFile.lastStartxref(in: bytes)
         lastCrossReference = newest
@@ -119,13 +133,18 @@ public struct PDFFile: Sendable {
         // Newest section first, so an object met again is an older version of
         // itself and must not overwrite what is already known.
         while let start = next {
-            guard !seen.contains(start) else {
+            guard seen.count < 256, !seen.contains(start) else {
                 throw PDFReadError.malformed("the cross-reference sections form a loop")
             }
             seen.insert(start)
             let section = try PDFFile.readSection(bytes: bytes, at: start)
-            for (number, offset) in section.offsets where offsets[number] == nil {
-                offsets[number] = offset
+            guard objects.count + section.numbers.count <= 1_000_000 else {
+                throw PDFReadError.malformed("xref object limit")
+            }
+            for number in section.numbers where objects.insert(number).inserted {
+                offsets[number] = section.offsets[number]
+                generations[number] = section.generations[number]
+                compressed[number] = section.compressed[number]
             }
             for (key, value) in section.trailer where trailer[key] == nil {
                 trailer[key] = value
@@ -149,6 +168,8 @@ public struct PDFFile: Sendable {
         guard trailer["Encrypt"] == nil else { throw PDFReadError.encrypted }
         guard trailer["Root"] != nil else { throw PDFReadError.malformed("the trailer has no /Root") }
         self.offsets = offsets
+        self.generations = generations
+        self.compressed = compressed
         self.trailer = trailer
     }
 
@@ -194,8 +215,11 @@ public struct PDFFile: Sendable {
     }
 
     private struct Section {
+        let numbers: Set<Int>
+        let generations: [Int: Int]
         let offsets: [Int: Int]
         let trailer: [String: PDFObject]
+        var compressed: [Int: (stream: Int, index: Int)] = [:]
     }
 
     /// The highest object number a file may name. The format writes them in
@@ -217,12 +241,12 @@ public struct PDFFile: Sendable {
         }
         var scanner = PDFScanner(bytes: bytes, index: place)
         guard scanner.readKeyword("xref") else {
-            // A cross-reference stream begins with `<n> <g> obj`. Named as
-            // itself, so the caller hears the real reason.
-            throw PDFReadError.crossReferenceStream
+            return try readStreamSection(bytes: bytes, at: start)
         }
 
         var offsets: [Int: Int] = [:]
+        var generations: [Int: Int] = [:]
+        var numbers: Set<Int> = []
         while true {
             scanner.skipWhitespace()
             if scanner.readKeyword("trailer") { break }
@@ -230,21 +254,27 @@ public struct PDFFile: Sendable {
                   case .integer(let count)? = try scanner.nextObject(),
                   first >= 0, count >= 0,
                   first <= PDFFile.objectNumberLimit,
-                  count <= PDFFile.objectNumberLimit - first
+                  count <= PDFFile.objectNumberLimit - first, count <= 1_000_000 - numbers.count
             else {
                 throw PDFReadError.malformed("a cross-reference subsection without its heading")
             }
             for row in 0..<count {
                 guard case .integer(let offset)? = try scanner.nextObject(),
-                      case .integer? = try scanner.nextObject(),
+                      case .integer(let generation)? = try scanner.nextObject(),
+                      (0...65535).contains(generation),
                       let kind = scanner.readKeywordCharacter()
                 else {
                     throw PDFReadError.malformed("a cross-reference row could not be read")
                 }
                 // `f` is a free entry: the object is not there at all, and the
                 // number in it is the next free one rather than a place.
-                if kind == UInt8(ascii: "n"), offsets[first + row] == nil {
+                guard numbers.insert(first + row).inserted,
+                      kind == UInt8(ascii: "n") || kind == UInt8(ascii: "f") else {
+                    throw PDFReadError.malformed("duplicate or invalid cross-reference row")
+                }
+                if kind == UInt8(ascii: "n") {
                     offsets[first + row] = offset
+                    generations[first + row] = generation
                 }
             }
         }
@@ -252,17 +282,138 @@ public struct PDFFile: Sendable {
         guard case .dictionary(let trailer)? = try scanner.nextObject() else {
             throw PDFReadError.malformed("the trailer is not a dictionary")
         }
-        return Section(offsets: offsets, trailer: trailer)
+        var compressed: [Int: (stream: Int, index: Int)] = [:]
+        if let hybrid = trailer["XRefStm"] {
+            guard let offset = crossReferenceOffset(hybrid, in: bytes), offset != start else {
+                throw PDFReadError.malformed("invalid hybrid xref offset")
+            }
+            let extra = try readStreamSection(bytes: bytes, at: offset)
+            guard extra.trailer["Encrypt"] == nil else { throw PDFReadError.encrypted }
+            for number in extra.numbers {
+                numbers.insert(number)
+                offsets[number] = extra.offsets[number]
+                generations[number] = extra.generations[number]
+                compressed[number] = extra.compressed[number]
+            }
+        }
+        return Section(numbers: numbers, generations: generations, offsets: offsets, trailer: trailer, compressed: compressed)
+    }
+
+    private static func readStreamSection(bytes: Data, at start: Int) throws -> Section {
+        guard let place = place(in: bytes, at: start) else { throw PDFReadError.malformed("xref stream offset") }
+        var scanner = PDFScanner(bytes: bytes, index: place)
+        guard let number = try scanner.nextObject()?.integerValue, number > 0, number <= objectNumberLimit,
+              let generation = try scanner.nextObject()?.integerValue, (0...65535).contains(generation),
+              scanner.readKeyword("obj"),
+              case .stream(let dictionary, let raw) = try scanner.nextObject(), scanner.readKeyword("endobj"),
+              case .name("XRef") = dictionary["Type"],
+              let size = dictionary["Size"]?.integerValue, size > 0, size <= objectNumberLimit,
+              case .array(let fields) = dictionary["W"], fields.count == 3 else {
+            throw PDFReadError.malformed("invalid xref stream")
+        }
+        let widths = fields.compactMap(\.integerValue)
+        guard widths.count == 3, widths.allSatisfy({ (0...8).contains($0) }), widths.reduce(0, +) > 0 else {
+            throw PDFReadError.malformed("xref field widths")
+        }
+        var indices = [0, size]
+        if let index = dictionary["Index"] {
+            guard case .array(let values) = index else { throw PDFReadError.malformed("xref Index") }
+            indices = values.compactMap(\.integerValue)
+            guard indices.count == values.count else { throw PDFReadError.malformed("xref Index values") }
+        }
+        guard indices.count.isMultiple(of: 2), !indices.isEmpty else { throw PDFReadError.malformed("xref Index pairs") }
+        let data = [UInt8](try PDFStreamCodec.decode(dictionary, raw))
+        var cursor = 0
+        var offsets: [Int: Int] = [:], generations: [Int: Int] = [:]
+        var compressed: [Int: (stream: Int, index: Int)] = [:]
+        var numbers: Set<Int> = []
+        func field(_ width: Int, default fallback: Int = 0) throws -> Int {
+            if width == 0 { return fallback }
+            guard width <= data.count - cursor else { throw PDFReadError.malformed("short xref stream") }
+            var value: UInt64 = 0
+            for _ in 0..<width { value = (value << 8) | UInt64(data[cursor]); cursor += 1 }
+            guard value <= Int.max else { throw PDFReadError.malformed("xref field overflow") }
+            return Int(value)
+        }
+        for i in stride(from: 0, to: indices.count, by: 2) {
+            let first = indices[i], count = indices[i + 1]
+            guard first >= 0, count >= 0, first <= size, count <= size - first,
+                  count <= 1_000_000 - numbers.count,
+                  count <= (data.count - cursor) / widths.reduce(0, +) else {
+                throw PDFReadError.malformed("xref range")
+            }
+            for id in first..<(first + count) {
+                guard numbers.insert(id).inserted else { throw PDFReadError.malformed("duplicate xref entry") }
+                let kind = try field(widths[0], default: 1), value = try field(widths[1]), extra = try field(widths[2])
+                switch kind {
+                case 0: guard extra <= 65535 else { throw PDFReadError.malformed("xref free generation") }
+                case 1:
+                    guard value > 0, value < bytes.count, extra <= 65535 else { throw PDFReadError.malformed("xref object offset") }
+                    offsets[id] = value; generations[id] = extra
+                case 2:
+                    guard value > 0, value < size else { throw PDFReadError.malformed("object stream number") }
+                    compressed[id] = (value, extra); generations[id] = 0
+                default: throw PDFReadError.malformed("unknown xref entry type")
+                }
+            }
+        }
+        guard cursor == data.count else { throw PDFReadError.malformed("xref trailing data") }
+        return Section(numbers: numbers, generations: generations, offsets: offsets, trailer: dictionary, compressed: compressed)
     }
 
     /// The object with this number, parsed.
     public func object(_ number: Int) throws -> PDFObject {
+        try object(number, reading: [])
+    }
+
+    private func object(_ number: Int, reading: Set<Int>) throws -> PDFObject {
+        guard reading.count < 64, !reading.contains(number) else {
+            throw PDFReadError.malformed("cyclic or excessively deep stream length reference")
+        }
+        if let location = compressed[number] {
+            guard case .stream(let dictionary, let raw) = try object(location.stream, reading: reading.union([number])),
+                  case .name("ObjStm") = dictionary["Type"],
+                  let count = dictionary["N"]?.integerValue, count > 0, count <= 1_000_000,
+                  let first = dictionary["First"]?.integerValue, first >= 0,
+                  location.index >= 0, location.index < count else {
+                throw PDFReadError.malformed("invalid object stream")
+            }
+            let data = try PDFStreamCodec.decode(dictionary, raw)
+            guard first <= data.count else { throw PDFReadError.malformed("object stream header length") }
+            var header = PDFScanner(bytes: data, index: data.startIndex)
+            var positions: [(Int, Int)] = []
+            var seen: Set<Int> = []
+            for _ in 0..<count {
+                guard let id = try header.nextObject()?.integerValue, id > 0, id <= Self.objectNumberLimit,
+                      seen.insert(id).inserted, let offset = try header.nextObject()?.integerValue,
+                      offset >= 0, offset < data.count - first,
+                      positions.last.map({ offset > $0.1 }) ?? true else {
+                    throw PDFReadError.malformed("invalid object stream index")
+                }
+                positions.append((id, offset))
+            }
+            guard header.index <= first, positions[location.index].0 == number else {
+                throw PDFReadError.malformed("object stream index mismatch")
+            }
+            let start = first + positions[location.index].1
+            let end = location.index + 1 < count ? first + positions[location.index + 1].1 : data.count
+            let body = Data(data[start..<end])
+            var scanner = PDFScanner(bytes: body, index: 0)
+            guard let value = try scanner.nextObject() else { throw PDFReadError.malformed("empty compressed object") }
+            scanner.skipWhitespace()
+            guard scanner.index == body.count else { throw PDFReadError.malformed("compressed object trailing data") }
+            return value
+        }
         guard let offset = offsets[number],
               let place = PDFFile.place(in: bytes, at: offset)
         else { return .null }
         var scanner = PDFScanner(bytes: bytes, index: place)
+        scanner.lengthResolver = { value in
+            try streamLength(value, reading: reading.union([number]))
+        }
         guard case .integer(let stated)? = try scanner.nextObject(),
-              case .integer? = try scanner.nextObject(),
+              case .integer(let generation)? = try scanner.nextObject(),
+              generation == generations[number],
               scanner.readKeyword("obj")
         else {
             throw PDFReadError.malformed("object \(number) is not where the table says")
@@ -270,13 +421,32 @@ public struct PDFFile: Sendable {
         guard stated == number else {
             throw PDFReadError.malformed("object \(number) calls itself \(stated)")
         }
-        return try scanner.nextObject() ?? .null
+        let value = try scanner.nextObject() ?? .null
+        guard scanner.readKeyword("endobj") else {
+            throw PDFReadError.malformed("object \(number) has no endobj terminator")
+        }
+        return value
+    }
+
+    private func streamLength(_ value: PDFObject, reading: Set<Int>) throws -> Int {
+        if case .integer(let length) = value, length >= 0 { return length }
+        if case .reference(let number, let generation) = value {
+            guard generations[number] == generation else {
+                throw PDFReadError.malformed("invalid stream length reference generation")
+            }
+            let resolved = try object(number, reading: reading)
+            return try streamLength(resolved, reading: reading.union([number]))
+        }
+        throw PDFReadError.malformed("stream length must resolve to a nonnegative integer")
     }
 
     /// The value itself: a reference is followed, anything else is returned.
     public func resolve(_ object: PDFObject?) throws -> PDFObject {
         guard let object else { return .null }
-        guard case .reference(let number, _) = object else { return object }
+        guard case .reference(let number, let generation) = object else { return object }
+        guard generations[number] == generation else {
+            throw PDFReadError.malformed("reference to a missing object or wrong generation")
+        }
         return try self.object(number)
     }
 
@@ -335,8 +505,11 @@ public struct PDFFile: Sendable {
             }
             visited.insert(number)
 
-            guard let dictionary = try object(number).dictionaryValue else {
+            guard let dictionary = try resolve(next.node).dictionaryValue else {
                 throw PDFReadError.malformed("object \(number) in the page tree is not a dictionary")
+            }
+            if let unit = dictionary["UserUnit"], try resolve(unit).doubleValue != 1 {
+                throw PDFReadError.unsupportedUserUnit
             }
             let ownResources = dictionary["Resources"] ?? next.resources
             let ownBox = try rectangle(dictionary["MediaBox"]) ?? next.mediaBox
@@ -400,6 +573,8 @@ public struct PDFFile: Sendable {
 /// Deliberately small: enough to walk a page tree and copy dictionaries
 /// across, not an implementation of the whole format.
 struct PDFScanner: Sendable {
+    /// Installed only by the file reader; a standalone scanner has no object table.
+    var lengthResolver: (@Sendable (PDFObject) throws -> Int)?
     private let bytes: Data
     public private(set) var index: Data.Index
 
@@ -642,6 +817,9 @@ struct PDFScanner: Sendable {
             guard let value = try nextObject(depth: depth + 1) else {
                 throw PDFReadError.malformed("the key /\(key) without a value")
             }
+            guard entries[key] == nil else {
+                throw PDFReadError.malformed("duplicate dictionary key /\(key)")
+            }
             entries[key] = value
         }
 
@@ -650,18 +828,20 @@ struct PDFScanner: Sendable {
             index = saved
             return .dictionary(entries)
         }
-        // The keyword is followed by CRLF or LF, and by nothing else.
+        // Consume only the stream's required line ending, never payload whitespace.
+        guard current == 0x0D || current == 0x0A else {
+            throw PDFReadError.malformed("stream keyword has no line ending")
+        }
         if current == 0x0D { index += 1 }
         if current == 0x0A { index += 1 }
         let start = index
-        guard let length = entries["Length"]?.intValue, length >= 0 else {
-            // A stream whose length hides behind a reference. The dictionary
-            // is still worth something — the caller decides.
-            //
-            // Negative counts among those: `bytes[start..<start - 5]` is a
-            // range whose ends are the wrong way round, and that traps rather
-            // than throws.
-            throw PDFReadError.malformed("a stream whose /Length is not a plain number")
+        let length: Int
+        if let value = entries["Length"], let lengthResolver {
+            length = try lengthResolver(value)
+        } else if case .integer(let direct)? = entries["Length"], direct >= 0 {
+            length = direct
+        } else {
+            throw PDFReadError.malformed("stream length must be a nonnegative integer")
         }
         // The addition itself is the hazard — `/Length 9223372036854775807`
         // overflows on the way to being compared with the end of the file.
@@ -670,6 +850,9 @@ struct PDFScanner: Sendable {
             throw PDFReadError.malformed("a stream that runs past the end of the file")
         }
         index = end
+        guard readKeyword("endstream") else {
+            throw PDFReadError.malformed("stream length does not end at endstream")
+        }
         return .stream(dictionary: entries, data: bytes[start..<end])
     }
 }

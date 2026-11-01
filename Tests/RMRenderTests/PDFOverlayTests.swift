@@ -595,7 +595,10 @@ func overlayKeepsGraphicsStateNamesPerPage() throws {
     let pages = try file.pages()
     func state(onPage index: Int) throws -> [String: PDFObject] {
         let resources = try #require(try file.resolve(pages[index].resources).dictionaryValue)
-        let states = try #require(try file.resolve(resources["ExtGState"]).dictionaryValue)
+        let objects = try #require(try file.resolve(resources["XObject"]).dictionaryValue)
+        let form = try #require(try file.resolve(objects["RMOverlay"]).dictionaryValue)
+        let scoped = try #require(try file.resolve(form["Resources"]).dictionaryValue)
+        let states = try #require(try file.resolve(scoped["ExtGState"]).dictionaryValue)
         return try #require(try file.resolve(states[marker.name]).dictionaryValue)
     }
 

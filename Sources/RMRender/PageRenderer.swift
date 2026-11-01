@@ -64,7 +64,7 @@ public enum PageRenderer {
     ///
     /// Bump it together with any change to the drawing or to the numbers in
     /// `Calibration`. Never reuse a number.
-    public static let version = 94
+    public static let version = 95
 
     /// The pages as a PDF held in memory.
     ///
@@ -82,6 +82,7 @@ public enum PageRenderer {
         assets: [String: Data] = [:],
         author: String? = nil
     ) throws -> Data {
+        try PageAssets.validate(assets, for: pages)
         guard let buffer = CFDataCreateMutable(nil, 0),
               let consumer = CGDataConsumer(data: buffer)
         else {
@@ -111,6 +112,7 @@ public enum PageRenderer {
         inkOnly: Bool = false,
         grayscale: Bool = false
     ) throws -> CGImage {
+        if !inkOnly { try PageAssets.validate(assets, for: [page]) }
         // Grown as a PDF page grows (`grownSheet`, shared with
         // `pdf(pages:pageSize:paper:...)` above), but never cut: a page
         // stretched with the tablet's "extend page" runs its ink past
@@ -192,6 +194,7 @@ public enum PageRenderer {
         author: String? = nil,
         to url: URL
     ) throws {
+        try PageAssets.validate(assets, for: pages)
         guard let consumer = CGDataConsumer(url: url as CFURL) else {
             throw RenderError.pdfContextUnavailable
         }
@@ -773,7 +776,7 @@ public enum PageRenderer {
 
     /// The attachment's bytes as an image. PNG and JPEG are what the format
     /// carries — captures as PNG, insertions as what was inserted.
-    private static func decodeImage(_ data: Data) -> CGImage? {
+    static func decodeImage(_ data: Data) -> CGImage? {
         guard let provider = CGDataProvider(data: data as CFData) else { return nil }
         let decoded: CGImage?
         if data.starts(with: [0x89, 0x50, 0x4E, 0x47]) {

@@ -236,6 +236,35 @@ in the PDFs it writes. They are under the SIL Open Font License; each family's
 licence file lies beside it in `Sources/RMRender/Fonts`. The CJK files are most
 of the package's size.
 
+## Annotated PDFs
+
+`AnnotatedPDFRenderer` first tries an **incremental update**: the marks are
+appended to the original file, so its links, outline and text stay as they
+were. Strokes become PDF operators; typed text, images
+and erased strokes are drawn by the same `PageRenderer` as a fresh export and
+imported as a Form. Quarter-turn page rotations, shifted origins and a
+`CropBox` are kept, and ink that runs past the page grows the box shown.
+
+When the update cannot be made — a page added, removed or reordered on the
+tablet, a hidden source page, or an encrypted file — the document is **drawn
+afresh**. A fresh export keeps URI and in-document links and the outline,
+remapped through the new page order, but not other annotations, forms or
+signatures.
+
+Some files are refused rather than changed silently:
+
+- a document with certification permissions (`/Perms`) is not redrawn
+  automatically; pass `allowOverlay: false` to ask for a fresh export, which
+  does not keep the certification;
+- a page with a `/UserUnit` other than 1;
+- an attachment that is present but is not a decodable image. A missing one is
+  left out; ink-only bitmaps do not decode images at all.
+
+The reader handles cross-reference tables and streams, hybrid files, packed
+objects and indirect stream lengths, with bounded decompression and checks on
+generations, references and byte ranges. Output is written to a temporary file
+and moved into place when complete.
+
 ## PDF tagging
 
 Off by default:

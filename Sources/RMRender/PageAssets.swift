@@ -22,10 +22,21 @@ import RMLines
 /// held together while the pages are drawn, so it is their total that has to
 /// fit. See `PageRenderer.maximumAssetBytes`.
 ///
-/// Nothing here throws. A missing attachment costs its own image and nothing
-/// else — the page is still drawn, with a hole where the picture stood, which
-/// is the outcome the drawing already survives.
+/// Gathering does not throw: a missing attachment costs only its own image.
+/// Export validation is separate and rejects present bytes that cannot be
+/// decoded, so corruption is not silently reported as a successful export.
 enum PageAssets {
+    /// Missing files may be omitted; present but undecodable images must not
+    /// turn into silent holes in an otherwise successful export.
+    static func validate(_ assets: [String: Data], for pages: [RMPage]? = nil) throws {
+        let wanted = pages.map { Set($0.flatMap { $0.images.map(\.file) }) }
+        for name in assets.keys.sorted() where wanted?.contains(name) != false {
+            guard let data = assets[name], PageRenderer.decodeImage(data) != nil else {
+                throw RenderError.malformedPage("attachment is not a supported, valid image: \(name)")
+            }
+        }
+    }
+
     /// - Parameters:
     ///   - pages: the parsed pages whose images name the attachments wanted.
     ///   - index: the document's files, which state each blob's size before

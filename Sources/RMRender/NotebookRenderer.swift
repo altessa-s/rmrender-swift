@@ -486,6 +486,7 @@ public struct NotebookRenderer: Sendable {
         // precedence exists — would otherwise have its turn silently overruled
         // and come out upright.
         let assets = await assets(for: pages, index: index, owner: documentID)
+        try PageAssets.validate(assets)
         return ParsedNotebook(
             pages: pages,
             pageSize: Self.canvas(declared: declared ?? layout.pageSize, isLandscape: layout.isLandscape),
