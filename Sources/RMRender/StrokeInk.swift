@@ -109,9 +109,8 @@ public extension Stroke {
     /// float32 is not a thin stroke but no width at all, so it takes the floor
     /// rather than the ceiling.
     ///
-    /// Internal on purpose. It was internal in the package it came from, and
-    /// a member of a `public extension` is public unless it says otherwise —
-    /// which would have made a rounding helper part of the API by accident.
+    /// Internal on purpose: a member of a `public extension` is public unless
+    /// it says otherwise, and a rounding helper is not part of the API.
     internal static func clamp(_ width: Double) -> Double {
         guard width.isFinite else { return InkScale.minimumStrokeWidth }
         return min(
