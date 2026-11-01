@@ -1,0 +1,41 @@
+{
+  "name": "Chord boxes",
+  "orientation": "portrait",
+  "categories": ["Creative"],
+  "constants": [
+    {"boxWidth": 208},
+    {"boxHeight": 238},
+    {"gap": 89},
+    {"room": "(templateWidth - 120 + gap) / (boxWidth + gap)"},
+    {"across": "room >= 4 ? 4 : room >= 3 ? 3 : room >= 2 ? 2 : 1"},
+    {"left": "templateWidth / 2 - (boxWidth * across + gap * (across - 1)) / 2"},
+    {"fits": "(templateHeight - 154 - 238 - 20) / 339 + 1"}
+  ],
+  "items": [
+    {
+      "type": "group",
+      "boundingBox": {"x": "left", "y": 154, "width": "boxWidth + gap", "height": "boxHeight + 101"},
+      "repeat": {"rows": "fits < 5 ? fits : 5", "columns": "across"},
+      "children": [
+        {
+          "type": "path",
+          "data": ["M", 0, 0, "L", 0, 238, "M", 41.6, 0, "L", 41.6, 238, "M", 83.2, 0, "L", 83.2, 238, "M", 124.8, 0, "L", 124.8, 238, "M", 166.4, 0, "L", 166.4, 238, "M", 208, 0, "L", 208, 238]
+        },
+        {
+          "type": "path",
+          "data": ["M", 0, 47.6, "L", 208, 47.6, "M", 0, 95.2, "L", 208, 95.2, "M", 0, 142.8, "L", 208, 142.8, "M", 0, 190.4, "L", 208, 190.4, "M", 0, 238, "L", 208, 238]
+        },
+        {
+          "type": "path",
+          "data": ["M", 0, 0, "L", 208, 0],
+          "strokeWidth": 5,
+          "strokeColor": "#5A5A5A"
+        },
+        {
+          "type": "path",
+          "data": ["M", 40, -34, "L", 168, -34]
+        }
+      ]
+    }
+  ]
+}

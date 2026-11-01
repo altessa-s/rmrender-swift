@@ -1,0 +1,48 @@
+{
+  "name": "Storyboard, one frame",
+  "orientation": "portrait",
+  "categories": ["Creative"],
+  "constants": [
+    {"fitWidth": "(templateWidth - 60) / 1164"},
+    {"fitDepth": "(templateHeight - 20) / 1679"},
+    {"fit": "fitWidth < fitDepth ? fitWidth : fitDepth"},
+    {"scale": "fit < 1 ? fit : 1"},
+    {"left": "templateWidth / 2 - 1164 * scale / 2"},
+    {"frameWidth": "1164 * scale"},
+    {"frameHeight": "859 * scale"},
+    {"gap": "0 * scale"}
+  ],
+  "items": [
+    {
+      "type": "group",
+      "boundingBox": {"x": 0, "y": 0, "height": "templateHeight"},
+      "repeat": {"rows": "down"},
+      "children": [
+        {
+          "type": "group",
+          "boundingBox": {"x": "left", "y": "100 * scale", "width": "frameWidth + gap"},
+          "repeat": {"rows": 1, "columns": 1},
+          "children": [
+            {
+              "type": "path",
+              "data": ["M", 0, 0, "L", "0 + frameWidth", 0, "L", "0 + frameWidth", "0 + frameHeight", "L", 0, "0 + frameHeight", "Z"],
+              "strokeWidth": 1.5,
+              "strokeColor": "#8C8C8C"
+            },
+            {
+              "type": "group",
+              "boundingBox": {"x": 0, "y": "955 * scale", "width": "frameWidth", "height": "104 * scale"},
+              "repeat": {"rows": 7},
+              "children": [
+                {
+                  "type": "path",
+                  "data": ["M", 0, 0, "L", "frameWidth", 0]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

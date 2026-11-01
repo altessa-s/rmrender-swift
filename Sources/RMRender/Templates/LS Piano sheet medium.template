@@ -1,0 +1,48 @@
+{
+  "name": "Grand staff, medium",
+  "orientation": "landscape",
+  "categories": ["Creative"],
+  "constants": [
+    {"compact": "templateWidth < 1000 || templateHeight < 1000"},
+    {"span": "templateWidth - 120 < 1594 ? templateWidth - 120 : 1594"},
+    {"top": "compact ? 120 : 214"},
+    {"fits": "(templateHeight - top - 248 - 20) / 360 + 1"},
+    {"space": 22},
+    {"between": 160},
+    {"depth": 248},
+    {"left": "templateWidth / 2 - span / 2 + 10.15"}
+  ],
+  "items": [
+    {
+      "type": "group",
+      "boundingBox": {"x": "left", "y": "top", "width": "span", "height": 360},
+      "repeat": {"rows": "fits < 3 ? fits : 3"},
+      "children": [
+        {
+          "type": "path",
+          "data": ["M", 0, 0, "L", "parentWidth", 0, "M", 0, 22, "L", "parentWidth", 22, "M", 0, 44, "L", "parentWidth", 44, "M", 0, 66, "L", "parentWidth", 66, "M", 0, 88, "L", "parentWidth", 88]
+        },
+        {
+          "type": "group",
+          "boundingBox": {"x": 0, "y": "between", "width": "span"},
+          "children": [
+            {
+              "type": "path",
+              "data": ["M", 0, 0, "L", "parentWidth", 0, "M", 0, 22, "L", "parentWidth", 22, "M", 0, 44, "L", "parentWidth", 44, "M", 0, 66, "L", "parentWidth", 66, "M", 0, 88, "L", "parentWidth", 88]
+            }
+          ]
+        },
+        {
+          "type": "path",
+          "data": ["M", 0, 0, "L", 0, "depth", "M", "span", 0, "L", "span", "depth"]
+        },
+        {
+          "type": "path",
+          "data": ["M", -6, -8, "L", -16, -8, "L", -16, "depth + 8", "L", -6, "depth + 8"],
+          "strokeWidth": 4,
+          "strokeColor": "#5A5A5A"
+        }
+      ]
+    }
+  ]
+}

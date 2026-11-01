@@ -1,0 +1,94 @@
+{
+  "name": "Week, six panels",
+  "orientation": "portrait",
+  "categories": ["Planners"],
+  "constants": [
+    {"titleBand": 146},
+    {"days": 223},
+    {"band": 89},
+    {"block": "(templateHeight - days) / 3"},
+    {"half": "templateWidth / 2"}
+  ],
+  "items": [
+    {
+      "type": "text",
+      "text": "Week of",
+      "fontSize": 52,
+      "position": {"x": 40, "y": 108}
+    },
+    {
+      "type": "text",
+      "text": "Week number",
+      "fontSize": 24,
+      "position": {"x": 40, "y": 198}
+    },
+    {
+      "type": "path",
+      "data": ["M", 0, "titleBand", "L", "templateWidth", "titleBand", "M", 0, "days", "L", "templateWidth", "days", "M", 0, "days + band", "L", "templateWidth", "days + band", "M", 0, "days + 1 * block", "L", "templateWidth", "days + 1 * block", "M", 0, "days + 1 * block + band", "L", "templateWidth", "days + 1 * block + band", "M", 0, "days + 2 * block", "L", "templateWidth", "days + 2 * block", "M", 0, "days + 2 * block + band", "L", "templateWidth", "days + 2 * block + band"]
+    },
+    {
+      "type": "group",
+      "boundingBox": {"x": "half", "y": "days", "height": "templateHeight - days"},
+      "repeat": {"rows": "down"},
+      "children": [
+        {
+          "type": "path",
+          "data": ["M", 0, 0, "L", 0, "parentHeight"]
+        }
+      ]
+    },
+    {
+      "type": "group",
+      "boundingBox": {"x": "half * 3 / 2", "y": "days + 2 * block", "height": "templateHeight - days + 2 * block"},
+      "repeat": {"rows": "down"},
+      "children": [
+        {
+          "type": "path",
+          "data": ["M", 0, 0, "L", 0, "parentHeight"]
+        }
+      ]
+    },
+    {
+      "type": "text",
+      "text": "Monday",
+      "fontSize": 28,
+      "position": {"x": 24, "y": "days + band / 2 + 11"}
+    },
+    {
+      "type": "text",
+      "text": "Tuesday",
+      "fontSize": 28,
+      "position": {"x": "half + 24", "y": "days + band / 2 + 11"}
+    },
+    {
+      "type": "text",
+      "text": "Wednesday",
+      "fontSize": 28,
+      "position": {"x": 24, "y": "days + 1 * block + band / 2 + 11"}
+    },
+    {
+      "type": "text",
+      "text": "Thursday",
+      "fontSize": 28,
+      "position": {"x": "half + 24", "y": "days + 1 * block + band / 2 + 11"}
+    },
+    {
+      "type": "text",
+      "text": "Friday",
+      "fontSize": 28,
+      "position": {"x": 24, "y": "days + 2 * block + band / 2 + 11"}
+    },
+    {
+      "type": "text",
+      "text": "Saturday",
+      "fontSize": 28,
+      "position": {"x": "half + 24", "y": "days + 2 * block + band / 2 + 11"}
+    },
+    {
+      "type": "text",
+      "text": "Sunday",
+      "fontSize": 28,
+      "position": {"x": "half * 3 / 2 + 24", "y": "days + 2 * block + band / 2 + 11"}
+    }
+  ]
+}

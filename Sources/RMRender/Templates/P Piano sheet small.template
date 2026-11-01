@@ -1,0 +1,48 @@
+{
+  "name": "Grand staff, small",
+  "orientation": "portrait",
+  "categories": ["Creative"],
+  "constants": [
+    {"compact": "templateWidth < 1000 || templateHeight < 1000"},
+    {"span": "templateWidth - 120 < 1104 ? templateWidth - 120 : 1104"},
+    {"top": "compact ? 120 : 155"},
+    {"fits": "(templateHeight - top - 204 - 20) / 284 + 1"},
+    {"space": 18},
+    {"between": 132},
+    {"depth": 204},
+    {"left": "templateWidth / 2 - span / 2 + 0"}
+  ],
+  "items": [
+    {
+      "type": "group",
+      "boundingBox": {"x": "left", "y": "top", "width": "span", "height": 284},
+      "repeat": {"rows": "fits < 6 ? fits : 6"},
+      "children": [
+        {
+          "type": "path",
+          "data": ["M", 0, 0, "L", "parentWidth", 0, "M", 0, 18, "L", "parentWidth", 18, "M", 0, 36, "L", "parentWidth", 36, "M", 0, 54, "L", "parentWidth", 54, "M", 0, 72, "L", "parentWidth", 72]
+        },
+        {
+          "type": "group",
+          "boundingBox": {"x": 0, "y": "between", "width": "span"},
+          "children": [
+            {
+              "type": "path",
+              "data": ["M", 0, 0, "L", "parentWidth", 0, "M", 0, 18, "L", "parentWidth", 18, "M", 0, 36, "L", "parentWidth", 36, "M", 0, 54, "L", "parentWidth", 54, "M", 0, 72, "L", "parentWidth", 72]
+            }
+          ]
+        },
+        {
+          "type": "path",
+          "data": ["M", 0, 0, "L", 0, "depth", "M", "span", 0, "L", "span", "depth"]
+        },
+        {
+          "type": "path",
+          "data": ["M", -6, -8, "L", -16, -8, "L", -16, "depth + 8", "L", -6, "depth + 8"],
+          "strokeWidth": 4,
+          "strokeColor": "#5A5A5A"
+        }
+      ]
+    }
+  ]
+}

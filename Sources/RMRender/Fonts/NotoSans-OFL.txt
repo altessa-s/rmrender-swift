@@ -1,0 +1,4 @@
+Noto Sans — SIL Open Font License 1.1.
+Copyright 2022 The Noto Project Authors
+(https://github.com/notofonts/latin-greek-cyrillic)
+Full license text: https://openfontlicense.org

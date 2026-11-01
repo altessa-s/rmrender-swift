@@ -1,0 +1,43 @@
+{
+  "name": "Staff paper",
+  "orientation": "portrait",
+  "categories": ["Creative"],
+  "constants": [
+    {"span": "templateWidth - 78 < 1325 ? templateWidth - 78 : 1325"},
+    {"left": "templateWidth / 2 - span / 2"},
+    {"fits0": "(templateHeight - 240.7 - 107 - 20) / 215.3 + 1"},
+    {"fits1": "(templateHeight - 885.3 - 107 - 20) / 214.2 + 1"}
+  ],
+  "items": [
+    {
+      "type": "group",
+      "boundingBox": {"x": "left", "y": 240.7, "width": "span", "height": 215.3},
+      "repeat": {"rows": "fits0 < 3 ? fits0 : 3"},
+      "children": [
+        {
+          "type": "path",
+          "data": ["M", 0, 0, "L", "parentWidth", 0, "M", 0, 26.75, "L", "parentWidth", 26.75, "M", 0, 53.5, "L", "parentWidth", 53.5, "M", 0, 80.25, "L", "parentWidth", 80.25, "M", 0, 107, "L", "parentWidth", 107]
+        },
+        {
+          "type": "path",
+          "data": ["M", 0, 0, "L", 0, 107, "M", "span", 0, "L", "span", 107]
+        }
+      ]
+    },
+    {
+      "type": "group",
+      "boundingBox": {"x": "left", "y": 885.3, "width": "span", "height": 214.2},
+      "repeat": {"rows": "fits1 < 4 ? fits1 : 4"},
+      "children": [
+        {
+          "type": "path",
+          "data": ["M", 0, 0, "L", "parentWidth", 0, "M", 0, 26.75, "L", "parentWidth", 26.75, "M", 0, 53.5, "L", "parentWidth", 53.5, "M", 0, 80.25, "L", "parentWidth", 80.25, "M", 0, 107, "L", "parentWidth", 107]
+        },
+        {
+          "type": "path",
+          "data": ["M", 0, 0, "L", 0, 107, "M", "span", 0, "L", "span", 107]
+        }
+      ]
+    }
+  ]
+}

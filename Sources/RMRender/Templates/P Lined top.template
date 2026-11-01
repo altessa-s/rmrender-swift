@@ -1,0 +1,23 @@
+{
+  "name": "Rule, upper half",
+  "orientation": "portrait",
+  "categories": ["Lines"],
+  "constants": [
+    {"compact": "templateWidth < 1000 || templateHeight < 1000"},
+    {"pitch": 78.7},
+    {"top": "compact ? templateHeight / 2 : 1024"}
+  ],
+  "items": [
+    {
+      "type": "group",
+      "boundingBox": {"x": 0, "y": "top", "width": "templateWidth", "height": "pitch"},
+      "repeat": {"rows": "up"},
+      "children": [
+        {
+          "type": "path",
+          "data": ["M", 0, 0, "L", "parentWidth", 0]
+        }
+      ]
+    }
+  ]
+}

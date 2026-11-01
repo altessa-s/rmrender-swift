@@ -1,0 +1,85 @@
+{
+  "name": "Week, Sunday first",
+  "orientation": "portrait",
+  "categories": ["Planners"],
+  "constants": [
+    {"narrow": "templateWidth < 1000"},
+    {"titleBand": 146},
+    {"numberBand": 224},
+    {"dayBand": "narrow ? numberBand : 312"},
+    {"gutter": 0},
+    {"day": "(templateWidth - gutter) / 7"},
+    {"dayRow": "(templateHeight - numberBand) / 7"}
+  ],
+  "items": [
+    {
+      "type": "text",
+      "text": "Week of",
+      "fontSize": 52,
+      "position": {"x": 40, "y": 108}
+    },
+    {
+      "type": "text",
+      "text": "Week number",
+      "fontSize": 24,
+      "position": {"x": 40, "y": 198}
+    },
+    {
+      "type": "path",
+      "data": ["M", 0, "titleBand", "L", "templateWidth", "titleBand", "M", 0, "numberBand", "L", "templateWidth", "numberBand", "M", 0, "dayBand", "L", "templateWidth", "dayBand"]
+    },
+    {
+      "type": "group",
+      "boundingBox": {"x": 0, "y": "numberBand", "height": "templateHeight - numberBand"},
+      "repeat": {"rows": "down"},
+      "children": [
+        {
+          "type": "path",
+          "data": ["M", "narrow ? 0 : gutter + day * 0", "narrow ? dayRow * 0 : 0", "L", "narrow ? templateWidth : gutter + day * 0", "narrow ? dayRow * 0 : parentHeight", "M", "narrow ? 0 : gutter + day * 1", "narrow ? dayRow * 1 : 0", "L", "narrow ? templateWidth : gutter + day * 1", "narrow ? dayRow * 1 : parentHeight", "M", "narrow ? 0 : gutter + day * 2", "narrow ? dayRow * 2 : 0", "L", "narrow ? templateWidth : gutter + day * 2", "narrow ? dayRow * 2 : parentHeight", "M", "narrow ? 0 : gutter + day * 3", "narrow ? dayRow * 3 : 0", "L", "narrow ? templateWidth : gutter + day * 3", "narrow ? dayRow * 3 : parentHeight", "M", "narrow ? 0 : gutter + day * 4", "narrow ? dayRow * 4 : 0", "L", "narrow ? templateWidth : gutter + day * 4", "narrow ? dayRow * 4 : parentHeight", "M", "narrow ? 0 : gutter + day * 5", "narrow ? dayRow * 5 : 0", "L", "narrow ? templateWidth : gutter + day * 5", "narrow ? dayRow * 5 : parentHeight", "M", "narrow ? 0 : gutter + day * 6", "narrow ? dayRow * 6 : 0", "L", "narrow ? templateWidth : gutter + day * 6", "narrow ? dayRow * 6 : parentHeight"]
+        }
+      ]
+    },
+    {
+      "type": "text",
+      "text": "Sun",
+      "fontSize": 30,
+      "position": {"x": "narrow ? gutter + 24 : gutter + day * 1 / 2 - textWidth / 2", "y": "narrow ? numberBand + dayRow * 0 + 40 : 278"}
+    },
+    {
+      "type": "text",
+      "text": "Mon",
+      "fontSize": 30,
+      "position": {"x": "narrow ? gutter + 24 : gutter + day * 3 / 2 - textWidth / 2", "y": "narrow ? numberBand + dayRow * 1 + 40 : 278"}
+    },
+    {
+      "type": "text",
+      "text": "Tue",
+      "fontSize": 30,
+      "position": {"x": "narrow ? gutter + 24 : gutter + day * 5 / 2 - textWidth / 2", "y": "narrow ? numberBand + dayRow * 2 + 40 : 278"}
+    },
+    {
+      "type": "text",
+      "text": "Wed",
+      "fontSize": 30,
+      "position": {"x": "narrow ? gutter + 24 : gutter + day * 7 / 2 - textWidth / 2", "y": "narrow ? numberBand + dayRow * 3 + 40 : 278"}
+    },
+    {
+      "type": "text",
+      "text": "Thu",
+      "fontSize": 30,
+      "position": {"x": "narrow ? gutter + 24 : gutter + day * 9 / 2 - textWidth / 2", "y": "narrow ? numberBand + dayRow * 4 + 40 : 278"}
+    },
+    {
+      "type": "text",
+      "text": "Fri",
+      "fontSize": 30,
+      "position": {"x": "narrow ? gutter + 24 : gutter + day * 11 / 2 - textWidth / 2", "y": "narrow ? numberBand + dayRow * 5 + 40 : 278"}
+    },
+    {
+      "type": "text",
+      "text": "Sat",
+      "fontSize": 30,
+      "position": {"x": "narrow ? gutter + 24 : gutter + day * 13 / 2 - textWidth / 2", "y": "narrow ? numberBand + dayRow * 6 + 40 : 278"}
+    }
+  ]
+}

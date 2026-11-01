@@ -1,0 +1,54 @@
+{
+  "name": "Day",
+  "orientation": "landscape",
+  "categories": ["Planners"],
+  "constants": [
+    {"hour": 116.5},
+    {"firstHour": 379},
+    {"gutter": 186}
+  ],
+  "items": [
+    {
+      "type": "text",
+      "text": "Date",
+      "fontSize": 44,
+      "position": {"x": 60, "y": 108}
+    },
+    {
+      "type": "text",
+      "text": "Schedule",
+      "fontSize": 26,
+      "position": {"x": 60, "y": 206}
+    },
+    {
+      "type": "path",
+      "data": ["M", 0, 145, "L", "templateWidth", 145]
+    },
+    {
+      "type": "path",
+      "data": ["M", 0, 245, "L", "templateWidth", 245]
+    },
+    {
+      "type": "group",
+      "boundingBox": {"x": "gutter - 26", "y": 245, "height": "templateHeight - 245"},
+      "repeat": {"rows": "down"},
+      "children": [
+        {
+          "type": "path",
+          "data": ["M", 0, 0, "L", 0, "parentHeight"]
+        }
+      ]
+    },
+    {
+      "type": "group",
+      "boundingBox": {"x": "gutter", "y": "firstHour", "width": "templateWidth - gutter", "height": "hour"},
+      "repeat": {"rows": "down"},
+      "children": [
+        {
+          "type": "path",
+          "data": ["M", 0, 0, "L", "parentWidth", 0]
+        }
+      ]
+    }
+  ]
+}

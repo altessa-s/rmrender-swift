@@ -1,0 +1,4 @@
+EB Garamond — SIL Open Font License 1.1.
+Copyright 2017 The EB Garamond Project Authors
+(https://github.com/octaviopardo/EBGaramond12)
+Full license text: https://openfontlicense.org

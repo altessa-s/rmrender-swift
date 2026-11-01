@@ -1,0 +1,31 @@
+{
+  "name": "Heading and rule",
+  "orientation": "portrait",
+  "categories": ["Lines"],
+  "constants": [
+    {"compact": "templateWidth < 1000 || templateHeight < 1000"},
+    {"pitch": 78.7},
+    {"top": 287},
+    {"headingY": 187},
+    {"headingInset": "compact ? 60 : 218"}
+  ],
+  "items": [
+    {
+      "type": "path",
+      "data": ["M", "headingInset", "headingY", "L", "templateWidth - headingInset", "headingY"],
+      "strokeWidth": 1.5,
+      "strokeColor": "#8C8C8C"
+    },
+    {
+      "type": "group",
+      "boundingBox": {"x": 0, "y": "top", "width": "templateWidth", "height": "pitch"},
+      "repeat": {"rows": "down"},
+      "children": [
+        {
+          "type": "path",
+          "data": ["M", 0, 0, "L", "parentWidth", 0]
+        }
+      ]
+    }
+  ]
+}

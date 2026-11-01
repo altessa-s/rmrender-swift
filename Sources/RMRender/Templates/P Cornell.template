@@ -1,0 +1,37 @@
+{
+  "name": "Cornell notes",
+  "orientation": "portrait",
+  "categories": ["Lines"],
+  "constants": [
+    {"compact": "templateWidth < 1000 || templateHeight < 1000"},
+    {"pitch": 76.4},
+    {"top": 103},
+    {"cue": "compact ? templateWidth * 0.3 : paperOriginX + 685"},
+    {"summary": "compact ? templateHeight - 300 : 1401"}
+  ],
+  "items": [
+    {
+      "type": "path",
+      "data": ["M", 0, "summary", "L", "templateWidth", "summary"],
+      "strokeWidth": 1.5,
+      "strokeColor": "#8C8C8C"
+    },
+    {
+      "type": "path",
+      "data": ["M", "cue", 0, "L", "cue", "summary"],
+      "strokeWidth": 1.5,
+      "strokeColor": "#8C8C8C"
+    },
+    {
+      "type": "group",
+      "boundingBox": {"x": "cue", "y": "top", "width": "templateWidth - cue", "height": "pitch"},
+      "repeat": {"rows": "(summary - top) / pitch + 1"},
+      "children": [
+        {
+          "type": "path",
+          "data": ["M", 0, 0, "L", "parentWidth", 0]
+        }
+      ]
+    }
+  ]
+}

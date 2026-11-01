@@ -1,0 +1,44 @@
+{
+  "name": "Checklist",
+  "orientation": "landscape",
+  "categories": ["Planners"],
+  "constants": [
+    {"compact": "templateWidth < 1000 || templateHeight < 1000"},
+    {"row": 97.4},
+    {"rule": 149},
+    {"first": 228},
+    {"box": 55},
+    {"boxLeft": 85},
+    {"lineLeft": 210},
+    {"inset": 60}
+  ],
+  "items": [
+    {
+      "type": "text",
+      "text": "Due date",
+      "fontSize": 24,
+      "position": {"x": "templateWidth - inset - textWidth", "y": 110}
+    },
+    {
+      "type": "path",
+      "data": ["M", 0, "rule", "L", "templateWidth", "rule"]
+    },
+    {
+      "type": "group",
+      "boundingBox": {"x": 0, "y": "first", "width": "templateWidth", "height": "row"},
+      "repeat": {"rows": "down"},
+      "children": [
+        {
+          "type": "path",
+          "data": ["M", "boxLeft", 0, "L", "boxLeft + box", 0, "L", "boxLeft + box", "0 + box", "L", "boxLeft", "0 + box", "Z"],
+          "strokeWidth": 1.5,
+          "strokeColor": "#5A5A5A"
+        },
+        {
+          "type": "path",
+          "data": ["M", "lineLeft", "box", "L", "templateWidth - inset", "box"]
+        }
+      ]
+    }
+  ]
+}

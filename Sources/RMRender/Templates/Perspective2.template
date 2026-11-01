@@ -1,0 +1,27 @@
+{
+  "name": "One-point perspective",
+  "orientation": "portrait",
+  "categories": ["Creative"],
+  "constants": [
+    {"cx": "templateWidth / 2"},
+    {"cy": "templateHeight / 2"}
+  ],
+  "items": [
+    {
+      "type": "path",
+      "data": ["M", "cx", "cy", "L", "templateWidth * 0 / 8", 0, "M", "cx", "cy", "L", "templateWidth * 0 / 8", "templateHeight", "M", "cx", "cy", "L", "templateWidth * 1 / 8", 0, "M", "cx", "cy", "L", "templateWidth * 1 / 8", "templateHeight", "M", "cx", "cy", "L", 0, "templateHeight * 1 / 8", "M", "cx", "cy", "L", "templateWidth", "templateHeight * 1 / 8", "M", "cx", "cy", "L", "templateWidth * 2 / 8", 0, "M", "cx", "cy", "L", "templateWidth * 2 / 8", "templateHeight", "M", "cx", "cy", "L", 0, "templateHeight * 2 / 8", "M", "cx", "cy", "L", "templateWidth", "templateHeight * 2 / 8", "M", "cx", "cy", "L", "templateWidth * 3 / 8", 0, "M", "cx", "cy", "L", "templateWidth * 3 / 8", "templateHeight", "M", "cx", "cy", "L", 0, "templateHeight * 3 / 8", "M", "cx", "cy", "L", "templateWidth", "templateHeight * 3 / 8", "M", "cx", "cy", "L", "templateWidth * 4 / 8", 0, "M", "cx", "cy", "L", "templateWidth * 4 / 8", "templateHeight", "M", "cx", "cy", "L", 0, "templateHeight * 4 / 8", "M", "cx", "cy", "L", "templateWidth", "templateHeight * 4 / 8", "M", "cx", "cy", "L", "templateWidth * 5 / 8", 0, "M", "cx", "cy", "L", "templateWidth * 5 / 8", "templateHeight", "M", "cx", "cy", "L", 0, "templateHeight * 5 / 8", "M", "cx", "cy", "L", "templateWidth", "templateHeight * 5 / 8", "M", "cx", "cy", "L", "templateWidth * 6 / 8", 0, "M", "cx", "cy", "L", "templateWidth * 6 / 8", "templateHeight", "M", "cx", "cy", "L", 0, "templateHeight * 6 / 8", "M", "cx", "cy", "L", "templateWidth", "templateHeight * 6 / 8", "M", "cx", "cy", "L", "templateWidth * 7 / 8", 0, "M", "cx", "cy", "L", "templateWidth * 7 / 8", "templateHeight", "M", "cx", "cy", "L", 0, "templateHeight * 7 / 8", "M", "cx", "cy", "L", "templateWidth", "templateHeight * 7 / 8", "M", "cx", "cy", "L", "templateWidth * 8 / 8", 0, "M", "cx", "cy", "L", "templateWidth * 8 / 8", "templateHeight"]
+    },
+    {
+      "type": "path",
+      "data": ["M", "cx - templateWidth / 6", "cy - templateHeight / 6", "L", "cx - templateWidth / 6 + templateWidth / 3", "cy - templateHeight / 6", "L", "cx - templateWidth / 6 + templateWidth / 3", "cy - templateHeight / 6 + templateHeight / 3", "L", "cx - templateWidth / 6", "cy - templateHeight / 6 + templateHeight / 3", "Z"],
+      "strokeWidth": 1.5,
+      "strokeColor": "#8C8C8C"
+    },
+    {
+      "type": "path",
+      "data": ["M", 0, "cy", "L", "templateWidth", "cy"],
+      "strokeWidth": 1.5,
+      "strokeColor": "#5A5A5A"
+    }
+  ]
+}

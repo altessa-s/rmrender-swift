@@ -1,0 +1,29 @@
+{
+  "name": "Two-point perspective",
+  "orientation": "portrait",
+  "categories": ["Creative"],
+  "constants": [
+    {"horizon": "templateHeight / 2"},
+    {"stride": "templateHeight / 16"}
+  ],
+  "items": [
+    {
+      "type": "path",
+      "data": ["M", 0, "horizon", "L", "templateWidth", "stride * 0", "M", 0, "horizon", "L", "templateWidth", "stride * 1", "M", 0, "horizon", "L", "templateWidth", "stride * 2", "M", 0, "horizon", "L", "templateWidth", "stride * 3", "M", 0, "horizon", "L", "templateWidth", "stride * 4", "M", 0, "horizon", "L", "templateWidth", "stride * 5", "M", 0, "horizon", "L", "templateWidth", "stride * 6", "M", 0, "horizon", "L", "templateWidth", "stride * 7", "M", 0, "horizon", "L", "templateWidth", "stride * 8", "M", 0, "horizon", "L", "templateWidth", "stride * 9", "M", 0, "horizon", "L", "templateWidth", "stride * 10", "M", 0, "horizon", "L", "templateWidth", "stride * 11", "M", 0, "horizon", "L", "templateWidth", "stride * 12", "M", 0, "horizon", "L", "templateWidth", "stride * 13", "M", 0, "horizon", "L", "templateWidth", "stride * 14", "M", 0, "horizon", "L", "templateWidth", "stride * 15", "M", 0, "horizon", "L", "templateWidth", "stride * 16"]
+    },
+    {
+      "type": "path",
+      "data": ["M", "templateWidth", "horizon", "L", 0, "stride * 0", "M", "templateWidth", "horizon", "L", 0, "stride * 1", "M", "templateWidth", "horizon", "L", 0, "stride * 2", "M", "templateWidth", "horizon", "L", 0, "stride * 3", "M", "templateWidth", "horizon", "L", 0, "stride * 4", "M", "templateWidth", "horizon", "L", 0, "stride * 5", "M", "templateWidth", "horizon", "L", 0, "stride * 6", "M", "templateWidth", "horizon", "L", 0, "stride * 7", "M", "templateWidth", "horizon", "L", 0, "stride * 8", "M", "templateWidth", "horizon", "L", 0, "stride * 9", "M", "templateWidth", "horizon", "L", 0, "stride * 10", "M", "templateWidth", "horizon", "L", 0, "stride * 11", "M", "templateWidth", "horizon", "L", 0, "stride * 12", "M", "templateWidth", "horizon", "L", 0, "stride * 13", "M", "templateWidth", "horizon", "L", 0, "stride * 14", "M", "templateWidth", "horizon", "L", 0, "stride * 15", "M", "templateWidth", "horizon", "L", 0, "stride * 16"]
+    },
+    {
+      "type": "path",
+      "data": ["M", "templateWidth * 1 / 8", 0, "L", "templateWidth * 1 / 8", "templateHeight", "M", "templateWidth * 2 / 8", 0, "L", "templateWidth * 2 / 8", "templateHeight", "M", "templateWidth * 3 / 8", 0, "L", "templateWidth * 3 / 8", "templateHeight", "M", "templateWidth * 4 / 8", 0, "L", "templateWidth * 4 / 8", "templateHeight", "M", "templateWidth * 5 / 8", 0, "L", "templateWidth * 5 / 8", "templateHeight", "M", "templateWidth * 6 / 8", 0, "L", "templateWidth * 6 / 8", "templateHeight", "M", "templateWidth * 7 / 8", 0, "L", "templateWidth * 7 / 8", "templateHeight"]
+    },
+    {
+      "type": "path",
+      "data": ["M", 0, "horizon", "L", "templateWidth", "horizon"],
+      "strokeWidth": 1.5,
+      "strokeColor": "#5A5A5A"
+    }
+  ]
+}

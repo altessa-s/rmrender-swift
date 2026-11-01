@@ -1,0 +1,35 @@
+{
+  "name": "Medium rule, margin",
+  "orientation": "landscape",
+  "categories": ["Lines"],
+  "constants": [
+    {"compact": "templateWidth < 1000 || templateHeight < 1000"},
+    {"pitch": 78.7},
+    {"top": "compact ? 160 : 177.8"},
+    {"margin": 243}
+  ],
+  "items": [
+    {
+      "type": "group",
+      "boundingBox": {"x": 0, "y": "top", "width": "templateWidth", "height": "pitch"},
+      "repeat": {"rows": "down"},
+      "children": [
+        {
+          "type": "path",
+          "data": ["M", 0, 0, "L", "parentWidth", 0]
+        }
+      ]
+    },
+    {
+      "type": "group",
+      "boundingBox": {"x": "margin", "y": 0, "height": "templateHeight"},
+      "repeat": {"rows": "down"},
+      "children": [
+        {
+          "type": "path",
+          "data": ["M", 0, 0, "L", 0, "parentHeight"]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,95 @@
+# What has to be true of every push and every pull request.
+#
+# The measurements are the reason this file exists. Almost nothing this package
+# does can be checked by reading it: a taper that reaches the paper, a baseline
+# a line stands on, the pitch of a template's rules, the band a marker leaves
+# over a flattened PDF — every one of those is a number read off a drawn page
+# and written down as a test. They are the tests that stop being true quietly.
+# A constant nudged by a tenth still compiles, still reads as though somebody
+# meant it, and still passes anything that checks the shape of the answer
+# rather than the answer. Only the drawing says otherwise.
+#
+# The two it depends on are the other reason. `RMLines` and `RMMarks` are
+# public repositories of their own, resolved by version, and this is the
+# package where a release of either one first shows up as something that does
+# not compile.
+#
+# macOS, and not by preference: the package declares `.macOS(.v15)` and draws
+# with CoreGraphics, CoreText and PDFKit, which are Apple's and exist nowhere
+# else. The Xcode is chosen rather than pinned — `Package.swift` asks for tools
+# 6.3, and a runner image pinned to an older Xcode fails to parse the manifest
+# at all, with an error that reads like a syntax error and is not one.
+
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+# Least privilege, named rather than inherited: these jobs read the tree and
+# write nothing, and the default token would let them do more.
+permissions:
+  contents: read
+
+# Actions are pinned to a major tag: patches and security fixes arrive without
+# a commit here, and a major bump — which is the one that can break a build —
+# still has to be made on purpose. A repository that wants the stricter form
+# pins the full commit SHA instead, and then needs something like Dependabot to
+# move it.
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Use the newest Xcode on the runner
+        run: Scripts/ci-select-xcode.sh
+      # The default build, with no `-DRMRENDER_PDF_TAGGING`: the artifact mark
+      # it gates needs the macOS 27 SDK, which no runner image carries. See the
+      # README — `#available` is a runtime test and does not spare the compiler
+      # from resolving the symbol.
+      - name: Verify generated grain assets
+        run: python3 Scripts/generate-grain.py --check
+      - name: Verify generated templates
+        run: python3 Scripts/generate-templates.py --check
+      - run: swift build --build-tests
+      - run: swift test
+
+  lint:
+    name: SwiftLint
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      # A release pinned by number rather than whatever Homebrew has today:
+      # `--strict` below turns every new rule a new SwiftLint ships into a red
+      # build, and a build that goes red without a commit is a build nobody
+      # can bisect. Bumping the number is a commit, reviewed like one.
+      - name: Install SwiftLint 0.65.1
+        run: |
+          curl -sSL -o swiftlint.zip \
+            https://github.com/realm/SwiftLint/releases/download/0.65.1/portable_swiftlint.zip
+          unzip -q swiftlint.zip -d swiftlint-bin
+      # `--strict` because the configuration beside it has no warnings left to
+      # tolerate: every rule that fires on deliberate work is switched off by
+      # name, with the measurement that justified it. A warning here is new.
+      - run: swiftlint-bin/swiftlint lint --strict
+
+  framework:
+    name: Build the xcframework
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Use the newest Xcode on the runner
+        run: Scripts/ci-select-xcode.sh
+      - run: brew install xcodegen
+      # The artefact a consumer links against, built the way a release is: the
+      # script's own checks refuse a static framework and one missing a slice,
+      # and both are failures that otherwise surface only in the consumer. Its
+      # two dependencies resolve from their public repositories.
+      - run: Scripts/build-xcframework.sh

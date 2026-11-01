@@ -1,0 +1,29 @@
+{
+  "name": "Bass tablature",
+  "orientation": "portrait",
+  "categories": ["Creative"],
+  "constants": [
+    {"span": "templateWidth - 120 < 1103 ? templateWidth - 120 : 1103"},
+    {"left": "templateWidth / 2 - span / 2"},
+    {"fits": "(templateHeight - 155 - 91 - 20) / 203 + 1"}
+  ],
+  "items": [
+    {
+      "type": "group",
+      "boundingBox": {"x": "left", "y": 155, "width": "span", "height": 203},
+      "repeat": {"rows": "fits < 8 ? fits : 8"},
+      "children": [
+        {
+          "type": "path",
+          "data": ["M", 0, 0, "L", "span", 0, "M", 0, 30.5, "L", "span", 30.5, "M", 0, 60.5, "L", "span", 60.5, "M", 0, 91, "L", "span", 91]
+        },
+        {
+          "type": "path",
+          "data": ["M", 0, 0, "L", 0, 91, "M", "span", 0, "L", "span", 91],
+          "strokeWidth": 2,
+          "strokeColor": "#5A5A5A"
+        }
+      ]
+    }
+  ]
+}

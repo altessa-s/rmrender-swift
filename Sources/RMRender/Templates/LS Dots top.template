@@ -1,0 +1,25 @@
+{
+  "name": "Dots, upper half",
+  "orientation": "landscape",
+  "categories": ["Grids"],
+  "constants": [
+    {"compact": "templateWidth < 1000 || templateHeight < 1000"},
+    {"pitch": 42.5},
+    {"left": "compact ? 5 : -6.5"},
+    {"edge": "compact ? templateHeight / 2 : 680.25"}
+  ],
+  "items": [
+    {
+      "type": "group",
+      "boundingBox": {"x": "left", "y": "edge", "width": "pitch", "height": "pitch"},
+      "repeat": {"rows": "up", "columns": "right"},
+      "children": [
+        {
+          "type": "path",
+          "data": ["M", 0, -1.5, "L", 1.5, 0, "L", 0, 1.5, "L", -1.5, 0, "Z"],
+          "fillColor": "#262626"
+        }
+      ]
+    }
+  ]
+}
