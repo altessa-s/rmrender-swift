@@ -40,8 +40,15 @@ puts a reMarkable library on the Mac.
 
 Strokes are drawn per tool: the pens' widths and pressure curves, the
 highlighter's darken blend, pencil grain from stamp textures, ballpoint grain
-from value noise, round and square caps and joins. The numbers live in
-`Calibration` and match exported PDFs. Eraser strokes are not drawn.
+from value noise, round and square caps and joins. Eraser strokes are not
+drawn.
+
+The stroke model is this package's own. Its widths, colours, opacities and
+blends are fitted to the PDF and SVG exports of the reMarkable apps and live
+in `Calibration`; caps, joins and grain are drawn by algorithms of its own. A
+rendered page therefore matches an export closely but not exactly, and can
+differ visibly from the same page on the tablet's screen — in the texture of
+pencil and ballpoint grain, at the ends of strokes and at sharp corners.
 
 ## Installation
 
