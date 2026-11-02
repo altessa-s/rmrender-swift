@@ -94,6 +94,82 @@ public enum PDFReadError: Error, Sendable, Equatable {
     case malformed(String)
 }
 
+/// What every copy of one `PDFFile` shares: the object streams already
+/// unpacked, and what is left of the file's decoding budget.
+///
+/// A reference type behind a lock, because `PDFFile` is a value that is
+/// copied and read from more than one task. Decoding happens outside the
+/// lock; two tasks that unpack the same stream at once both pay for it, and
+/// the second result is the one kept.
+final class PDFDecodeState: @unchecked Sendable {
+    /// The most one file may decode to, over all its streams together. A
+    /// stream of a few kilobytes inflates to the 64 MB a single stream is
+    /// allowed; without a total, a file of a few hundred of them is gigabytes
+    /// of work.
+    static let budget = 256 * 1024 * 1024
+
+    private let lock = NSLock()
+    private var remaining: Int
+    private var streams: [Int: Result<PDFObjectStream, any Error>] = [:]
+    private var count = 0
+
+    init(budget: Int = PDFDecodeState.budget) {
+        remaining = budget
+    }
+
+    /// How many streams have been decoded so far.
+    var decodes: Int { lock.withLock { count } }
+
+    /// `PDFStreamCodec.decode`, charged to the file's budget. A decode that
+    /// fails is charged what it was allowed, since that is what it may have
+    /// cost.
+    func decode(_ dictionary: [String: PDFObject], _ bytes: Data) throws -> Data {
+        let allowance = lock.withLock { () -> Int in
+            count += 1
+            return min(PDFStreamCodec.limit, remaining)
+        }
+        guard allowance > 0 else {
+            throw PDFReadError.malformed("the file decodes to more than the reader will hold")
+        }
+        let data: Data
+        do {
+            data = try PDFStreamCodec.decode(dictionary, bytes, limit: allowance)
+        } catch {
+            lock.withLock { remaining -= allowance }
+            throw error
+        }
+        try lock.withLock {
+            guard data.count <= remaining else {
+                remaining = 0
+                throw PDFReadError.malformed("the file decodes to more than the reader will hold")
+            }
+            remaining -= data.count
+        }
+        return data
+    }
+
+    /// The object stream with this number, unpacked by `load` the first time
+    /// it is asked for. A failure is kept as well: a broken stream is not
+    /// worth decoding again for every object it claims to hold.
+    func objectStream(_ number: Int, load: () throws -> PDFObjectStream) throws -> PDFObjectStream {
+        if let known = lock.withLock({ streams[number] }) { return try known.get() }
+        let result = Result { try load() }
+        lock.withLock { streams[number] = result }
+        return try result.get()
+    }
+}
+
+/// An object stream, decoded, with its index read.
+struct PDFObjectStream: Sendable {
+    /// The decoded bytes, indexed from zero.
+    let data: Data
+    /// Where the first object begins.
+    let first: Int
+    /// Each packed object's number and its offset from `first`, in the
+    /// stream's own order; the offsets rise strictly.
+    let entries: [(number: Int, offset: Int)]
+}
+
 /// A PDF file opened for reading: its objects, its page tree, its trailer.
 ///
 /// Mapped rather than read: a reader's book runs to hundreds of megabytes, and
@@ -108,11 +184,28 @@ public struct PDFFile: Sendable {
     public let generations: [Int: Int]
     private let compressed: [Int: (stream: Int, index: Int)]
     public let trailer: [String: PDFObject]
+    /// The highest object number any section names, free entries included.
+    /// An update numbers its new objects past it, so that no number the file
+    /// has ever used — and that an old reference may still say — comes back
+    /// meaning something else.
+    let highestObjectNumber: Int
+    let state: PDFDecodeState
     /// Where the file's newest cross-reference section begins. An incremental
     /// update has to name it as its `/Prev`, or a reader stops at the update
     /// and sees a document of the few objects it changed.
     var usesCrossReferenceStreams: Bool { !compressed.isEmpty || trailer["XRefStm"] != nil || trailer["Type"] != nil }
     let lastCrossReference: Int
+
+    /// How many cross-reference rows the reader parses over all sections
+    /// together. The count of distinct objects is bounded separately; this
+    /// bounds the work, which a chain of sections that repeat the same
+    /// numbers multiplies.
+    static let crossReferenceRowLimit = 2_000_000
+
+    /// How many references a stream's `/Length` may pass through before it
+    /// reaches its number. The walk is a loop, not a recursion, so this
+    /// bounds work rather than the stack.
+    private static let lengthHopLimit = 8
 
     public init(url: URL) throws {
         try self.init(bytes: try Data(contentsOf: url, options: .mappedIfSafe))
@@ -121,12 +214,16 @@ public struct PDFFile: Sendable {
     public init(bytes: Data) throws {
         guard bytes.starts(with: Array("%PDF-".utf8)) else { throw PDFReadError.notAPDF }
         self.bytes = bytes
+        let state = PDFDecodeState()
+        self.state = state
 
         var offsets: [Int: Int] = [:]
         var generations: [Int: Int] = [:]
         var compressed: [Int: (stream: Int, index: Int)] = [:]
         var objects: Set<Int> = []
         var trailer: [String: PDFObject] = [:]
+        var highest = 0
+        var rowBudget = PDFFile.crossReferenceRowLimit
         let newest = try PDFFile.lastStartxref(in: bytes)
         lastCrossReference = newest
         var next: Int? = newest
@@ -139,10 +236,12 @@ public struct PDFFile: Sendable {
                 throw PDFReadError.malformed("the cross-reference sections form a loop")
             }
             seen.insert(start)
-            let section = try PDFFile.readSection(bytes: bytes, at: start)
+            let section = try PDFFile.readSection(bytes: bytes, at: start, state: state, rowBudget: rowBudget)
+            rowBudget -= section.rows
             guard objects.count + section.numbers.count <= 1_000_000 else {
                 throw PDFReadError.malformed("xref object limit")
             }
+            highest = max(highest, section.numbers.max() ?? 0)
             for number in section.numbers where objects.insert(number).inserted {
                 offsets[number] = section.offsets[number]
                 generations[number] = section.generations[number]
@@ -173,6 +272,15 @@ public struct PDFFile: Sendable {
         self.generations = generations
         self.compressed = compressed
         self.trailer = trailer
+        self.highestObjectNumber = highest
+    }
+
+    /// How many streams this file has decoded so far, its copies included.
+    var decodeCount: Int { state.decodes }
+
+    /// A stream's bytes decoded, charged to this file's budget.
+    func decode(_ dictionary: [String: PDFObject], _ data: Data) throws -> Data {
+        try state.decode(dictionary, data)
     }
 
     /// An offset that names a cross-reference section, or `nil` when the file
@@ -222,6 +330,8 @@ public struct PDFFile: Sendable {
         let offsets: [Int: Int]
         let trailer: [String: PDFObject]
         var compressed: [Int: (stream: Int, index: Int)] = [:]
+        /// The rows parsed to read it, a hybrid section's stream included.
+        var rows: Int
     }
 
     /// The highest object number a file may name. The format writes them in
@@ -237,13 +347,15 @@ public struct PDFFile: Sendable {
     private static let pageTreeDepthLimit = 256
 
     /// One cross-reference section: the table, and the trailer after it.
-    private static func readSection(bytes: Data, at start: Int) throws -> Section {
+    ///
+    /// - Parameter rowBudget: how many rows the file may still parse.
+    private static func readSection(bytes: Data, at start: Int, state: PDFDecodeState, rowBudget: Int) throws -> Section {
         guard let place = PDFFile.place(in: bytes, at: start) else {
             throw PDFReadError.malformed("a cross-reference section outside the file")
         }
         var scanner = PDFScanner(bytes: bytes, index: place)
         guard scanner.readKeyword("xref") else {
-            return try readStreamSection(bytes: bytes, at: start)
+            return try readStreamSection(bytes: bytes, at: start, state: state, rowBudget: rowBudget)
         }
 
         var offsets: [Int: Int] = [:]
@@ -256,7 +368,7 @@ public struct PDFFile: Sendable {
                   case .integer(let count)? = try scanner.nextObject(),
                   first >= 0, count >= 0,
                   first <= PDFFile.objectNumberLimit,
-                  count <= PDFFile.objectNumberLimit - first, count <= 1_000_000 - numbers.count
+                  count <= PDFFile.objectNumberLimit - first, count <= rowBudget - numbers.count
             else {
                 throw PDFReadError.malformed("a cross-reference subsection without its heading")
             }
@@ -285,23 +397,32 @@ public struct PDFFile: Sendable {
             throw PDFReadError.malformed("the trailer is not a dictionary")
         }
         var compressed: [Int: (stream: Int, index: Int)] = [:]
+        var rows = numbers.count
         if let hybrid = trailer["XRefStm"] {
             guard let offset = crossReferenceOffset(hybrid, in: bytes), offset != start else {
                 throw PDFReadError.malformed("invalid hybrid xref offset")
             }
-            let extra = try readStreamSection(bytes: bytes, at: offset)
+            let extra = try readStreamSection(bytes: bytes, at: offset, state: state, rowBudget: rowBudget - rows)
             guard extra.trailer["Encrypt"] == nil else { throw PDFReadError.encrypted }
-            for number in extra.numbers {
+            rows += extra.rows
+            // The table is read first and the stream after it: the stream
+            // speaks only for the numbers the table has no object for, which
+            // are the ones a hybrid writer leaves free or out of the table so
+            // that an older reader skips them.
+            for number in extra.numbers where offsets[number] == nil {
                 numbers.insert(number)
-                offsets[number] = extra.offsets[number]
                 generations[number] = extra.generations[number]
+                offsets[number] = extra.offsets[number]
                 compressed[number] = extra.compressed[number]
             }
         }
-        return Section(numbers: numbers, generations: generations, offsets: offsets, trailer: trailer, compressed: compressed)
+        return Section(
+            numbers: numbers, generations: generations, offsets: offsets, trailer: trailer,
+            compressed: compressed, rows: rows
+        )
     }
 
-    private static func readStreamSection(bytes: Data, at start: Int) throws -> Section {
+    private static func readStreamSection(bytes: Data, at start: Int, state: PDFDecodeState, rowBudget: Int) throws -> Section {
         guard let place = place(in: bytes, at: start) else { throw PDFReadError.malformed("xref stream offset") }
         var scanner = PDFScanner(bytes: bytes, index: place)
         guard let number = try scanner.nextObject()?.integerValue, number > 0, number <= objectNumberLimit,
@@ -317,6 +438,17 @@ public struct PDFFile: Sendable {
         guard widths.count == 3, widths.allSatisfy({ (0...8).contains($0) }), widths.reduce(0, +) > 0 else {
             throw PDFReadError.malformed("xref field widths")
         }
+        let rowWidth = widths.reduce(0, +)
+        // A predictor works on rows, and the rows of this stream are the
+        // entries: a `/Columns` of anything else is a stream that does not
+        // decode to the table it claims to be.
+        var parameters = dictionary["DecodeParms"]
+        if case .array(let values) = parameters, values.count == 1 { parameters = values[0] }
+        if case .dictionary(let options) = parameters, (options["Predictor"]?.integerValue ?? 1) > 1 {
+            guard options["Columns"]?.integerValue == rowWidth, (options["Colors"]?.integerValue ?? 1) == 1 else {
+                throw PDFReadError.malformed("xref predictor columns")
+            }
+        }
         var indices = [0, size]
         if let index = dictionary["Index"] {
             guard case .array(let values) = index else { throw PDFReadError.malformed("xref Index") }
@@ -324,7 +456,7 @@ public struct PDFFile: Sendable {
             guard indices.count == values.count else { throw PDFReadError.malformed("xref Index values") }
         }
         guard indices.count.isMultiple(of: 2), !indices.isEmpty else { throw PDFReadError.malformed("xref Index pairs") }
-        let data = [UInt8](try PDFStreamCodec.decode(dictionary, raw))
+        let data = [UInt8](try state.decode(dictionary, raw))
         var cursor = 0
         var offsets: [Int: Int] = [:], generations: [Int: Int] = [:]
         var compressed: [Int: (stream: Int, index: Int)] = [:]
@@ -340,8 +472,8 @@ public struct PDFFile: Sendable {
         for i in stride(from: 0, to: indices.count, by: 2) {
             let first = indices[i], count = indices[i + 1]
             guard first >= 0, count >= 0, first <= size, count <= size - first,
-                  count <= 1_000_000 - numbers.count,
-                  count <= (data.count - cursor) / widths.reduce(0, +) else {
+                  count <= rowBudget - numbers.count,
+                  count <= (data.count - cursor) / rowWidth else {
                 throw PDFReadError.malformed("xref range")
             }
             for id in first..<(first + count) {
@@ -360,59 +492,28 @@ public struct PDFFile: Sendable {
             }
         }
         guard cursor == data.count else { throw PDFReadError.malformed("xref trailing data") }
-        return Section(numbers: numbers, generations: generations, offsets: offsets, trailer: dictionary, compressed: compressed)
+        return Section(
+            numbers: numbers, generations: generations, offsets: offsets, trailer: dictionary,
+            compressed: compressed, rows: numbers.count
+        )
     }
 
     /// The object with this number, parsed.
     public func object(_ number: Int) throws -> PDFObject {
-        try object(number, reading: [])
+        if let location = compressed[number] { return try packedObject(number, at: location) }
+        return try plainObject(number) { try self.streamLength($0, packed: true) }
     }
 
-    private func object(_ number: Int, reading: Set<Int>) throws -> PDFObject {
-        guard reading.count < 64, !reading.contains(number) else {
-            throw PDFReadError.malformed("cyclic or excessively deep stream length reference")
-        }
-        if let location = compressed[number] {
-            guard case .stream(let dictionary, let raw) = try object(location.stream, reading: reading.union([number])),
-                  case .name("ObjStm") = dictionary["Type"],
-                  let count = dictionary["N"]?.integerValue, count > 0, count <= 1_000_000,
-                  let first = dictionary["First"]?.integerValue, first >= 0,
-                  location.index >= 0, location.index < count else {
-                throw PDFReadError.malformed("invalid object stream")
-            }
-            let data = try PDFStreamCodec.decode(dictionary, raw)
-            guard first <= data.count else { throw PDFReadError.malformed("object stream header length") }
-            var header = PDFScanner(bytes: data, index: data.startIndex)
-            var positions: [(Int, Int)] = []
-            var seen: Set<Int> = []
-            for _ in 0..<count {
-                guard let id = try header.nextObject()?.integerValue, id > 0, id <= Self.objectNumberLimit,
-                      seen.insert(id).inserted, let offset = try header.nextObject()?.integerValue,
-                      offset >= 0, offset < data.count - first,
-                      positions.last.map({ offset > $0.1 }) ?? true else {
-                    throw PDFReadError.malformed("invalid object stream index")
-                }
-                positions.append((id, offset))
-            }
-            guard header.index <= first, positions[location.index].0 == number else {
-                throw PDFReadError.malformed("object stream index mismatch")
-            }
-            let start = first + positions[location.index].1
-            let end = location.index + 1 < count ? first + positions[location.index + 1].1 : data.count
-            let body = Data(data[start..<end])
-            var scanner = PDFScanner(bytes: body, index: 0)
-            guard let value = try scanner.nextObject() else { throw PDFReadError.malformed("empty compressed object") }
-            scanner.skipWhitespace()
-            guard scanner.index == body.count else { throw PDFReadError.malformed("compressed object trailing data") }
-            return value
-        }
+    /// An object stored at an offset of its own.
+    ///
+    /// - Parameter lengths: how a stream's `/Length` that is not a number is
+    ///   resolved, or `nil` to refuse one.
+    private func plainObject(_ number: Int, lengths: (@Sendable (PDFObject) throws -> Int)?) throws -> PDFObject {
         guard let offset = offsets[number],
               let place = PDFFile.place(in: bytes, at: offset)
         else { return .null }
         var scanner = PDFScanner(bytes: bytes, index: place)
-        scanner.lengthResolver = { value in
-            try streamLength(value, reading: reading.union([number]))
-        }
+        scanner.lengthResolver = lengths
         guard case .integer(let stated)? = try scanner.nextObject(),
               case .integer(let generation)? = try scanner.nextObject(),
               generation == generations[number],
@@ -430,16 +531,90 @@ public struct PDFFile: Sendable {
         return value
     }
 
-    private func streamLength(_ value: PDFObject, reading: Set<Int>) throws -> Int {
-        if case .integer(let length) = value, length >= 0 { return length }
-        if case .reference(let number, let generation) = value {
+    /// A stream's `/Length`, followed to its number.
+    ///
+    /// The objects on the way are parsed with no resolver of their own: a
+    /// length is a number, and an object that needs a stream's length to be
+    /// read is not one. That is what keeps the resolution from re-entering
+    /// the parser — a chain that did re-enter it, each object nested in the
+    /// arrays the parser allows, multiplied the two depths and ran the
+    /// thread's stack out.
+    ///
+    /// - Parameter packed: whether the length may sit in an object stream.
+    ///   It may not for an object stream's own length, which would need
+    ///   another object stream unpacked to unpack this one.
+    private func streamLength(_ value: PDFObject, packed: Bool) throws -> Int {
+        var value = value
+        for _ in 0...PDFFile.lengthHopLimit {
+            if case .integer(let length) = value, length >= 0 { return length }
+            guard case .reference(let number, let generation) = value else { break }
             guard generations[number] == generation else {
                 throw PDFReadError.malformed("invalid stream length reference generation")
             }
-            let resolved = try object(number, reading: reading)
-            return try streamLength(resolved, reading: reading.union([number]))
+            if let location = compressed[number] {
+                guard packed else {
+                    throw PDFReadError.malformed("an object stream whose length is packed in an object stream")
+                }
+                value = try packedObject(number, at: location)
+            } else {
+                value = try plainObject(number, lengths: nil)
+            }
         }
         throw PDFReadError.malformed("stream length must resolve to a nonnegative integer")
+    }
+
+    /// An object packed in an object stream.
+    private func packedObject(_ number: Int, at location: (stream: Int, index: Int)) throws -> PDFObject {
+        let container = try objectStream(location.stream)
+        guard location.index >= 0, location.index < container.entries.count,
+              container.entries[location.index].number == number else {
+            throw PDFReadError.malformed("object stream index mismatch")
+        }
+        let start = container.first + container.entries[location.index].offset
+        let end = location.index + 1 < container.entries.count
+            ? container.first + container.entries[location.index + 1].offset
+            : container.data.count
+        var scanner = PDFScanner(bytes: container.data[start..<end], index: start)
+        guard let value = try scanner.nextObject() else { throw PDFReadError.malformed("empty compressed object") }
+        scanner.skipWhitespace()
+        guard scanner.index == end else { throw PDFReadError.malformed("compressed object trailing data") }
+        return value
+    }
+
+    /// An object stream, decoded and indexed once for the life of the file.
+    private func objectStream(_ number: Int) throws -> PDFObjectStream {
+        try state.objectStream(number) {
+            // An object stream is never itself packed: one that were would
+            // need another unpacked to be found, and so on down.
+            guard compressed[number] == nil else {
+                throw PDFReadError.malformed("an object stream inside an object stream")
+            }
+            guard case .stream(let dictionary, let raw) = try plainObject(number, lengths: {
+                      try self.streamLength($0, packed: false)
+                  }),
+                  case .name("ObjStm") = dictionary["Type"],
+                  let count = dictionary["N"]?.integerValue, count > 0, count <= 1_000_000,
+                  let first = dictionary["First"]?.integerValue, first >= 0 else {
+                throw PDFReadError.malformed("invalid object stream")
+            }
+            let data = try state.decode(dictionary, raw)
+            guard first <= data.count else { throw PDFReadError.malformed("object stream header length") }
+            var header = PDFScanner(bytes: data, index: 0)
+            var entries: [(number: Int, offset: Int)] = []
+            entries.reserveCapacity(min(count, data.count / 4))
+            var seen: Set<Int> = []
+            for _ in 0..<count {
+                guard let id = try header.nextObject()?.integerValue, id > 0, id <= Self.objectNumberLimit,
+                      seen.insert(id).inserted, let offset = try header.nextObject()?.integerValue,
+                      offset >= 0, offset < data.count - first,
+                      entries.last.map({ offset > $0.offset }) ?? true else {
+                    throw PDFReadError.malformed("invalid object stream index")
+                }
+                entries.append((id, offset))
+            }
+            guard header.index <= first else { throw PDFReadError.malformed("object stream index mismatch") }
+            return PDFObjectStream(data: data, first: first, entries: entries)
+        }
     }
 
     /// The value itself: a reference is followed, anything else is returned.
@@ -767,7 +942,20 @@ struct PDFScanner: Sendable {
             name.append(byte)
             index += 1
         }
-        return String(decoding: name, as: UTF8.self)
+        return PDFScanner.nameString(name)
+    }
+
+    /// A name's bytes as a string, one character per byte (ISO Latin-1).
+    ///
+    /// A name is bytes, not text: `/F#e9` and a Shift-JIS font name are
+    /// names a document may use, and decoding them as UTF-8 replaces what is
+    /// not UTF-8 with U+FFFD — a different name, written back as one the
+    /// content stream does not use. Latin-1 maps every byte to a scalar of
+    /// the same value and back, so `PDFWriter` writes the bytes that came in.
+    static func nameString(_ bytes: [UInt8]) -> String {
+        var scalars = String.UnicodeScalarView()
+        scalars.append(contentsOf: bytes.map { Unicode.Scalar($0) })
+        return String(scalars)
     }
 
     /// The bytes of a literal string, brackets and all: nesting and escapes

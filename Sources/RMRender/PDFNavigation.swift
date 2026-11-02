@@ -40,9 +40,11 @@ struct PDFNavigation {
                           let targetTransform = transform(source.index(for: page), target) {
                     let name = "RMNavigation\(work)"
                     var point = destination.point
-                    let box = page.bounds(for: .mediaBox)
-                    if !point.x.isFinite || point.x == .greatestFiniteMagnitude { point.x = box.minX }
-                    if !point.y.isFinite || point.y == .greatestFiniteMagnitude { point.y = box.maxY }
+                    // The target page's box fills in a coordinate the
+                    // destination leaves open; the link keeps its own `box`.
+                    let targetBox = page.bounds(for: .mediaBox)
+                    if !point.x.isFinite || point.x == .greatestFiniteMagnitude { point.x = targetBox.minX }
+                    if !point.y.isFinite || point.y == .greatestFiniteMagnitude { point.y = targetBox.maxY }
                     destinations[target, default: []].append((name, point.applying(targetTransform)))
                     links[index, default: []].append(Link(box: box, url: nil, name: name))
                 }

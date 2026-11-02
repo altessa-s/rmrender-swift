@@ -106,9 +106,22 @@ enum PDFWriter {
     }
 
     /// A name with the bytes a name may not carry written as `#xx`.
+    ///
+    /// The reader keeps a name's bytes one per scalar (`PDFScanner.nameString`),
+    /// so a scalar below 256 is the byte itself. A scalar above it is no byte
+    /// the reader made; it comes from a name given here as text, and is
+    /// written as its UTF-8.
     private static func escaped(_ name: String) -> String {
+        var bytes: [UInt8] = []
+        for scalar in name.unicodeScalars {
+            if scalar.value < 256 {
+                bytes.append(UInt8(scalar.value))
+            } else {
+                bytes.append(contentsOf: Array(String(scalar).utf8))
+            }
+        }
         var out = ""
-        for byte in Array(name.utf8) {
+        for byte in bytes {
             let allowed = byte > 0x20 && byte < 0x7F && !Array("()<>[]{}/%#".utf8).contains(byte)
             out += allowed ? String(UnicodeScalar(byte)) : String(format: "#%02x", byte)
         }
@@ -292,7 +305,10 @@ public struct PDFOverlayWriter: Sendable {
         guard size <= PDFFile.objectNumberLimit else {
             throw PDFReadError.malformed("a trailer /Size of \(size)")
         }
-        var nextNumber = max((file.generations.keys.max() ?? 0) + 1, size)
+        // Past every number any section names, free ones included: a number
+        // freed in one revision may still be what an older object refers to,
+        // and a new object under it would answer that reference.
+        var nextNumber = max(file.highestObjectNumber + 1, size)
 
         func emit(_ object: PDFObject, number: Int? = nil) -> Int {
             let assigned = number ?? nextNumber
@@ -433,7 +449,7 @@ public struct PDFOverlayWriter: Sendable {
                     if case .array(let values) = resolved {
                         for value in values { try appendContent(value, depth: depth + 1) }
                     } else if case .stream(let dictionary, let bytes) = resolved {
-                        content.append(try PDFStreamCodec.decode(dictionary, bytes))
+                        content.append(try source.decode(dictionary, bytes))
                         content.append(10)
                     } else if case .null = resolved { } else {
                         throw PDFReadError.malformed("overlay content is not a stream")
@@ -518,7 +534,12 @@ public struct PDFOverlayWriter: Sendable {
         try FileManager.default.copyItem(at: original, to: temporary)
         let handle = try FileHandle(forWritingTo: temporary)
         do {
-            try handle.seekToEnd()
+            // Every offset in `body` counts from the end of the file that was
+            // read. A copy of another length — the original replaced between
+            // the read and now — would put each of them in the wrong place.
+            guard try handle.seekToEnd() == UInt64(offset) else {
+                throw PDFReadError.malformed("the original changed after it was read")
+            }
             try handle.write(contentsOf: body)
             try handle.close()
         } catch {
@@ -572,7 +593,7 @@ public struct PDFOverlayWriter: Sendable {
 
     /// The new cross-reference section: the objects this update changed,
     /// grouped into runs of consecutive numbers.
-    private func crossReferenceTable(_ offsets: [Int: Int], generations: [Int: Int]) -> Data {
+    func crossReferenceTable(_ offsets: [Int: Int], generations: [Int: Int]) -> Data {
         var out = Data("xref\n".utf8)
         var numbers = offsets.keys.sorted()
         while !numbers.isEmpty {
@@ -583,7 +604,7 @@ public struct PDFOverlayWriter: Sendable {
             out.append(contentsOf: Array("\(run[0]) \(run.count)\n".utf8))
             for number in run {
                 // Twenty bytes a row, exactly: offset, generation, kind.
-                out.append(contentsOf: Array(String(format: "%010d %05d n \n", offsets[number] ?? 0, generations[number] ?? 0).utf8))
+                out.append(contentsOf: Array(String(format: "%010ld %05ld n \n", offsets[number] ?? 0, generations[number] ?? 0).utf8))
             }
         }
         return out
