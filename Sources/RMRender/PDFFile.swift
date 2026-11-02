@@ -84,11 +84,13 @@ public indirect enum PDFObject: Sendable, Equatable {
 public enum PDFReadError: Error, Sendable, Equatable {
     case notAPDF
     case encrypted
-    /// Non-default page units require scaling that this renderer does not implement.
-    case unsupportedUserUnit
-    /// Not thrown: cross-reference streams are read. Kept so that callers
-    /// switching over the cases still compile.
+    /// Never thrown: the reader reads cross-reference streams. The case
+    /// stays in the frozen set so that an exhaustive `switch` over it
+    /// compiles.
     case crossReferenceStream
+    /// The file does not hold together, or holds something the reader does
+    /// not take — a page `/UserUnit` other than 1 among them, since nothing
+    /// written onto such a page would be scaled by it.
     case malformed(String)
 }
 
@@ -509,7 +511,7 @@ public struct PDFFile: Sendable {
                 throw PDFReadError.malformed("object \(number) in the page tree is not a dictionary")
             }
             if let unit = dictionary["UserUnit"], try resolve(unit).doubleValue != 1 {
-                throw PDFReadError.unsupportedUserUnit
+                throw PDFReadError.malformed("a /UserUnit other than 1")
             }
             let ownResources = dictionary["Resources"] ?? next.resources
             let ownBox = try rectangle(dictionary["MediaBox"]) ?? next.mediaBox

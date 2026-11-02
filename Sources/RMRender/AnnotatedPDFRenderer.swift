@@ -117,6 +117,27 @@ public struct AnnotatedPDFRenderer: Sendable {
     /// overlay writes onto the original's own pages, all of them, and a
     /// document shorter than its original is not one it can make. The
     /// output loses the original's links and outline for it.
+    ///
+    /// A certified original — one whose catalog carries `/Perms` — takes no
+    /// incremental update: appending to it would break the certification.
+    /// Whenever it is drawn afresh — because there are marks to append, or
+    /// for any of the reasons above — the output keeps its links and outline
+    /// and not its certification, and `onCertificationDropped` is called once
+    /// before the drawing starts. A certified original with no marks on pages
+    /// in its own order goes out as it is, certification included, and
+    /// nothing is called. `refuseCertified` turns the fresh drawing into a
+    /// refusal: the render throws `RenderError.unsupportedFormat` instead and
+    /// writes no output.
+    ///
+    /// A page whose `/UserUnit` is other than 1 is refused with
+    /// `RenderError.unsupportedFormat`: neither route scales the marks by it.
+    ///
+    /// An image the marks place on a page and the drawing cannot show — its
+    /// attachment is absent from the index, failed to arrive, is past the
+    /// size budget, or holds bytes that do not decode as an image — leaves a
+    /// hole where it stood, and the page is drawn without it. The render goes
+    /// on, and `onMissingImages` is called once with the number of pages that
+    /// lost an image and the number of attachments missing.
     public func renderPDF(
         documentID: String,
         index: DocumentFiles,
@@ -125,6 +146,9 @@ public struct AnnotatedPDFRenderer: Sendable {
         // same document, and the choice is otherwise made here rather than by
         // the caller.
         allowOverlay: Bool = true,
+        // Strict mode for certified originals: see above. Off by default, so
+        // that a certified document comes out with its marks drawn.
+        refuseCertified: Bool = false,
         author: String? = nil,
         maximumPages: Int? = nil,
         onProgress: @escaping @Sendable (_ completed: Int64, _ total: Int64) -> Void = { _, _ in },
@@ -132,6 +156,13 @@ public struct AnnotatedPDFRenderer: Sendable {
         // `NotebookRenderer.renderPDF`. A trailing closure still finds
         // `onProgress` forwards and `onUnreadable` backwards.
         onPageCount: @escaping @Sendable (_ drawn: Int, _ document: Int) -> Void = { _, _ in },
+        // Two numbers, like `onPageCount`, so that a trailing closure written
+        // for `onUnsupported` after an `onPageCount:` label is refused by the
+        // compiler rather than taken for this one. See `NotebookRenderer`.
+        onMissingImages: @escaping @Sendable (_ pages: Int, _ images: Int) -> Void = { _, _ in },
+        // No arguments, so that no closure written for the callbacks around
+        // it can be taken for it.
+        onCertificationDropped: @escaping @Sendable () -> Void = {},
         // Called at most once, and only when the marks on some of the pages
         // are in an older `.rm` generation. The same division of labour as in
         // `NotebookRenderer`: this renderer knows what it could not read, and
@@ -165,13 +196,7 @@ public struct AnnotatedPDFRenderer: Sendable {
             throw RenderError.malformedPage("the document's PDF does not open")
         }
 
-        // Automatic fallback must not silently discard certification permissions.
-        // The caller may request a fresh export explicitly with allowOverlay=false.
-        var permissions: CGPDFObjectRef?
-        if allowOverlay, let catalog = original.catalog,
-           CGPDFDictionaryGetObject(catalog, "Perms", &permissions) {
-            throw PDFOverlayWriter.OverlayError.certifiedDocument
-        }
+        let certified = Self.isCertified(original)
 
         for position in 0..<original.numberOfPages {
             guard let page = original.page(at: position + 1), let dictionary = page.dictionary else { continue }
@@ -199,8 +224,13 @@ public struct AnnotatedPDFRenderer: Sendable {
         let total = originalBytes + Int64(pages.count)
         onProgress(originalBytes, total)
 
-        let assets = await assets(for: pages.compactMap(\.marks), index: index, owner: documentID)
-        try PageAssets.validate(assets)
+        let marked = pages.compactMap(\.marks)
+        let assets = PageAssets.decodable(
+            await assets(for: marked, index: index, owner: documentID),
+            channel: "annotated"
+        )
+        let holes = PageAssets.holes(in: marked, assets: assets)
+        if holes.pages > 0 { onMissingImages(holes.pages, holes.images) }
 
         // Everything from here on is drawing, and drawing is the long part of
         // a render — so it goes off the caller's executor into a detached
@@ -217,9 +247,22 @@ public struct AnnotatedPDFRenderer: Sendable {
                 // outline, which redrawing loses — and it refuses more often
                 // than not, because it only knows how to put marks onto pages
                 // that are already there.
-                if allowOverlay, try overlay(order: order, pages: pages, original: source, assets: assets, to: output) {
+                if allowOverlay, try overlay(
+                    order: order, pages: pages, original: source, certified: certified, assets: assets, to: output
+                ) {
                     onProgress(total, total)
                     return
+                }
+                if certified {
+                    guard !refuseCertified else {
+                        throw RenderError.unsupportedFormat(
+                            "a certified PDF (/Perms) whose certification a fresh export would drop"
+                        )
+                    }
+                    RMRenderLog.pageError(
+                        "annotated: \(documentID) is a certified PDF — drawn afresh, without its certification"
+                    )
+                    onCertificationDropped()
                 }
                 try Self.redraw(pages, original: source, assets: assets, author: author, to: output) { done in
                     onProgress(originalBytes + Int64(done), total)
@@ -233,6 +276,15 @@ public struct AnnotatedPDFRenderer: Sendable {
             try? FileManager.default.removeItem(at: output)
             throw error
         }
+    }
+
+    /// Whether the original carries certification permissions: a `/Perms`
+    /// entry in its catalog, the mark of a document signed so that changes
+    /// to it are restricted or detected.
+    static func isCertified(_ document: CGPDFDocument) -> Bool {
+        var permissions: CGPDFObjectRef?
+        guard let catalog = document.catalog else { return false }
+        return CGPDFDictionaryGetObject(catalog, "Perms", &permissions)
     }
 
     /// The long way round: every page drawn afresh into a new PDF, the page
@@ -446,10 +498,15 @@ public struct AnnotatedPDFRenderer: Sendable {
     /// else — a page added on the tablet, pages reordered or dropped, or
     /// encryption — goes the long way round. A document that comes out wrong
     /// is worse than one that comes out without its links.
+    ///
+    /// A `certified` original is refused as soon as there is something to
+    /// append: an incremental update would break its certification. With
+    /// nothing to append it is copied as it stands, certification and all.
     private func overlay(
         order: [PageOrder.Page],
         pages: [Sheet],
         original: URL,
+        certified: Bool,
         assets: [String: Data],
         to output: URL
     ) throws -> Bool {
@@ -542,6 +599,10 @@ public struct AnnotatedPDFRenderer: Sendable {
             try FileManager.default.copyItem(at: original, to: output)
             RMRenderLog.pageDebug("annotated: no marks on any page — the original goes out as it is")
             return true
+        }
+        if certified {
+            RMRenderLog.pageDebug("annotated: overlay declined — the original is certified")
+            return false
         }
 
         do {

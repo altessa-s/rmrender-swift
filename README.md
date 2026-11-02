@@ -251,14 +251,23 @@ afresh**. A fresh export keeps URI and in-document links and the outline,
 remapped through the new page order, but not other annotations, forms or
 signatures.
 
-Some files are refused rather than changed silently:
+A **certified** document (one whose catalog carries `/Perms`) takes no
+incremental update, since appending to it would break the certification. With
+marks on it, it is drawn afresh by default: links and the outline are kept, the
+certification is not, and the `onCertificationDropped` callback is called.
+Pass `refuseCertified: true` to have such a document refused with
+`RenderError.unsupportedFormat` instead. A certified document without marks
+goes out unchanged, certification included.
 
-- a document with certification permissions (`/Perms`) is not redrawn
-  automatically; pass `allowOverlay: false` to ask for a fresh export, which
-  does not keep the certification;
-- a page with a `/UserUnit` other than 1;
-- an attachment that is present but is not a decodable image. A missing one is
-  left out; ink-only bitmaps do not decode images at all.
+An image whose attachment is missing, too large or not a decodable PNG or JPEG
+leaves a **hole**: the page is drawn without it, the export goes on, and
+`onMissingImages` reports how many pages lost an image and how many
+attachments are missing (`NotebookRenderer` has the same callback).
+`PageRenderer`, which is handed its attachments, draws the same hole and logs
+it.
+
+A page with a `/UserUnit` other than 1 is refused with
+`RenderError.unsupportedFormat`.
 
 The reader handles cross-reference tables and streams, hybrid files, packed
 objects and indirect stream lengths, with bounded decompression and checks on

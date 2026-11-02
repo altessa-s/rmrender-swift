@@ -72,6 +72,11 @@ public enum PageRenderer {
     /// process beside the parsed pages and their attachments. The product path
     /// writes to a file — see the overload below. This one is for tests and for
     /// command-line use, where the documents are small and a `Data` reads better.
+    ///
+    /// An image whose attachment is absent from `assets`, or whose bytes do
+    /// not decode, leaves a hole where it stood and a line in the log; the
+    /// page is drawn all the same. The same holds for the other entry points
+    /// here.
     public static func pdf(
         pages: [RMPage],
         pageSize: CGSize = defaultPageSize,
@@ -82,7 +87,6 @@ public enum PageRenderer {
         assets: [String: Data] = [:],
         author: String? = nil
     ) throws -> Data {
-        try PageAssets.validate(assets, for: pages)
         guard let buffer = CFDataCreateMutable(nil, 0),
               let consumer = CGDataConsumer(data: buffer)
         else {
@@ -112,7 +116,6 @@ public enum PageRenderer {
         inkOnly: Bool = false,
         grayscale: Bool = false
     ) throws -> CGImage {
-        if !inkOnly { try PageAssets.validate(assets, for: [page]) }
         // Grown as a PDF page grows (`grownSheet`, shared with
         // `pdf(pages:pageSize:paper:...)` above), but never cut: a page
         // stretched with the tablet's "extend page" runs its ink past
@@ -194,7 +197,6 @@ public enum PageRenderer {
         author: String? = nil,
         to url: URL
     ) throws {
-        try PageAssets.validate(assets, for: pages)
         guard let consumer = CGDataConsumer(url: url as CFURL) else {
             throw RenderError.pdfContextUnavailable
         }
@@ -687,8 +689,8 @@ public enum PageRenderer {
     /// solved on three corners; the fourth follows, because the format writes
     /// parallelograms (indexes `0 1 2 2 3 0`).
     ///
-    /// An image whose bytes are missing leaves a hole and a log line — the
-    /// document still comes out.
+    /// An image whose bytes are missing, or do not decode, leaves a hole and
+    /// a log line — the document still comes out.
     private static func drawImage(
         _ image: PageImage,
         assets: [String: Data],
@@ -696,9 +698,15 @@ public enum PageRenderer {
         pageSize: CGSize
     ) {
         guard image.vertices.count == 4 else { return }
-        guard let data = assets[image.file], let decoded = decodeImage(data) else {
+        guard let data = assets[image.file] else {
             RMRenderLog.pageError(
                 "render: no bytes for an image of the page — a hole where it stood"
+            )
+            return
+        }
+        guard let decoded = decodeImage(data) else {
+            RMRenderLog.pageError(
+                "render: the bytes of an image of the page do not decode — a hole where it stood"
             )
             return
         }

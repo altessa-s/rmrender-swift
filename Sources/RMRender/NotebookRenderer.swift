@@ -52,6 +52,15 @@ public struct NotebookRenderer: Sendable {
     /// two numbers, on purpose. A trailing closure finds `onProgress` scanning
     /// forwards and `onUnreadable` scanning backwards, and a one-number
     /// closure written for either cannot be taken for this one.
+    ///
+    /// `onMissingImages` is called at most once, when pages are drawn with a
+    /// hole where an image stood: its attachment is absent from the index,
+    /// failed to arrive, is past the size budget, or holds bytes that do not
+    /// decode as an image. It is told how many pages lost an image and how
+    /// many attachments are missing. The render goes on without them. It
+    /// stands third and takes two numbers for the same reason `onPageCount`
+    /// does: a one-number closure trailing an `onPageCount:` label is refused
+    /// by the compiler rather than taken for it.
     public func renderPDF(
         documentID: String,
         index: DocumentFiles,
@@ -61,6 +70,7 @@ public struct NotebookRenderer: Sendable {
         includesUnlistedPages: Bool = true,
         onProgress: @Sendable (_ completed: Int, _ total: Int) -> Void = { _, _ in },
         onPageCount: @Sendable (_ drawn: Int, _ document: Int) -> Void = { _, _ in },
+        onMissingImages: @Sendable (_ pages: Int, _ images: Int) -> Void = { _, _ in },
         onUnsupported: @Sendable (_ pages: Int) -> Void = { _ in },
         onUnreadable: @Sendable (_ pages: Int) -> Void = { _ in }
     ) async throws -> Data {
@@ -71,6 +81,7 @@ public struct NotebookRenderer: Sendable {
             includesUnlistedPages: includesUnlistedPages,
             onProgress: onProgress,
             onPageCount: onPageCount,
+            onMissingImages: onMissingImages,
             onUnsupported: onUnsupported,
             onUnreadable: onUnreadable
         )
@@ -107,6 +118,7 @@ public struct NotebookRenderer: Sendable {
         includesUnlistedPages: Bool = true,
         onProgress: @Sendable (_ completed: Int, _ total: Int) -> Void = { _, _ in },
         onPageCount: @Sendable (_ drawn: Int, _ document: Int) -> Void = { _, _ in },
+        onMissingImages: @Sendable (_ pages: Int, _ images: Int) -> Void = { _, _ in },
         onUnsupported: @Sendable (_ pages: Int) -> Void = { _ in },
         onUnreadable: @Sendable (_ pages: Int) -> Void = { _ in }
     ) async throws {
@@ -117,6 +129,7 @@ public struct NotebookRenderer: Sendable {
             includesUnlistedPages: includesUnlistedPages,
             onProgress: onProgress,
             onPageCount: onPageCount,
+            onMissingImages: onMissingImages,
             onUnsupported: onUnsupported,
             onUnreadable: onUnreadable
         )
@@ -144,6 +157,7 @@ public struct NotebookRenderer: Sendable {
         includesUnlistedPages: Bool = true,
         onProgress: @Sendable (_ completed: Int, _ total: Int) -> Void = { _, _ in },
         onPageCount: @Sendable (_ drawn: Int, _ document: Int) -> Void = { _, _ in },
+        onMissingImages: @Sendable (_ pages: Int, _ images: Int) -> Void = { _, _ in },
         onUnsupported: @Sendable (_ pages: Int) -> Void = { _ in },
         onUnreadable: @Sendable (_ pages: Int) -> Void = { _ in }
     ) async throws -> [CGImage] {
@@ -154,6 +168,7 @@ public struct NotebookRenderer: Sendable {
             includesUnlistedPages: includesUnlistedPages,
             onProgress: onProgress,
             onPageCount: onPageCount,
+            onMissingImages: onMissingImages,
             onUnsupported: onUnsupported,
             onUnreadable: onUnreadable
         )
@@ -281,6 +296,7 @@ public struct NotebookRenderer: Sendable {
         includesUnlistedPages: Bool = true,
         onProgress: @Sendable (_ completed: Int, _ total: Int) -> Void = { _, _ in },
         onPageCount: @Sendable (_ drawn: Int, _ document: Int) -> Void = { _, _ in },
+        onMissingImages: @Sendable (_ pages: Int, _ images: Int) -> Void = { _, _ in },
         onUnsupported: @Sendable (_ pages: Int) -> Void = { _ in },
         onUnreadable: @Sendable (_ pages: Int) -> Void = { _ in }
     ) async throws -> ParsedNotebook {
@@ -485,8 +501,12 @@ public struct NotebookRenderer: Sendable {
         // carry a scene size — which is the ordinary case, and the reason this
         // precedence exists — would otherwise have its turn silently overruled
         // and come out upright.
-        let assets = await assets(for: pages, index: index, owner: documentID)
-        try PageAssets.validate(assets)
+        let assets = PageAssets.decodable(
+            await assets(for: pages, index: index, owner: documentID),
+            channel: "render"
+        )
+        let holes = PageAssets.holes(in: pages, assets: assets)
+        if holes.pages > 0 { onMissingImages(holes.pages, holes.images) }
         return ParsedNotebook(
             pages: pages,
             pageSize: Self.canvas(declared: declared ?? layout.pageSize, isLandscape: layout.isLandscape),

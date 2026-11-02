@@ -22,19 +22,41 @@ import RMLines
 /// held together while the pages are drawn, so it is their total that has to
 /// fit. See `PageRenderer.maximumAssetBytes`.
 ///
-/// Gathering does not throw: a missing attachment costs only its own image.
-/// Export validation is separate and rejects present bytes that cannot be
-/// decoded, so corruption is not silently reported as a successful export.
+/// Nothing here throws. An attachment that is missing, refused or
+/// undecodable costs its own image and nothing else — the page is still
+/// drawn, with a hole where the picture stood — and `holes` counts what was
+/// lost, so that a caller can say so.
 enum PageAssets {
-    /// Missing files may be omitted; present but undecodable images must not
-    /// turn into silent holes in an otherwise successful export.
-    static func validate(_ assets: [String: Data], for pages: [RMPage]? = nil) throws {
-        let wanted = pages.map { Set($0.flatMap { $0.images.map(\.file) }) }
-        for name in assets.keys.sorted() where wanted?.contains(name) != false {
-            guard let data = assets[name], PageRenderer.decodeImage(data) != nil else {
-                throw RenderError.malformedPage("attachment is not a supported, valid image: \(name)")
-            }
+    /// The attachments the drawing can use. One whose bytes do not decode as
+    /// an image — torn, neither PNG nor JPEG, or past
+    /// `PageRenderer.maximumImagePixels` — is taken out and named in the log,
+    /// so that its page is drawn with the same hole a missing one leaves.
+    static func decodable(_ assets: [String: Data], channel: String) -> [String: Data] {
+        var kept = assets
+        for name in assets.keys.sorted() where assets[name].flatMap(PageRenderer.decodeImage) == nil {
+            kept[name] = nil
+            RMRenderLog.pageError(
+                """
+                \(channel): an attachment of \(assets[name]?.count ?? 0) bytes does not \
+                decode as an image — a hole where its image stood
+                """
+            )
         }
+        return kept
+    }
+
+    /// How many pages name an image that `assets` does not hold, and how many
+    /// distinct attachments those images are.
+    static func holes(in pages: [RMPage], assets: [String: Data]) -> (pages: Int, images: Int) {
+        var missing: Set<String> = []
+        var pagesWithHoles = 0
+        for page in pages {
+            let lost = page.images.map(\.file).filter { assets[$0] == nil }
+            guard !lost.isEmpty else { continue }
+            pagesWithHoles += 1
+            missing.formUnion(lost)
+        }
+        return (pagesWithHoles, missing.count)
     }
 
     /// - Parameters:

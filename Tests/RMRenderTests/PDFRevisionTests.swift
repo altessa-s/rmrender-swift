@@ -4,7 +4,7 @@ import Foundation
 @testable import RMRender
 import Testing
 
-private func revisionFixture(generation: Int = 0, contents: String = "null", permissions: Bool = false, extra: String = "") -> Data {
+func revisionFixture(generation: Int = 0, contents: String = "null", permissions: Bool = false, extra: String = "") -> Data {
     let objects = [
         "<< /Type /Catalog /Pages 2 0 R \(permissions ? "/Perms << /DocMDP 3 0 R >>" : "") >>",
         "<< /Type /Pages /Kids [3 \(generation) R] /Count 1 >>",
@@ -70,7 +70,7 @@ func revisionReferenceValidation() throws {
     #expect(throws: PDFReadError.self) { try scanner.nextObject() }
 }
 
-@Test("Certification permissions refuse an incremental write before touching output")
+@Test("The writer refuses a certified original with a RenderError before touching output")
 func revisionCertification() throws {
     let original = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
     let output = original.appendingPathExtension("out")
@@ -81,17 +81,27 @@ func revisionCertification() throws {
     try revisionFixture(permissions: true).write(to: original)
     let sentinel = Data("unchanged".utf8)
     try sentinel.write(to: output)
-    #expect(throws: PDFOverlayWriter.OverlayError.certifiedDocument) {
+    let error = #expect(throws: RenderError.self) {
         try PDFOverlayWriter().write(original: original, overlays: [], to: output)
     }
+    guard case .unsupportedFormat(let reason)? = error else {
+        Issue.record("expected unsupportedFormat, got \(String(describing: error))")
+        return
+    }
+    #expect(reason.contains("certified"))
     #expect(try Data(contentsOf: output) == sentinel)
 }
 
 @Test("Only the default PDF user unit is supported", arguments: ["2", "0", "null", "(one)"])
 func revisionUserUnit(_ unit: String) throws {
-    #expect(throws: PDFReadError.unsupportedUserUnit) {
+    let error = #expect(throws: PDFReadError.self) {
         try PDFFile(bytes: revisionFixture(extra: "/UserUnit \(unit)")).pages()
     }
+    guard case .malformed(let reason)? = error else {
+        Issue.record("expected malformed, got \(String(describing: error))")
+        return
+    }
+    #expect(reason.contains("UserUnit"))
     #expect(try PDFFile(bytes: revisionFixture(extra: "/UserUnit 1.0")).pages().count == 1)
 }
 

@@ -232,12 +232,10 @@ public struct PDFOverlayWriter: Sendable {
     public enum OverlayError: Error, Sendable, Equatable {
         /// The page a mark belongs to is not in the original.
         case noSuchPage(Int)
-        /// Not thrown: the overlay is placed in the page's own coordinates and
-        /// keeps its `/Rotate`. Kept so that callers switching over the cases
-        /// still compile.
+        /// Never thrown: the overlay is placed in the page's own coordinates
+        /// and the page keeps its `/Rotate`. The case stays in the frozen set
+        /// so that an exhaustive `switch` over it compiles.
         case rotatedPage(Int)
-        /// Certification permissions require an explicit fresh export.
-        case certifiedDocument
     }
 
     public init() {}
@@ -255,6 +253,11 @@ public struct PDFOverlayWriter: Sendable {
     /// The same, for a caller that has already read the file: the page tree of
     /// a five-hundred-page book is not worth walking twice, and the caller has
     /// to walk it anyway to know whether the overlay applies at all.
+    ///
+    /// A certified original — `/Perms` in its catalog — is refused with
+    /// `RenderError.unsupportedFormat` before anything is written: an
+    /// incremental update breaks the certification. `AnnotatedPDFRenderer`
+    /// makes the same check itself and draws such a document afresh instead.
     public func write(
         file: PDFFile,
         pages: [PDFFile.Page],
@@ -263,7 +266,9 @@ public struct PDFOverlayWriter: Sendable {
         to output: URL
     ) throws {
         let root = try file.resolve(file.trailer["Root"]).dictionaryValue
-        guard root?["Perms"] == nil else { throw OverlayError.certifiedDocument }
+        guard root?["Perms"] == nil else {
+            throw RenderError.unsupportedFormat("a certified PDF (/Perms) takes no incremental update")
+        }
         for overlay in overlays {
             guard overlay.pageIndex >= 0, overlay.pageIndex < pages.count else {
                 throw OverlayError.noSuchPage(overlay.pageIndex)
