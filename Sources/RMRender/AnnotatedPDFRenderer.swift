@@ -117,6 +117,27 @@ public struct AnnotatedPDFRenderer: Sendable {
     /// overlay writes onto the original's own pages, all of them, and a
     /// document shorter than its original is not one it can make. The
     /// output loses the original's links and outline for it.
+    ///
+    /// A certified original — one whose catalog carries `/Perms` — takes no
+    /// incremental update: appending to it would break the certification.
+    /// Whenever it is drawn afresh — because there are marks to append, or
+    /// for any of the reasons above — the output keeps its links and outline
+    /// and not its certification, and `onCertificationDropped` is called once
+    /// before the drawing starts. A certified original with no marks on pages
+    /// in its own order goes out as it is, certification included, and
+    /// nothing is called. `refuseCertified` turns the fresh drawing into a
+    /// refusal: the render throws `RenderError.unsupportedFormat` instead and
+    /// writes no output.
+    ///
+    /// A page whose `/UserUnit` is other than 1 is refused with
+    /// `RenderError.unsupportedFormat`: neither route scales the marks by it.
+    ///
+    /// An image the marks place on a page and the drawing cannot show — its
+    /// attachment is absent from the index, failed to arrive, is past the
+    /// size budget, or holds bytes that do not decode as an image — leaves a
+    /// hole where it stood, and the page is drawn without it. The render goes
+    /// on, and `onMissingImages` is called once with the number of pages that
+    /// lost an image and the number of attachments missing.
     public func renderPDF(
         documentID: String,
         index: DocumentFiles,
@@ -125,6 +146,9 @@ public struct AnnotatedPDFRenderer: Sendable {
         // same document, and the choice is otherwise made here rather than by
         // the caller.
         allowOverlay: Bool = true,
+        // Strict mode for certified originals: see above. Off by default, so
+        // that a certified document comes out with its marks drawn.
+        refuseCertified: Bool = false,
         author: String? = nil,
         maximumPages: Int? = nil,
         onProgress: @escaping @Sendable (_ completed: Int64, _ total: Int64) -> Void = { _, _ in },
@@ -132,6 +156,13 @@ public struct AnnotatedPDFRenderer: Sendable {
         // `NotebookRenderer.renderPDF`. A trailing closure still finds
         // `onProgress` forwards and `onUnreadable` backwards.
         onPageCount: @escaping @Sendable (_ drawn: Int, _ document: Int) -> Void = { _, _ in },
+        // Two numbers, like `onPageCount`, so that a trailing closure written
+        // for `onUnsupported` after an `onPageCount:` label is refused by the
+        // compiler rather than taken for this one. See `NotebookRenderer`.
+        onMissingImages: @escaping @Sendable (_ pages: Int, _ images: Int) -> Void = { _, _ in },
+        // No arguments, so that no closure written for the callbacks around
+        // it can be taken for it.
+        onCertificationDropped: @escaping @Sendable () -> Void = {},
         // Called at most once, and only when the marks on some of the pages
         // are in an older `.rm` generation. The same division of labour as in
         // `NotebookRenderer`: this renderer knows what it could not read, and
@@ -165,6 +196,18 @@ public struct AnnotatedPDFRenderer: Sendable {
             throw RenderError.malformedPage("the document's PDF does not open")
         }
 
+        let certified = Self.isCertified(original)
+
+        for position in 0..<original.numberOfPages {
+            guard let page = original.page(at: position + 1), let dictionary = page.dictionary else { continue }
+            var object: CGPDFObjectRef?
+            if CGPDFDictionaryGetObject(dictionary, "UserUnit", &object) {
+                var unit: CGPDFReal = 0
+                guard CGPDFDictionaryGetNumber(dictionary, "UserUnit", &unit), unit == 1 else {
+                    throw RenderError.unsupportedFormat("non-default PDF UserUnit")
+                }
+            }
+        }
         let resolved = try await pageOrder(
             index: index, original: original, owner: documentID, maximumPages: maximumPages
         )
@@ -181,7 +224,13 @@ public struct AnnotatedPDFRenderer: Sendable {
         let total = originalBytes + Int64(pages.count)
         onProgress(originalBytes, total)
 
-        let assets = await assets(for: pages.compactMap(\.marks), index: index, owner: documentID)
+        let marked = pages.compactMap(\.marks)
+        let assets = PageAssets.decodable(
+            await assets(for: marked, index: index, owner: documentID),
+            channel: "annotated"
+        )
+        let holes = PageAssets.holes(in: marked, assets: assets)
+        if holes.pages > 0 { onMissingImages(holes.pages, holes.images) }
 
         // Everything from here on is drawing, and drawing is the long part of
         // a render — so it goes off the caller's executor into a detached
@@ -198,9 +247,22 @@ public struct AnnotatedPDFRenderer: Sendable {
                 // outline, which redrawing loses — and it refuses more often
                 // than not, because it only knows how to put marks onto pages
                 // that are already there.
-                if allowOverlay, try overlay(order: order, pages: pages, original: source, to: output) {
+                if allowOverlay, try overlay(
+                    order: order, pages: pages, original: source, certified: certified, assets: assets, to: output
+                ) {
                     onProgress(total, total)
                     return
+                }
+                if certified {
+                    guard !refuseCertified else {
+                        throw RenderError.unsupportedFormat(
+                            "a certified PDF (/Perms) whose certification a fresh export would drop"
+                        )
+                    }
+                    RMRenderLog.pageError(
+                        "annotated: \(documentID) is a certified PDF — drawn afresh, without its certification"
+                    )
+                    onCertificationDropped()
                 }
                 try Self.redraw(pages, original: source, assets: assets, author: author, to: output) { done in
                     onProgress(originalBytes + Int64(done), total)
@@ -214,6 +276,15 @@ public struct AnnotatedPDFRenderer: Sendable {
             try? FileManager.default.removeItem(at: output)
             throw error
         }
+    }
+
+    /// Whether the original carries certification permissions: a `/Perms`
+    /// entry in its catalog, the mark of a document signed so that changes
+    /// to it are restricted or detected.
+    static func isCertified(_ document: CGPDFDocument) -> Bool {
+        var permissions: CGPDFObjectRef?
+        guard let catalog = document.catalog else { return false }
+        return CGPDFDictionaryGetObject(catalog, "Perms", &permissions)
     }
 
     /// The long way round: every page drawn afresh into a new PDF, the page
@@ -247,6 +318,8 @@ public struct AnnotatedPDFRenderer: Sendable {
             throw RenderError.pdfContextUnavailable
         }
 
+        let navigation = try PDFNavigation(original: original, document: document,
+                                           mapping: pages.map { ($0.redir, $0.marks?.rootDocumentVisible != false, $0.sheet) })
         for (done, page) in pages.enumerated() {
             // Nothing in this loop suspends, so it is not interruptible on its
             // own: without asking, a redraw of a five-hundred-page book runs to
@@ -259,10 +332,12 @@ public struct AnnotatedPDFRenderer: Sendable {
                 marks: page.marks,
                 sheet: page.sheet,
                 into: context,
-                assets: assets
+                assets: assets,
+                navigation: { navigation.draw(page: done, in: $0) }
             )
             onPageDrawn(done + 1)
         }
+        navigation.finish(in: context)
         context.closePDF()
     }
 
@@ -305,7 +380,8 @@ public struct AnnotatedPDFRenderer: Sendable {
         marks: RMPage?,
         sheet size: CGSize,
         into context: CGContext,
-        assets: [String: Data] = [:]
+        assets: [String: Data] = [:],
+        navigation: ((CGContext) -> Void)? = nil
     ) {
         let sheet = CGRect(origin: .zero, size: size)
         // The drawing happens in `.rm` units: the sheet becomes a page of the
@@ -318,7 +394,14 @@ public struct AnnotatedPDFRenderer: Sendable {
             ?? CGRect(origin: .zero, size: units)
         let box = AnnotationGeometry.box(bounds, on: sheet)
 
-        context.beginPDFPage(pageInfo(mediaBox: box, artBox: sheet))
+        let placement = source.map { sourceTransform($0, onto: sheet) }
+        let crop = source.flatMap { page -> CGRect? in
+            guard marks?.rootDocumentVisible != false,
+                  page.getBoxRect(.cropBox) != page.getBoxRect(.mediaBox),
+                  let placement else { return nil }
+            return page.getBoxRect(.cropBox).applying(placement)
+        }
+        context.beginPDFPage(pageInfo(mediaBox: box, artBox: sheet, cropBox: crop))
         // Nothing is translated, and that is the point worth stating: a media
         // box beginning left of zero moves the page's edges, not its
         // coordinates. Drawing goes on at the same numbers throughout, and
@@ -335,6 +418,7 @@ public struct AnnotatedPDFRenderer: Sendable {
         // page's size — hiding changes what is drawn, not the geometry.
         if let source, marks?.rootDocumentVisible != false {
             context.saveGState()
+            context.concatenate(sourceTransform(source, onto: sheet))
             context.drawPDFPage(source)
             context.restoreGState()
         }
@@ -344,7 +428,15 @@ public struct AnnotatedPDFRenderer: Sendable {
             PageRenderer.draw(marks, in: context, pageSize: units, bounds: bounds, assets: assets)
             context.restoreGState()
         }
+        navigation?(context)
         context.endPDFPage()
+    }
+
+    static func sourceTransform(_ source: CGPDFPage, onto sheet: CGRect) -> CGAffineTransform {
+        let media = source.getBoxRect(.mediaBox)
+        return CGAffineTransform(translationX: sheet.midX, y: sheet.midY)
+            .rotated(by: -CGFloat(source.rotationAngle) * .pi / 180)
+            .translatedBy(x: -media.midX, y: -media.midY)
     }
 
     /// The imported PDF as a file: out of the cache when it is there, from the
@@ -403,14 +495,19 @@ public struct AnnotatedPDFRenderer: Sendable {
     ///
     /// The refusals are deliberate and wide. The overlay writes onto pages the
     /// original already has, in the order it already has them, so anything
-    /// else — a page added on the tablet, pages reordered or dropped, typed
-    /// text that would need a font, a turned page, a cross-reference stream,
+    /// else — a page added on the tablet, pages reordered or dropped, or
     /// encryption — goes the long way round. A document that comes out wrong
     /// is worse than one that comes out without its links.
+    ///
+    /// A `certified` original is refused as soon as there is something to
+    /// append: an incremental update would break its certification. With
+    /// nothing to append it is copied as it stands, certification and all.
     private func overlay(
         order: [PageOrder.Page],
         pages: [Sheet],
         original: URL,
+        certified: Bool,
+        assets: [String: Data],
         to output: URL
     ) throws -> Bool {
         guard let file = try? PDFFile(url: original) else { return false }
@@ -422,46 +519,74 @@ public struct AnnotatedPDFRenderer: Sendable {
         }
         // A page whose source the user hid cannot be done by appending: the
         // original page would stay visible under the marks. The redraw path
-        // knows how to leave it out. A page carrying images goes the same
-        // way — the overlay writes strokes and knows nothing of textures.
-        for sheet in pages {
-            if sheet.marks?.rootDocumentVisible == false { return false }
-            if sheet.marks?.images.isEmpty == false { return false }
-            if sheet.marks?.text != nil { return false }
-        }
+        // knows how to leave it out. Text, images and erased strokes use a
+        // native PDF Form rendered by the same PageRenderer as fresh export.
+        for sheet in pages where sheet.marks?.rootDocumentVisible == false { return false }
 
         var overlays: [PDFOverlayWriter.Overlay] = []
         for (position, sheet) in pages.enumerated() {
             guard let marks = sheet.marks else { continue }
-            guard !marks.strokes.isEmpty || !marks.highlights.isEmpty else { continue }
-            // A page cropped to less than its media box is left to the
-            // redrawing path. Marks are placed against the media box, and a
-            // reader shows the crop — the two disagree by the difference
-            // between the boxes, and which of them the tablet drew against is
-            // not something any live document has yet answered.
+            guard !marks.strokes.isEmpty || !marks.highlights.isEmpty || !marks.images.isEmpty || marks.text != nil else { continue }
             let original = originalPages[position]
-            if let crop = original.cropBox, let box = original.mediaBox, crop != box { return false }
-            guard let box = original.mediaBox,
-                  let built = MarkContentStream.build(marks, mediaBox: box)
-            else { return false }
-            // The marks are placed against the page's own box, and that stays
-            // what it is — `MarkContentStream` centres on it. What grows is
-            // the box the reader shows.
-            let grown = AnnotationGeometry.box(
+            guard let box = original.mediaBox, original.rotation.isMultiple(of: 90) else { return false }
+            let rotated = !original.rotation.isMultiple(of: 360)
+            let drawingBox = rotated ? CGRect(origin: .zero, size: sheet.sheet) : box
+            let built = marks.text == nil && marks.images.isEmpty ? MarkContentStream.build(marks, mediaBox: drawingBox) : nil
+            var grown = AnnotationGeometry.box(
                 PageRenderer.contentBounds(
                     of: marks,
-                    pageSize: AnnotationGeometry.units(of: box.size),
+                    pageSize: AnnotationGeometry.units(of: drawingBox.size),
                     edge: Self.markEdge
                 ),
-                on: box
+                on: drawingBox
             )
+            var native: Data?
+            var content: Data
+            if let built {
+                content = built.content
+            } else {
+                let data = NSMutableData()
+                var media = grown
+                guard let consumer = CGDataConsumer(data: data),
+                      let context = CGContext(consumer: consumer, mediaBox: &media, nil) else {
+                    throw RenderError.pdfContextUnavailable
+                }
+                context.beginPDFPage(nil)
+                context.translateBy(x: drawingBox.minX, y: drawingBox.minY)
+                context.scaleBy(x: Calibration.pointsPerUnit, y: Calibration.pointsPerUnit)
+                let units = AnnotationGeometry.units(of: drawingBox.size)
+                PageRenderer.draw(marks, in: context, pageSize: units,
+                                  bounds: PageRenderer.contentBounds(of: marks, pageSize: units, edge: Self.markEdge),
+                                  assets: assets)
+                context.endPDFPage()
+                context.closePDF()
+                native = data as Data
+                content = Data("q /RMNative Do Q\n".utf8)
+            }
+            if rotated {
+                // Marks use the displayed page's frame. The appended Form uses
+                // the original page's frame and keeps its /Rotate unchanged.
+                let placement = CGAffineTransform(translationX: drawingBox.midX, y: drawingBox.midY)
+                    .rotated(by: -CGFloat(original.rotation % 360) * .pi / 180)
+                    .translatedBy(x: -box.midX, y: -box.midY)
+                    .inverted()
+                let matrix = [placement.a, placement.b, placement.c, placement.d, placement.tx, placement.ty]
+                    .map { PDFWriter.number(Double($0), places: 10) }.joined(separator: " ")
+                content = Data("q \(matrix) cm\n".utf8) + content + Data("\nQ\n".utf8)
+                grown = grown.applying(placement)
+            }
+            let unchangedBox = zip(
+                [grown.minX, grown.minY, grown.maxX, grown.maxY],
+                [box.minX, box.minY, box.maxX, box.maxY]
+            ).allSatisfy { abs($0 - $1) < 1e-8 }
             overlays.append(
                 PDFOverlayWriter.Overlay(
                     pageIndex: position,
-                    content: built.content,
-                    states: built.states,
-                    images: built.images,
-                    box: grown == box ? nil : grown
+                    content: content,
+                    states: built?.states ?? [],
+                    images: built?.images ?? [],
+                    box: unchangedBox ? nil : grown,
+                    formPDF: native
                 )
             )
         }
@@ -474,6 +599,10 @@ public struct AnnotatedPDFRenderer: Sendable {
             try FileManager.default.copyItem(at: original, to: output)
             RMRenderLog.pageDebug("annotated: no marks on any page — the original goes out as it is")
             return true
+        }
+        if certified {
+            RMRenderLog.pageDebug("annotated: overlay declined — the original is certified")
+            return false
         }
 
         do {
@@ -608,7 +737,9 @@ public struct AnnotatedPDFRenderer: Sendable {
             // in points.
             let sheet: CGSize
             if let source {
-                sheet = source.getBoxRect(.mediaBox).size
+                let box = source.getBoxRect(.mediaBox)
+                sheet = source.rotationAngle.isMultiple(of: 180)
+                    ? box.size : CGSize(width: box.height, height: box.width)
             } else {
                 sheet = AnnotationGeometry.sheet(
                     forScene: PageRenderer.plausibleCanvas(marks[position]?.paperSize) ?? PageRenderer.defaultPageSize
@@ -717,14 +848,16 @@ public struct AnnotatedPDFRenderer: Sendable {
     /// same reason the tablet's own export writes one: once the media box has
     /// grown around the marks, nothing else in the file says where the sheet
     /// originally stood.
-    private static func pageInfo(mediaBox: CGRect, artBox: CGRect) -> CFDictionary {
+    private static func pageInfo(mediaBox: CGRect, artBox: CGRect, cropBox: CGRect? = nil) -> CFDictionary {
         func data(_ rectangle: CGRect) -> CFData {
             var box = rectangle
             return Data(bytes: &box, count: MemoryLayout<CGRect>.size) as CFData
         }
-        return [
+        var info = [
             kCGPDFContextMediaBox as String: data(mediaBox),
             kCGPDFContextArtBox as String: data(artBox),
-        ] as CFDictionary
+        ]
+        if let cropBox { info[kCGPDFContextCropBox as String] = data(cropBox) }
+        return info as CFDictionary
     }
 }

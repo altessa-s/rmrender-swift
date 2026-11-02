@@ -238,12 +238,10 @@ func overlayAndRedrawDrawTheSamePage() async throws {
     #expect(apart < 0.05, "the two routes drew \(overlaid) and \(drawn) — \(Int(apart * 100))% apart")
 }
 
-// An eraser is the case the overlay cannot do: appended operators cannot cut
-// what the page already carries, so a page holding one has to go the long way
-// round. It is the same assertion as above, and that is deliberate — the
-// refusal is only worth anything if the page it produces still matches.
-@Test("A page somebody rubbed out agrees too, because the overlay hands it back")
-func aPageWithAnEraserAgreesBecauseTheOverlayRefusesIt() async throws {
+// Erasing applies to the tablet ink inside the imported overlay Form.
+// The original PDF stays intact, and the visible result must match redraw.
+@Test("A page somebody rubbed out agrees and preserves the original PDF")
+func aPageWithAnEraserPreservesTheOriginalAndMatchesRedraw() async throws {
     let bytes = markedPageWithAnEraser()
     // The fixture first: a page whose second stroke is not the eraser would
     // make everything below pass for the wrong reason.
@@ -263,8 +261,8 @@ func aPageWithAnEraserAgreesBecauseTheOverlayRefusesIt() async throws {
 
     let source = try Data(contentsOf: fixture.original)
     #expect(
-        try !Data(contentsOf: appended).starts(with: source),
-        "the overlay has to refuse a page with an eraser on it"
+        try Data(contentsOf: appended).starts(with: source),
+        "the overlay must preserve the original PDF bytes even when ink is erased"
     )
 
     let overlaid = try inkOfPage(appended, page: 1)

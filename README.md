@@ -236,6 +236,44 @@ in the PDFs it writes. They are under the SIL Open Font License; each family's
 licence file lies beside it in `Sources/RMRender/Fonts`. The CJK files are most
 of the package's size.
 
+## Annotated PDFs
+
+`AnnotatedPDFRenderer` first tries an **incremental update**: the marks are
+appended to the original file, so its links, outline and text stay as they
+were. Strokes become PDF operators; typed text, images
+and erased strokes are drawn by the same `PageRenderer` as a fresh export and
+imported as a Form. Quarter-turn page rotations, shifted origins and a
+`CropBox` are kept, and ink that runs past the page grows the box shown.
+
+When the update cannot be made — a page added, removed or reordered on the
+tablet, a hidden source page, or an encrypted file — the document is **drawn
+afresh**. A fresh export keeps URI and in-document links and the outline,
+remapped through the new page order, but not other annotations, forms or
+signatures.
+
+A **certified** document (one whose catalog carries `/Perms`) takes no
+incremental update, since appending to it would break the certification. With
+marks on it, it is drawn afresh by default: links and the outline are kept, the
+certification is not, and the `onCertificationDropped` callback is called.
+Pass `refuseCertified: true` to have such a document refused with
+`RenderError.unsupportedFormat` instead. A certified document without marks
+goes out unchanged, certification included.
+
+An image whose attachment is missing, too large or not a decodable PNG or JPEG
+leaves a **hole**: the page is drawn without it, the export goes on, and
+`onMissingImages` reports how many pages lost an image and how many
+attachments are missing (`NotebookRenderer` has the same callback).
+`PageRenderer`, which is handed its attachments, draws the same hole and logs
+it.
+
+A page with a `/UserUnit` other than 1 is refused with
+`RenderError.unsupportedFormat`.
+
+The reader handles cross-reference tables and streams, hybrid files, packed
+objects and indirect stream lengths, with bounded decompression and checks on
+generations, references and byte ranges. Output is written to a temporary file
+and moved into place when complete.
+
 ## PDF tagging
 
 Off by default:

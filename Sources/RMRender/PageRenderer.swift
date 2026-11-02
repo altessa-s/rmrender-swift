@@ -64,7 +64,7 @@ public enum PageRenderer {
     ///
     /// Bump it together with any change to the drawing or to the numbers in
     /// `Calibration`. Never reuse a number.
-    public static let version = 94
+    public static let version = 95
 
     /// The pages as a PDF held in memory.
     ///
@@ -72,6 +72,11 @@ public enum PageRenderer {
     /// process beside the parsed pages and their attachments. The product path
     /// writes to a file — see the overload below. This one is for tests and for
     /// command-line use, where the documents are small and a `Data` reads better.
+    ///
+    /// An image whose attachment is absent from `assets`, or whose bytes do
+    /// not decode, leaves a hole where it stood and a line in the log; the
+    /// page is drawn all the same. The same holds for the other entry points
+    /// here.
     public static func pdf(
         pages: [RMPage],
         pageSize: CGSize = defaultPageSize,
@@ -684,8 +689,8 @@ public enum PageRenderer {
     /// solved on three corners; the fourth follows, because the format writes
     /// parallelograms (indexes `0 1 2 2 3 0`).
     ///
-    /// An image whose bytes are missing leaves a hole and a log line — the
-    /// document still comes out.
+    /// An image whose bytes are missing, or do not decode, leaves a hole and
+    /// a log line — the document still comes out.
     private static func drawImage(
         _ image: PageImage,
         assets: [String: Data],
@@ -693,9 +698,15 @@ public enum PageRenderer {
         pageSize: CGSize
     ) {
         guard image.vertices.count == 4 else { return }
-        guard let data = assets[image.file], let decoded = decodeImage(data) else {
+        guard let data = assets[image.file] else {
             RMRenderLog.pageError(
                 "render: no bytes for an image of the page — a hole where it stood"
+            )
+            return
+        }
+        guard let decoded = decodeImage(data) else {
+            RMRenderLog.pageError(
+                "render: the bytes of an image of the page do not decode — a hole where it stood"
             )
             return
         }
@@ -773,7 +784,7 @@ public enum PageRenderer {
 
     /// The attachment's bytes as an image. PNG and JPEG are what the format
     /// carries — captures as PNG, insertions as what was inserted.
-    private static func decodeImage(_ data: Data) -> CGImage? {
+    static func decodeImage(_ data: Data) -> CGImage? {
         guard let provider = CGDataProvider(data: data as CFData) else { return nil }
         let decoded: CGImage?
         if data.starts(with: [0x89, 0x50, 0x4E, 0x47]) {

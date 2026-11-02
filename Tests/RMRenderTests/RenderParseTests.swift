@@ -264,7 +264,7 @@ func twoDeviceLayersOrderByAuthor() throws {
 // MARK: - Images
 
 /// The attachment map (`0x0E`): one entry, key to file name.
-private func attachmentMapBlock(key: [UInt8], file: String) -> [UInt8] {
+func attachmentMapBlock(key: [UInt8], file: String) -> [UInt8] {
     var inner = FixtureWriter()
     inner.appendID(index: 1, (author: 0, counter: 0))
     var string = FixtureWriter()
@@ -300,7 +300,7 @@ private func attachmentMapBlock(key: [UInt8], file: String) -> [UInt8] {
 
 /// One corner of a placed image: where it lands on the sheet, and which
 /// corner of the picture goes there.
-private struct ImageVertex {
+struct ImageVertex {
     var x: Float
     var y: Float
     var u: Float
@@ -308,7 +308,7 @@ private struct ImageVertex {
 }
 
 /// An image on the page (`0x0F`): the preamble, the key, four vertices.
-private func imageItemBlock(
+func imageItemBlock(
     parent: (author: UInt8, counter: UInt64) = (1, 1),
     item: (author: UInt8, counter: UInt64),
     left: (author: UInt8, counter: UInt64) = (0, 0),

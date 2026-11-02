@@ -69,7 +69,7 @@ enum PDFWriter {
         case .integer(let value):
             out.append(contentsOf: Array("\(value)".utf8))
         case .real(let value):
-            out.append(contentsOf: Array(number(value).utf8))
+            out.append(contentsOf: Array(number(value, places: 10).utf8))
         case .string(let raw):
             out.append(raw)
         case .name(let name):
@@ -106,9 +106,22 @@ enum PDFWriter {
     }
 
     /// A name with the bytes a name may not carry written as `#xx`.
+    ///
+    /// The reader keeps a name's bytes one per scalar (`PDFScanner.nameString`),
+    /// so a scalar below 256 is the byte itself. A scalar above it is no byte
+    /// the reader made; it comes from a name given here as text, and is
+    /// written as its UTF-8.
     private static func escaped(_ name: String) -> String {
+        var bytes: [UInt8] = []
+        for scalar in name.unicodeScalars {
+            if scalar.value < 256 {
+                bytes.append(UInt8(scalar.value))
+            } else {
+                bytes.append(contentsOf: Array(String(scalar).utf8))
+            }
+        }
         var out = ""
-        for byte in Array(name.utf8) {
+        for byte in bytes {
             let allowed = byte > 0x20 && byte < 0x7F && !Array("()<>[]{}/%#".utf8).contains(byte)
             out += allowed ? String(UnicodeScalar(byte)) : String(format: "#%02x", byte)
         }
@@ -116,10 +129,10 @@ enum PDFWriter {
     }
 
     /// A number the way PDF wants it: no exponent, no trailing noise.
-    static func number(_ value: Double) -> String {
+    static func number(_ value: Double, places: Int = 4) -> String {
         guard value.isFinite else { return "0" }
         if value == value.rounded(), abs(value) < 1e15 { return "\(Int(value))" }
-        var text = String(format: "%.4f", value)
+        var text = String(format: "%.*f", locale: Locale(identifier: "en_US_POSIX"), places, value)
         while text.hasSuffix("0") { text.removeLast() }
         if text.hasSuffix(".") { text.removeLast() }
         return text
@@ -204,19 +217,23 @@ public struct PDFOverlayWriter: Sendable {
         /// invisible. Nothing in the page's own coordinates moves — what
         /// changes is only which part of them counts as the page.
         public let box: CGRect?
+        /// A one-page PDF imported as the RMNative Form in this overlay.
+        public let formPDF: Data?
 
         public init(
             pageIndex: Int,
             content: Data,
             states: [GraphicsState],
             images: [ImageMask] = [],
-            box: CGRect? = nil
+            box: CGRect? = nil,
+            formPDF: Data? = nil
         ) {
             self.pageIndex = pageIndex
             self.content = content
             self.states = states
             self.images = images
             self.box = box
+            self.formPDF = formPDF
         }
     }
 
@@ -228,8 +245,9 @@ public struct PDFOverlayWriter: Sendable {
     public enum OverlayError: Error, Sendable, Equatable {
         /// The page a mark belongs to is not in the original.
         case noSuchPage(Int)
-        /// A page turned by 90 degrees or more: the marks would land sideways,
-        /// and no live document has needed it yet.
+        /// Never thrown: the overlay is placed in the page's own coordinates
+        /// and the page keeps its `/Rotate`. The case stays in the frozen set
+        /// so that an exhaustive `switch` over it compiles.
         case rotatedPage(Int)
     }
 
@@ -248,6 +266,11 @@ public struct PDFOverlayWriter: Sendable {
     /// The same, for a caller that has already read the file: the page tree of
     /// a five-hundred-page book is not worth walking twice, and the caller has
     /// to walk it anyway to know whether the overlay applies at all.
+    ///
+    /// A certified original — `/Perms` in its catalog — is refused with
+    /// `RenderError.unsupportedFormat` before anything is written: an
+    /// incremental update breaks the certification. `AnnotatedPDFRenderer`
+    /// makes the same check itself and draws such a document afresh instead.
     public func write(
         file: PDFFile,
         pages: [PDFFile.Page],
@@ -255,31 +278,24 @@ public struct PDFOverlayWriter: Sendable {
         overlays: [Overlay],
         to output: URL
     ) throws {
+        let root = try file.resolve(file.trailer["Root"]).dictionaryValue
+        guard root?["Perms"] == nil else {
+            throw RenderError.unsupportedFormat("a certified PDF (/Perms) takes no incremental update")
+        }
         for overlay in overlays {
             guard overlay.pageIndex >= 0, overlay.pageIndex < pages.count else {
                 throw OverlayError.noSuchPage(overlay.pageIndex)
             }
-            guard pages[overlay.pageIndex].rotation.isMultiple(of: 360) else {
-                throw OverlayError.rotatedPage(overlay.pageIndex)
-            }
         }
 
-        try? FileManager.default.removeItem(at: output)
-        try FileManager.default.copyItem(at: original, to: output)
-
-        let handle = try FileHandle(forWritingTo: output)
-        defer { try? handle.close() }
-        var offset = Int(try handle.seekToEnd())
-
-        // A file whose last byte is not a newline would run `%%EOF` into our
-        // first object.
-        if file.bytes.last != 0x0A {
-            try handle.write(contentsOf: Data([UInt8(ascii: "\n")]))
-            offset += 1
-        }
-
+        // Validate and construct the revision before touching the destination.
+        let offset = file.bytes.count
         var body = Data()
+        if file.bytes.last != 0x0A {
+            body.append(0x0A)
+        }
         var newOffsets: [Int: Int] = [:]
+        var newGenerations: [Int: Int] = [:]
         // `/Size` is the file's own word, and a word past any object number
         // the format can write is refused rather than counted on from: every
         // object this update adds is one more than the last, and one more
@@ -289,13 +305,18 @@ public struct PDFOverlayWriter: Sendable {
         guard size <= PDFFile.objectNumberLimit else {
             throw PDFReadError.malformed("a trailer /Size of \(size)")
         }
-        var nextNumber = max((file.offsets.keys.max() ?? 0) + 1, size)
+        // Past every number any section names, free ones included: a number
+        // freed in one revision may still be what an older object refers to,
+        // and a new object under it would answer that reference.
+        var nextNumber = max(file.highestObjectNumber + 1, size)
 
         func emit(_ object: PDFObject, number: Int? = nil) -> Int {
             let assigned = number ?? nextNumber
             if number == nil { nextNumber += 1 }
             newOffsets[assigned] = offset + body.count
-            body.append(contentsOf: Array("\(assigned) 0 obj\n".utf8))
+            let generation = number.flatMap { file.generations[$0] } ?? 0
+            newGenerations[assigned] = generation
+            body.append(contentsOf: Array("\(assigned) \(generation) obj\n".utf8))
             PDFWriter.append(object, to: &body)
             body.append(contentsOf: Array("\nendobj\n".utf8))
             return assigned
@@ -332,7 +353,6 @@ public struct PDFOverlayWriter: Sendable {
 
         for overlay in overlays {
             let page = pages[overlay.pageIndex]
-            let marks = emit(stream(overlay.content))
 
             // The states by the names this page's content says them. Two
             // pages may both say `/RMGs0` and mean different things by it;
@@ -373,13 +393,90 @@ public struct PDFOverlayWriter: Sendable {
                 dictionary["MediaBox"] = rectangle(box)
                 // The crop box is what a reader actually shows, and a page
                 // that declares none takes the media box. Leaving an old one
-                // behind would crop the marks back off.
-                dictionary["CropBox"] = rectangle(box)
+                // behind would crop the marks back off. An intentional crop smaller
+                // than the sheet remains the user's chosen visible area.
+                if let crop = page.cropBox, crop != page.mediaBox {
+                    dictionary["CropBox"] = rectangle(crop)
+                } else {
+                    dictionary["CropBox"] = rectangle(box)
+                }
                 // The sheet's original extent, kept the way the tablet's own
                 // export keeps it: once the media box has grown, nothing else
                 // in the file says which part of it is the imported page.
                 if let sheet = page.mediaBox { dictionary["ArtBox"] = rectangle(sheet) }
             }
+            // Scope overlay names inside a Form: the source may already use
+            // any of the names emitted by MarkContentStream or a public caller.
+            var resources = try file.resolve(page.resources).dictionaryValue ?? [:]
+            var scoped = resources
+            var scopedStates = try file.resolve(resources["ExtGState"]).dictionaryValue ?? [:]
+            var scopedObjects = try file.resolve(resources["XObject"]).dictionaryValue ?? [:]
+            scopedStates.merge(states) { _, added in added }
+            scopedObjects.merge(stencils) { _, added in added }
+            if let pdf = overlay.formPDF {
+                let source = try PDFFile(bytes: pdf)
+                let imported = try source.pages()
+                guard imported.count == 1, let first = imported.first else {
+                    throw PDFReadError.malformed("overlay PDF must have one page")
+                }
+                var mapped: [Int: Int] = [:]
+                func copy(_ value: PDFObject, depth: Int = 0) throws -> PDFObject {
+                    guard depth < 128 else { throw PDFReadError.malformed("overlay resource depth") }
+                    switch value {
+                    case .reference(let number, let generation):
+                        guard source.generations[number] == generation else {
+                            throw PDFReadError.malformed("overlay resource generation")
+                        }
+                        if let assigned = mapped[number] { return .reference(number: assigned, generation: 0) }
+                        let assigned = nextNumber
+                        nextNumber += 1
+                        mapped[number] = assigned
+                        let cloned = try copy(source.object(number), depth: depth + 1)
+                        _ = emit(cloned, number: assigned)
+                        return .reference(number: assigned, generation: 0)
+                    case .array(let values): return .array(try values.map { try copy($0, depth: depth + 1) })
+                    case .dictionary(let values): return .dictionary(try values.mapValues { try copy($0, depth: depth + 1) })
+                    case .stream(var dictionary, let data):
+                        dictionary["Length"] = .integer(data.count)
+                        return .stream(dictionary: try dictionary.mapValues { try copy($0, depth: depth + 1) }, data: data)
+                    default: return value
+                    }
+                }
+                var content = Data()
+                func appendContent(_ value: PDFObject?, depth: Int = 0) throws {
+                    guard depth < 128 else { throw PDFReadError.malformed("overlay content depth") }
+                    let resolved = try source.resolve(value)
+                    if case .array(let values) = resolved {
+                        for value in values { try appendContent(value, depth: depth + 1) }
+                    } else if case .stream(let dictionary, let bytes) = resolved {
+                        content.append(try source.decode(dictionary, bytes))
+                        content.append(10)
+                    } else if case .null = resolved { } else {
+                        throw PDFReadError.malformed("overlay content is not a stream")
+                    }
+                }
+                try appendContent(first.dictionary["Contents"])
+                let native = emit(stream([
+                    "Type": .name("XObject"), "Subtype": .name("Form"),
+                    "BBox": rectangle(first.mediaBox ?? .zero),
+                    "Resources": try copy(source.resolve(first.resources)),
+                ], content))
+                scopedObjects["RMNative"] = .reference(number: native, generation: 0)
+            }
+
+            scoped["ExtGState"] = .dictionary(scopedStates)
+            scoped["XObject"] = .dictionary(scopedObjects)
+            let form = emit(stream([
+                "Type": .name("XObject"), "Subtype": .name("Form"),
+                "BBox": rectangle(overlay.box ?? page.mediaBox ?? .zero),
+                "Resources": .dictionary(scoped),
+            ], overlay.content))
+            var objects = try file.resolve(resources["XObject"]).dictionaryValue ?? [:]
+            var name = "RMOverlay"
+            while objects[name] != nil { name += "_" }
+            objects[name] = .reference(number: form, generation: 0)
+            resources["XObject"] = .dictionary(objects)
+            let marks = emit(stream("q /\(name) Do Q\n"))
             dictionary["Contents"] = .array(
                 [.reference(number: openState, generation: 0)]
                     + (try contentsList(of: page.dictionary["Contents"], in: file))
@@ -388,22 +485,71 @@ public struct PDFOverlayWriter: Sendable {
                         .reference(number: marks, generation: 0),
                     ]
             )
-            dictionary["Resources"] = try resources(
-                of: page,
-                in: file,
-                adding: states,
-                stencils: stencils
-            )
+            dictionary["Resources"] = .dictionary(resources)
             // The same object number: an incremental update replaces a page by
             // writing it again, and the newest cross-reference wins.
             _ = emit(.dictionary(dictionary), number: page.number)
         }
 
         let crossReference = offset + body.count
-        body.append(crossReferenceTable(newOffsets))
-        body.append(trailer(of: file, size: nextNumber, crossReference: crossReference))
+        if file.usesCrossReferenceStreams {
+            let number = nextNumber
+            nextNumber += 1
+            newOffsets[number] = crossReference
+            newGenerations[number] = 0
+            let sorted = newOffsets.keys.sorted()
+            var index: [PDFObject] = []
+            var rows = Data()
+            for id in sorted {
+                index += [.integer(id), .integer(1)]
+                rows.append(1)
+                let offset = UInt64(newOffsets[id] ?? 0)
+                for shift in stride(from: 56, through: 0, by: -8) { rows.append(UInt8(truncatingIfNeeded: offset >> shift)) }
+                let generation = newGenerations[id] ?? 0
+                rows.append(UInt8(truncatingIfNeeded: generation >> 8))
+                rows.append(UInt8(truncatingIfNeeded: generation))
+            }
+            var dictionary: [String: PDFObject] = [
+                "Type": .name("XRef"), "Size": .integer(nextNumber), "Prev": .integer(file.lastCrossReference),
+                "W": .array([.integer(1), .integer(8), .integer(2)]), "Index": .array(index),
+            ]
+            for key in ["Root", "Info", "ID"] { dictionary[key] = file.trailer[key] }
+            if file.trailer["XRefStm"] != nil { dictionary.removeValue(forKey: "Prev") }
+            _ = emit(stream(dictionary, rows), number: number)
+            if file.trailer["XRefStm"] != nil {
+                let tableOffset = offset + body.count
+                body.append(crossReferenceTable(newOffsets, generations: newGenerations))
+                body.append(trailer(of: file, size: nextNumber, crossReference: tableOffset, hybrid: crossReference))
+            } else {
+                body.append(Data("startxref\n\(crossReference)\n%%EOF\n".utf8))
+            }
+        } else {
+            body.append(crossReferenceTable(newOffsets, generations: newGenerations))
+            body.append(trailer(of: file, size: nextNumber, crossReference: crossReference))
+        }
 
-        try handle.write(contentsOf: body)
+        let temporary = output.deletingLastPathComponent()
+            .appendingPathComponent(".rmrender-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        try FileManager.default.copyItem(at: original, to: temporary)
+        let handle = try FileHandle(forWritingTo: temporary)
+        do {
+            // Every offset in `body` counts from the end of the file that was
+            // read. A copy of another length — the original replaced between
+            // the read and now — would put each of them in the wrong place.
+            guard try handle.seekToEnd() == UInt64(offset) else {
+                throw PDFReadError.malformed("the original changed after it was read")
+            }
+            try handle.write(contentsOf: body)
+            try handle.close()
+        } catch {
+            try? handle.close()
+            throw error
+        }
+        // POSIX rename replaces an existing destination atomically on its volume.
+        guard rename(temporary.path, output.path) == 0 else {
+            throw CocoaError(.fileWriteUnknown)
+        }
     }
 
     /// A box the way PDF writes one: lower left corner, then upper right.
@@ -436,6 +582,7 @@ public struct PDFOverlayWriter: Sendable {
     /// nothing is copied here.
     private func contentsList(of object: PDFObject?, in file: PDFFile) throws -> [PDFObject] {
         guard let object else { return [] }
+        if case .null = try file.resolve(object) { return [] }
         if case .array(let items) = object { return items }
         if case .reference = object,
            case .array(let items) = try file.resolve(object) {
@@ -444,37 +591,9 @@ public struct PDFOverlayWriter: Sendable {
         return [object]
     }
 
-    /// The page's resources with ours added.
-    ///
-    /// Copied rather than replaced: `/ExtGState` and `/XObject` may already
-    /// be there, and putting ours in their place would take away the names
-    /// the page's own drawing uses. Inheritance is resolved by the reader,
-    /// so a page that declares no resources of its own still gets its
-    /// parent's here.
-    private func resources(
-        of page: PDFFile.Page,
-        in file: PDFFile,
-        adding extra: [String: PDFObject],
-        stencils: [String: PDFObject]
-    ) throws -> PDFObject {
-        guard !extra.isEmpty || !stencils.isEmpty else { return page.resources ?? .dictionary([:]) }
-        var dictionary = try file.resolve(page.resources).dictionaryValue ?? [:]
-        if !extra.isEmpty {
-            var states = try file.resolve(dictionary["ExtGState"]).dictionaryValue ?? [:]
-            for (name, value) in extra { states[name] = value }
-            dictionary["ExtGState"] = .dictionary(states)
-        }
-        if !stencils.isEmpty {
-            var objects = try file.resolve(dictionary["XObject"]).dictionaryValue ?? [:]
-            for (name, value) in stencils { objects[name] = value }
-            dictionary["XObject"] = .dictionary(objects)
-        }
-        return .dictionary(dictionary)
-    }
-
     /// The new cross-reference section: the objects this update changed,
     /// grouped into runs of consecutive numbers.
-    private func crossReferenceTable(_ offsets: [Int: Int]) -> Data {
+    func crossReferenceTable(_ offsets: [Int: Int], generations: [Int: Int]) -> Data {
         var out = Data("xref\n".utf8)
         var numbers = offsets.keys.sorted()
         while !numbers.isEmpty {
@@ -485,17 +604,18 @@ public struct PDFOverlayWriter: Sendable {
             out.append(contentsOf: Array("\(run[0]) \(run.count)\n".utf8))
             for number in run {
                 // Twenty bytes a row, exactly: offset, generation, kind.
-                out.append(contentsOf: Array(String(format: "%010d 00000 n \n", offsets[number] ?? 0).utf8))
+                out.append(contentsOf: Array(String(format: "%010ld %05ld n \n", offsets[number] ?? 0, generations[number] ?? 0).utf8))
             }
         }
         return out
     }
 
-    private func trailer(of file: PDFFile, size: Int, crossReference: Int) -> Data {
+    private func trailer(of file: PDFFile, size: Int, crossReference: Int, hybrid: Int? = nil) -> Data {
         var entries: [String: PDFObject] = [
             "Size": .integer(size),
             "Prev": .integer(file.lastCrossReference),
         ]
+        if let hybrid { entries["XRefStm"] = .integer(hybrid) }
         // What identifies the document is carried over as it stands: /Root
         // says which catalogue to read, /Info and /ID are what the file says
         // about itself, and rewriting either would be a change we did not mean

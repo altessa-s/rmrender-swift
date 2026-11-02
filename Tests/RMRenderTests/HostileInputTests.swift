@@ -662,3 +662,148 @@ func emptyNotebookCountsItsBlankSheet() async throws {
     #expect(pdf.numberOfPages == 1)
     #expect(journal.all == ["1 of 0"])
 }
+
+// MARK: - Images that do not decode, certified originals, page units
+
+/// A page carrying one image, whose attachment is `file`, and one stroke.
+private func pageWithAnImage(file: String) -> Data {
+    let key: [UInt8] = Array(0..<16)
+    let strokePage = makePage(parent: (1, 1), item: (1, 10), left: (0, 0))
+    let header = RMParser.header.utf8.count
+    return Data(
+        Array(strokePage.prefix(header))
+            + attachmentMapBlock(key: key, file: file)
+            + imageItemBlock(item: (1, 20), left: (1, 10), key: key, vertices: [
+                ImageVertex(x: -100, y: 200, u: 0, v: 0),
+                ImageVertex(x: 100, y: 200, u: 1, v: 0),
+                ImageVertex(x: 100, y: 400, u: 1, v: 1),
+                ImageVertex(x: -100, y: 400, u: 0, v: 1),
+            ])
+            + Array(strokePage.dropFirst(header))
+    )
+}
+
+private func temporaryPDF() -> URL {
+    FileManager.default.temporaryDirectory.appending(path: "rmrender-test-\(UUID().uuidString).pdf")
+}
+
+@Test("A notebook page whose image does not decode is drawn with a hole and reported")
+func notebookReportsAnUndecodableImage() async throws {
+    let (index, blobs) = document([
+        ("doc.content", cPages([record("p")])),
+        ("doc/p.rm", pageWithAnImage(file: "pic.png")),
+        ("doc/p/pic.png", Data("not a picture".utf8)),
+    ])
+    let journal = Journal()
+    let pdf = try open(
+        try await NotebookRenderer(blobs: blobs).renderPDF(
+            documentID: "doc", index: index, onMissingImages: { pages, images in journal.append("\(pages) \(images)") }
+        )
+    )
+    #expect(pdf.numberOfPages == 1)
+    #expect(journal.all == ["1 1"])
+}
+
+@Test("An annotated page whose image does not decode is drawn with a hole and reported")
+func annotatedReportsAnUndecodableImage() async throws {
+    let (index, blobs) = document([
+        ("doc.pdf", try originalPDF(pages: 1)),
+        ("doc.content", cPages([record("p", redir: "0")])),
+        ("doc/p.rm", pageWithAnImage(file: "pic.png")),
+        ("doc/p/pic.png", Data("not a picture".utf8)),
+    ])
+    let output = temporaryPDF()
+    defer { try? FileManager.default.removeItem(at: output) }
+    let journal = Journal()
+    try await AnnotatedPDFRenderer(blobs: blobs).renderPDF(
+        documentID: "doc", index: index, to: output,
+        onMissingImages: { pages, images in journal.append("\(pages) \(images)") }
+    )
+    #expect(try open(output).numberOfPages == 1)
+    #expect(journal.all == ["1 1"])
+}
+
+@Test("A certified original with marks is drawn afresh, and the caller is told", arguments: [true, false])
+func certifiedOriginalFallsBack(allowOverlay: Bool) async throws {
+    let original = revisionFixture(permissions: true)
+    let (index, blobs) = document([
+        ("doc.pdf", original),
+        ("doc.content", cPages([record("p", redir: "0")])),
+        ("doc/p.rm", inkedPage(0)),
+    ])
+    let output = temporaryPDF()
+    defer { try? FileManager.default.removeItem(at: output) }
+    let journal = Journal()
+    try await AnnotatedPDFRenderer(blobs: blobs).renderPDF(
+        documentID: "doc", index: index, to: output, allowOverlay: allowOverlay,
+        onCertificationDropped: { journal.append("dropped") }
+    )
+    let written = try Data(contentsOf: output)
+    #expect(!written.starts(with: original), "a certified original takes no incremental update")
+    #expect(try open(written).numberOfPages == 1)
+    #expect(journal.all == ["dropped"])
+}
+
+@Test("refuseCertified turns the fresh drawing of a certified original into a RenderError")
+func certifiedOriginalIsRefusedOnRequest() async throws {
+    let (index, blobs) = document([
+        ("doc.pdf", revisionFixture(permissions: true)),
+        ("doc.content", cPages([record("p", redir: "0")])),
+        ("doc/p.rm", inkedPage(0)),
+    ])
+    let output = temporaryPDF()
+    defer { try? FileManager.default.removeItem(at: output) }
+    let journal = Journal()
+    let error = await #expect(throws: RenderError.self) {
+        try await AnnotatedPDFRenderer(blobs: blobs).renderPDF(
+            documentID: "doc", index: index, to: output, refuseCertified: true,
+            onCertificationDropped: { journal.append("dropped") }
+        )
+    }
+    guard case .unsupportedFormat(let reason)? = error else {
+        Issue.record("expected unsupportedFormat, got \(String(describing: error))")
+        return
+    }
+    #expect(reason.contains("certified"))
+    #expect(journal.all.isEmpty)
+    #expect(!FileManager.default.fileExists(atPath: output.path))
+}
+
+@Test("A certified original without marks goes out unchanged, strict or not", arguments: [false, true])
+func unmarkedCertifiedOriginalIsKept(refuseCertified: Bool) async throws {
+    let original = revisionFixture(permissions: true)
+    let (index, blobs) = document([
+        ("doc.pdf", original),
+        ("doc.content", cPages([record("p", redir: "0")])),
+    ])
+    let output = temporaryPDF()
+    defer { try? FileManager.default.removeItem(at: output) }
+    let journal = Journal()
+    try await AnnotatedPDFRenderer(blobs: blobs).renderPDF(
+        documentID: "doc", index: index, to: output, refuseCertified: refuseCertified,
+        onCertificationDropped: { journal.append("dropped") }
+    )
+    #expect(try Data(contentsOf: output) == original)
+    #expect(journal.all.isEmpty)
+}
+
+@Test("A page /UserUnit other than 1 is refused with a RenderError", arguments: [true, false])
+func annotatedRefusesAUserUnit(allowOverlay: Bool) async throws {
+    let (index, blobs) = document([
+        ("doc.pdf", revisionFixture(extra: "/UserUnit 2")),
+        ("doc.content", cPages([record("p", redir: "0")])),
+        ("doc/p.rm", inkedPage(0)),
+    ])
+    let output = temporaryPDF()
+    defer { try? FileManager.default.removeItem(at: output) }
+    let error = await #expect(throws: RenderError.self) {
+        try await AnnotatedPDFRenderer(blobs: blobs).renderPDF(
+            documentID: "doc", index: index, to: output, allowOverlay: allowOverlay
+        )
+    }
+    guard case .unsupportedFormat(let reason)? = error else {
+        Issue.record("expected unsupportedFormat, got \(String(describing: error))")
+        return
+    }
+    #expect(reason.contains("UserUnit"))
+}
