@@ -5,6 +5,7 @@
 import CoreGraphics
 import CryptoKit
 import Foundation
+import PDFKit
 import RMMarks
 import RMLines
 @testable import RMRender
@@ -236,6 +237,80 @@ func overlayAndRedrawDrawTheSamePage() async throws {
     // what was drawn rather than in how it was rasterised.
     let apart = Double(abs(overlaid - drawn)) / Double(max(overlaid, drawn))
     #expect(apart < 0.05, "the two routes drew \(overlaid) and \(drawn) — \(Int(apart * 100))% apart")
+}
+
+// A redraw writes a fresh PDF, so the imported document's navigation has to be
+// carried across on purpose: a web link and a link to another page on page one,
+// and an outline entry pointing at page two.
+@Test("Links and the outline survive a redraw")
+func linksAndOutlineSurviveARedraw() async throws {
+    let web = try #require(URL(string: "https://example.com/chapter"))
+    let drawn = NSMutableData()
+    let consumer = try #require(CGDataConsumer(data: drawn))
+    var media = CGRect(x: 0, y: 0, width: 612, height: 792)
+    let context = try #require(CGContext(consumer: consumer, mediaBox: &media, nil))
+    context.beginPDFPage(nil)
+    context.setURL(web as CFURL, for: CGRect(x: 72, y: 700, width: 200, height: 20))
+    context.setDestination("chapter" as CFString, for: CGRect(x: 72, y: 600, width: 200, height: 20))
+    context.endPDFPage()
+    context.beginPDFPage(nil)
+    context.addDestination("chapter" as CFString, at: CGPoint(x: 72, y: 720))
+    context.endPDFPage()
+    let entry: [String: Any] = [
+        kCGPDFOutlineTitle as String: "Chapter",
+        kCGPDFOutlineDestination as String: 2,
+    ]
+    CGPDFContextSetOutline(context, [kCGPDFOutlineChildren as String: [entry]] as CFDictionary)
+    context.closePDF()
+
+    let pdf = drawn as Data
+    #expect(PDFDocument(data: pdf)?.outlineRoot?.numberOfChildren == 1, "the source has no outline")
+    let original = FileManager.default.temporaryDirectory
+        .appending(path: "rmrender-test-\(UUID().uuidString).pdf")
+    try pdf.write(to: original)
+
+    let marks = markedPage()
+    let content = Data(#"""
+    {"formatVersion": 2, "cPages": {"pages": [
+      {"id": "page-0", "redir": {"timestamp": "1:2", "value": 0}},
+      {"id": "page-1", "redir": {"timestamp": "1:3", "value": 1}}
+    ]}}
+    """#.utf8)
+    let fixture = AnnotatedFixture(
+        index: DocumentFiles(files: [
+            DocumentFile(hash: address(pdf), name: "doc-1.pdf", size: Int64(pdf.count)),
+            DocumentFile(hash: address(content), name: "doc-1.content", size: Int64(content.count)),
+            DocumentFile(hash: address(marks), name: "doc-1/page-0.rm", size: Int64(marks.count)),
+        ]),
+        blobs: [address(pdf): pdf, address(content): content, address(marks): marks],
+        original: original
+    )
+    let redrawn = try await annotated(fixture, allowOverlay: false)
+    defer {
+        for url in [original, redrawn] {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+    #expect(try !Data(contentsOf: redrawn).starts(with: pdf), "the redraw was not taken")
+
+    let output = try #require(PDFDocument(url: redrawn))
+    #expect(output.pageCount == 2)
+    let first = try #require(output.page(at: 0))
+    let links = first.annotations.filter { $0.type == "Link" }
+    let urls = links.compactMap { ($0.action as? PDFActionURL)?.url }
+    #expect(urls == [web], "the web link did not survive")
+    let targets = links.compactMap { link -> Int? in
+        guard let page = (link.action as? PDFActionGoTo)?.destination.page ?? link.destination?.page else { return nil }
+        return output.index(for: page)
+    }
+    #expect(targets == [1], "the link to page two did not survive")
+
+    let outline = try #require(output.outlineRoot)
+    #expect(outline.numberOfChildren == 1)
+    let survived = try #require(outline.child(at: 0))
+    #expect(survived.label == "Chapter")
+    let page = try #require(survived.destination?.page)
+    #expect(output.index(for: page) == 1, "the outline entry lost its page")
 }
 
 // Erasing applies to the tablet ink inside the imported overlay Form.
