@@ -862,6 +862,13 @@ public struct PDFOverlayWriter: Sendable {
     /// A one-page PDF as a Form and the objects it needs, numbered from
     /// nought: each object takes the next number when a reference to it is
     /// first reached, and is listed once all it refers to has been.
+    ///
+    /// A dictionary's entries are walked in the order of their keys — the
+    /// order `PDFWriter` writes them in — and not in the dictionary's own:
+    /// that is its hash seed's, a new one every run, and the numbers came
+    /// out differently each time the same document was written. A copy
+    /// already downloaded is invalidated by a file that changes for no
+    /// reason.
     private func native(_ pdf: Data) throws -> PreparedPage.Native {
         let source = try PDFFile(bytes: pdf)
         let imported = try source.pages()
@@ -884,12 +891,19 @@ public struct PDFOverlayWriter: Sendable {
                 objects.append((number: assigned, object: cloned))
                 return .reference(number: assigned, generation: 0)
             case .array(let values): return .array(try values.map { try copy($0, depth: depth + 1) })
-            case .dictionary(let values): return .dictionary(try values.mapValues { try copy($0, depth: depth + 1) })
+            case .dictionary(let values): return .dictionary(try copy(entries: values, depth: depth))
             case .stream(var dictionary, let data):
                 dictionary["Length"] = .integer(data.count)
-                return .stream(dictionary: try dictionary.mapValues { try copy($0, depth: depth + 1) }, data: data)
+                return .stream(dictionary: try copy(entries: dictionary, depth: depth), data: data)
             default: return value
             }
+        }
+        func copy(entries: [String: PDFObject], depth: Int) throws -> [String: PDFObject] {
+            var copied: [String: PDFObject] = [:]
+            for key in entries.keys.sorted() {
+                copied[key] = try copy(entries[key] ?? .null, depth: depth + 1)
+            }
+            return copied
         }
         var content = Data()
         func appendContent(_ value: PDFObject?, depth: Int = 0) throws {

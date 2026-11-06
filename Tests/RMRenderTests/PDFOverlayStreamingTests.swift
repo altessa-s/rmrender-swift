@@ -378,22 +378,6 @@ private final class Window: @unchecked Sendable {
     var breached: [Int] { lock.withLock { breaches } }
 }
 
-/// `object` with every reference replaced by what it names, all the way
-/// down: two updates that number the same objects differently resolve alike.
-private func resolvedDeep(_ object: PDFObject?, in file: PDFFile, depth: Int = 0) throws -> PDFObject {
-    guard depth < 64 else { throw PDFReadError.malformed("too deep") }
-    switch try file.resolve(object) {
-    case .array(let items):
-        return .array(try items.map { try resolvedDeep($0, in: file, depth: depth + 1) })
-    case .dictionary(let entries):
-        return .dictionary(try entries.mapValues { try resolvedDeep($0, in: file, depth: depth + 1) })
-    case .stream(let dictionary, let data):
-        return .stream(dictionary: try dictionary.mapValues { try resolvedDeep($0, in: file, depth: depth + 1) }, data: data)
-    case let resolved:
-        return resolved
-    }
-}
-
 @Test(
     "Pages made side by side are written in order: the file is the one a page at a time makes",
     arguments: [false, true]
@@ -429,25 +413,7 @@ func concurrentWriteMatchesSequential(nativeDrawings: Bool) async throws {
         return try #require(overlays[page])
     }
 
-    let written = try Data(contentsOf: concurrent)
-    let expected = try Data(contentsOf: sequential)
-    // A native drawing's objects are numbered in the order its dictionaries
-    // are walked, and a dictionary's order is its hash seed's: two runs in
-    // one process may number them differently, as two runs of the writer
-    // always could. Under deterministic hashing they may not; otherwise the
-    // two files must say the same thing however they number it.
-    if !nativeDrawings || ProcessInfo.processInfo.environment["SWIFT_DETERMINISTIC_HASHING"] != nil {
-        #expect(written == expected)
-    } else {
-        #expect(written.count == expected.count)
-        let one = try PDFFile(bytes: written), other = try PDFFile(bytes: expected)
-        for page in indices {
-            let mine = try resolvedDeep(try form("RMOverlay", of: one, page: page).dictionary["Resources"], in: one)
-            let theirs = try resolvedDeep(try form("RMOverlay", of: other, page: page).dictionary["Resources"], in: other)
-            #expect(mine == theirs, "page \(page)")
-            #expect(try form("RMOverlay", of: one, page: page).data == (try form("RMOverlay", of: other, page: page).data))
-        }
-    }
+    #expect(try Data(contentsOf: concurrent) == (try Data(contentsOf: sequential)))
     #expect(window.breached.isEmpty, "pages asked for past the window: \(window.breached)")
     #expect(try PDFFile(url: concurrent).pages().count == pageCount)
     #expect(PDFDocument(url: concurrent)?.pageCount == pageCount)
@@ -530,4 +496,104 @@ func crossReferencePadding() {
             #expect(String(decoding: padded, as: UTF8.self) == String(format: "%0*ld", width, value), "\(value)")
         }
     }
+}
+
+// MARK: - The same file from every process
+
+/// Where `writeOverlayForAnotherProcess` writes, and from what: set only in a
+/// process `overlayIsTheSameInEveryProcess` starts.
+private let overlayOriginalKey = "RMRENDER_TEST_OVERLAY_ORIGINAL"
+private let overlayOutputKey = "RMRENDER_TEST_OVERLAY_OUTPUT"
+
+/// The pages the processes write: every kind of overlay, native drawings
+/// among them, and pages left out.
+private let crossProcessPages = (0..<16).filter { !$0.isMultiple(of: 5) }
+
+private func writeCrossProcessOverlay(original: URL, to output: URL) async throws {
+    let overlays = try mixedOverlays(pages: crossProcessPages)
+    let file = try PDFFile(url: original)
+    try await PDFOverlayWriter().writeConcurrently(
+        file: file, pages: try file.pages(), original: original, pageIndices: crossProcessPages, to: output, limit: 3
+    ) { page in try #require(overlays[page]) }
+}
+
+/// Whether this process was started by `swift test`, whose runner can be
+/// started again with a filter of its own.
+private let runnerCanBeRestarted = CommandLine.arguments.first?.hasSuffix("swiftpm-testing-helper") == true
+    && CommandLine.arguments.contains("--test-bundle-path")
+
+@Test(
+    "The other half of the test below: writes the overlay where the process that started it says",
+    .enabled(if: ProcessInfo.processInfo.environment[overlayOutputKey] != nil)
+)
+func writeOverlayForAnotherProcess() async throws {
+    let environment = ProcessInfo.processInfo.environment
+    let original = URL(fileURLWithPath: try #require(environment[overlayOriginalKey]))
+    let output = URL(fileURLWithPath: try #require(environment[overlayOutputKey]))
+    try await writeCrossProcessOverlay(original: original, to: output)
+}
+
+@Test(
+    "The same overlay is the same bytes whichever process writes it, and whatever its hash seed",
+    .enabled(if: runnerCanBeRestarted)
+)
+func overlayIsTheSameInEveryProcess() async throws {
+    let original = try blankDocument(pages: 16)
+    let folder = original.deletingLastPathComponent()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let here = folder.appending(path: "here.pdf")
+    try await writeCrossProcessOverlay(original: original, to: here)
+
+    // The runner started again, asked for the test above alone: twice with
+    // a hash seed of its own each time, once with the fixed one.
+    var arguments = Array(CommandLine.arguments.dropFirst())
+    if let filter = arguments.firstIndex(of: "--filter"), filter + 1 < arguments.count {
+        arguments.removeSubrange(filter...(filter + 1))
+    }
+    arguments += ["--filter", "writeOverlayForAnotherProcess"]
+    // A run under a sanitizer carries its runtime beside the test bundle, and
+    // a process started from here has to be handed it again, or it stops
+    // before it starts.
+    var sanitizers: [String] = []
+    if let bundle = arguments.firstIndex(of: "--test-bundle-path").map({ arguments[$0 + 1] }) {
+        let frameworks = URL(fileURLWithPath: bundle).deletingLastPathComponent().deletingLastPathComponent()
+            .appending(path: "Frameworks")
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: frameworks.path)) ?? []
+        sanitizers = names.filter { $0.hasPrefix("libclang_rt.") && $0.hasSuffix("_osx_dynamic.dylib") }
+            .sorted().map { frameworks.appending(path: $0).path }
+    }
+    var written: [Data] = []
+    for (run, deterministic) in [false, false, true].enumerated() {
+        let output = folder.appending(path: "process\(run).pdf")
+        var environment = ProcessInfo.processInfo.environment
+        environment.removeValue(forKey: "SWIFT_DETERMINISTIC_HASHING")
+        if deterministic { environment["SWIFT_DETERMINISTIC_HASHING"] = "1" }
+        environment[overlayOriginalKey] = original.path
+        environment[overlayOutputKey] = output.path
+        if !sanitizers.isEmpty { environment["DYLD_INSERT_LIBRARIES"] = sanitizers.joined(separator: ":") }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
+        process.arguments = arguments
+        process.environment = environment
+        let log = folder.appending(path: "process\(run).log")
+        FileManager.default.createFile(atPath: log.path, contents: nil)
+        let logHandle = try FileHandle(forWritingTo: log)
+        process.standardOutput = logHandle
+        process.standardError = logHandle
+        try process.run()
+        process.waitUntilExit()
+        try logHandle.close()
+        try #require(
+            process.terminationStatus == 0,
+            "run \(run): \(String(decoding: (try? Data(contentsOf: log)) ?? Data(), as: UTF8.self).suffix(2000))"
+        )
+        written.append(try Data(contentsOf: output))
+    }
+
+    let expected = try Data(contentsOf: here)
+    for (run, bytes) in written.enumerated() {
+        #expect(bytes == expected, "run \(run)")
+    }
+    #expect(try PDFFile(bytes: expected).pages().count == 16)
+    #expect(PDFDocument(data: expected)?.pageCount == 16)
 }
