@@ -116,6 +116,22 @@ public enum PageRenderer {
         inkOnly: Bool = false,
         grayscale: Bool = false
     ) throws -> CGImage {
+        try image(
+            page: page, pageSize: pageSize, scale: scale, images: PageImages(bytes: assets), inkOnly: inkOnly,
+            grayscale: grayscale
+        )
+    }
+
+    /// The same, with the attachments already decoded where a caller has
+    /// them so (`ParsedNotebook.images`).
+    static func image(
+        page: RMPage,
+        pageSize: CGSize,
+        scale: CGFloat,
+        images: PageImages,
+        inkOnly: Bool,
+        grayscale: Bool
+    ) throws -> CGImage {
         // Grown as a PDF page grows (`grownSheet`, shared with
         // `pdf(pages:pageSize:paper:...)` above), but never cut: a page
         // stretched with the tablet's "extend page" runs its ink past
@@ -173,7 +189,7 @@ public enum PageRenderer {
         // stated in the same units.
         context.concatenate(placement(of: bounds, on: sheet, scale: 1))
         draw(
-            page, in: context, pageSize: pageSize, bounds: bounds, assets: assets, inkOnly: inkOnly, geometry: geometry
+            page, in: context, pageSize: pageSize, bounds: bounds, images: images, inkOnly: inkOnly, geometry: geometry
         )
         context.restoreGState()
         guard let image = context.makeImage() else {
@@ -219,30 +235,54 @@ public enum PageRenderer {
         author: String?,
         into consumer: CGDataConsumer
     ) throws {
-        // The page canvas decides the sheet only for the "as tablet" paper:
-        // each tablet model declares its own canvas.
-        let paperSize = paper.points(forCanvas: pageSize)
-        var mediaBox = CGRect(origin: .zero, size: paperSize)
-        let info = PDFDocumentInfo.dictionary(author: author)
-        guard let context = CGContext(consumer: consumer, mediaBox: &mediaBox, info) else {
-            throw RenderError.pdfContextUnavailable
-        }
-
+        let output = try PDFPages(consumer: consumer, pageSize: pageSize, paper: paper, author: author)
+        let images = PageImages(bytes: assets)
         // An empty notebook must still produce a file that opens.
-        let pagesToDraw = pages.isEmpty ? [RMPage(strokes: [], skippedBlocks: 0)] : pages
-
-        // The scale is set by the width and is one for the whole document:
-        // the tablet's page fits exactly into the width of the chosen sheet.
-        // That way nothing is squeezed — exactly as in exported PDFs, where
-        // every page carries one and the same coefficient.
-        let scale = paperSize.width / pageSize.width
-
-        for page in pagesToDraw {
+        for page in pages.isEmpty ? [RMPage(strokes: [], skippedBlocks: 0)] : pages {
             // A caller may cancel a render it does not need, and drawing is
             // the long part of it. Asked here
             // rather than inside a page: a page is a bounded piece of work,
             // and stopping between two of them costs nothing to reason about.
             try Task.checkCancellation()
+            output.draw(page, images: images)
+        }
+        output.close()
+    }
+
+    /// A notebook's PDF written a page at a time.
+    ///
+    /// Apart from the loop above so that a caller can hand the pages over as
+    /// it comes to them: `NotebookRenderer` parses a page when it is drawn and
+    /// lets it go once it has been, and a list of every page parsed — what
+    /// the loop above takes — is the memory that keeps a long notebook from
+    /// being exported at all. Not `Sendable`: it is a `CGContext`, and it is
+    /// used from the one task that made it.
+    final class PDFPages {
+        private let context: CGContext
+        private let pageSize: CGSize
+        private let paperSize: CGSize
+        private let scale: CGFloat
+
+        init(consumer: CGDataConsumer, pageSize: CGSize, paper: PaperSize, author: String?) throws {
+            // The page canvas decides the sheet only for the "as tablet" paper:
+            // each tablet model declares its own canvas.
+            let paperSize = paper.points(forCanvas: pageSize)
+            var mediaBox = CGRect(origin: .zero, size: paperSize)
+            let info = PDFDocumentInfo.dictionary(author: author)
+            guard let context = CGContext(consumer: consumer, mediaBox: &mediaBox, info) else {
+                throw RenderError.pdfContextUnavailable
+            }
+            self.context = context
+            self.pageSize = pageSize
+            self.paperSize = paperSize
+            // The scale is set by the width and is one for the whole document:
+            // the tablet's page fits exactly into the width of the chosen sheet.
+            // That way nothing is squeezed — exactly as in exported PDFs, where
+            // every page carries one and the same coefficient.
+            scale = paperSize.width / pageSize.width
+        }
+
+        func draw(_ page: RMPage, images: PageImages) {
             // The sheet is worked out per page. One sheet for the whole
             // notebook would mean that a single page written far down
             // squeezes all the others: on a three-page document the scale
@@ -255,14 +295,17 @@ public enum PageRenderer {
             context.beginPDFPage(pageInfo(mediaBox: CGRect(origin: .zero, size: sheet)))
             context.saveGState()
             context.concatenate(placement(of: bounds, on: sheet, scale: scale))
-            draw(
-                page, in: context, pageSize: pageSize, bounds: bounds, assets: assets, geometry: geometry,
+            PageRenderer.draw(
+                page, in: context, pageSize: pageSize, bounds: bounds, images: images, geometry: geometry,
                 templateIsArtifact: true
             )
             context.restoreGState()
             context.endPDFPage()
         }
-        context.closePDF()
+
+        func close() {
+            context.closePDF()
+        }
     }
 
     /// The sheet size for one PDF page.
@@ -328,7 +371,7 @@ public enum PageRenderer {
         in context: CGContext,
         pageSize: CGSize,
         bounds: CGRect,
-        assets: [String: Data] = [:],
+        images pictures: PageImages = PageImages(),
         inkOnly: Bool = false,
         geometry laidOut: TextGeometry? = nil,
         templateIsArtifact: Bool = false
@@ -441,7 +484,7 @@ public enum PageRenderer {
         func drawImages(before position: Int) {
             while nextImage < placedImages.count,
                   placedImages[nextImage].strokesBefore <= position {
-                drawImage(placedImages[nextImage], assets: assets, in: context, pageSize: pageSize)
+                drawImage(placedImages[nextImage], images: pictures, in: context, pageSize: pageSize)
                 nextImage += 1
             }
         }
@@ -693,22 +736,28 @@ public enum PageRenderer {
     /// a log line — the document still comes out.
     private static func drawImage(
         _ image: PageImage,
-        assets: [String: Data],
+        images: PageImages,
         in context: CGContext,
         pageSize: CGSize
     ) {
         guard image.vertices.count == 4 else { return }
-        guard let data = assets[image.file] else {
-            RMRenderLog.pageError(
-                "render: no bytes for an image of the page — a hole where it stood"
-            )
-            return
-        }
-        guard let decoded = decodeImage(data) else {
-            RMRenderLog.pageError(
-                "render: the bytes of an image of the page do not decode — a hole where it stood"
-            )
-            return
+        let decoded: CGImage
+        if let ready = images.decoded[image.file] {
+            decoded = ready
+        } else {
+            guard let data = images.bytes[image.file] else {
+                RMRenderLog.pageError(
+                    "render: no bytes for an image of the page — a hole where it stood"
+                )
+                return
+            }
+            guard let fresh = decodeImage(data) else {
+                RMRenderLog.pageError(
+                    "render: the bytes of an image of the page do not decode — a hole where it stood"
+                )
+                return
+            }
+            decoded = fresh
         }
         let v = image.vertices
         let p0 = convert(x: v[0].x, y: v[0].y, pageSize: pageSize)
@@ -758,6 +807,20 @@ public enum PageRenderer {
         context.scaleBy(x: 1, y: -1)
         context.draw(decoded, in: CGRect(x: 0, y: 0, width: 1, height: 1))
         context.restoreGState()
+    }
+
+    /// The pictures a page's images are drawn from, by file name.
+    ///
+    /// Two ways in, because there are two kinds of caller. A render of a
+    /// whole document checks its attachments before it draws a page
+    /// (`PageAssets.decoded`), and that check is a decode: the images it made
+    /// are handed in as they are, so a picture shown on a hundred pages is
+    /// not decoded a hundred and one times. A caller that hands bytes in —
+    /// the public entry points here — has them decoded where they are drawn,
+    /// as before, a hole and a log line for any that do not.
+    struct PageImages: Sendable {
+        var decoded: [String: CGImage] = [:]
+        var bytes: [String: Data] = [:]
     }
 
     /// How many pixels an attachment may unpack to before it is refused.

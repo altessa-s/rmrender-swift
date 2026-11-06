@@ -74,7 +74,7 @@ public struct NotebookRenderer: Sendable {
         onUnsupported: @Sendable (_ pages: Int) -> Void = { _ in },
         onUnreadable: @Sendable (_ pages: Int) -> Void = { _ in }
     ) async throws -> Data {
-        let work = try await parsed(
+        let work = try await measured(
             documentID: documentID,
             index: index,
             maximumPages: maximumPages,
@@ -85,13 +85,13 @@ public struct NotebookRenderer: Sendable {
             onUnsupported: onUnsupported,
             onUnreadable: onUnreadable
         )
-        let pdf = try await render(
-            work.pages,
-            pageSize: work.pageSize,
-            paper: paper,
-            assets: work.assets,
-            author: author
-        )
+        let pdf = try await RenderWork.detachedWaiting { [self] in
+            guard let buffer = CFDataCreateMutable(nil, 0), let consumer = CGDataConsumer(data: buffer) else {
+                throw RenderError.pdfContextUnavailable
+            }
+            try await draw(work, documentID: documentID, paper: paper, author: author, into: consumer)
+            return buffer as Data
+        }
         // The assembly counted as a unit of the work, so somebody has to say it
         // finished. Without this the bar would stop one unit short of its
         // total and stay there, and a caller with a progress bar shows what it
@@ -102,8 +102,8 @@ public struct NotebookRenderer: Sendable {
 
     /// The same document, written straight to `output` instead of handed back.
     ///
-    /// A caller that serves a file wants a file, and the render holds the
-    /// parsed pages and every attachment while it draws. Answering with `Data`
+    /// A caller that serves a file wants a file, and the render holds every
+    /// attachment and a few parsed pages while it draws. Answering with `Data`
     /// adds the finished document to that as well, for the caller to write out
     /// and drop — a full redundant copy of the output inside a process that
     /// may be killed for memory. `AnnotatedPDFRenderer` takes a URL for the
@@ -122,7 +122,7 @@ public struct NotebookRenderer: Sendable {
         onUnsupported: @Sendable (_ pages: Int) -> Void = { _ in },
         onUnreadable: @Sendable (_ pages: Int) -> Void = { _ in }
     ) async throws {
-        let work = try await parsed(
+        let work = try await measured(
             documentID: documentID,
             index: index,
             maximumPages: maximumPages,
@@ -133,14 +133,20 @@ public struct NotebookRenderer: Sendable {
             onUnsupported: onUnsupported,
             onUnreadable: onUnreadable
         )
-        try await render(
-            work.pages,
-            pageSize: work.pageSize,
-            paper: paper,
-            assets: work.assets,
-            author: author,
-            to: output
-        )
+        try await RenderWork.detachedWaiting { [self] in
+            guard let consumer = CGDataConsumer(url: output as CFURL) else {
+                throw RenderError.pdfContextUnavailable
+            }
+            do {
+                try await draw(work, documentID: documentID, paper: paper, author: author, into: consumer)
+            } catch {
+                // A cancelled or failed render leaves a truncated PDF behind,
+                // and a truncated PDF at the path the caller asked for is
+                // worse than nothing: it opens, and it is wrong.
+                try? FileManager.default.removeItem(at: output)
+                throw error
+            }
+        }
         onProgress(work.total, work.total)
     }
 
@@ -194,13 +200,15 @@ public struct NotebookRenderer: Sendable {
         _ parsed: ParsedNotebook, scale: CGFloat = 1, grayscale: Bool = false, pages window: Range<Int>?
     ) async throws -> [CGImage] {
         let wanted = window.map { $0.clamped(to: 0..<parsed.pages.count) } ?? 0..<parsed.pages.count
+        let images = PageRenderer.PageImages(decoded: parsed.images)
         return try await RenderWork.detached {
             try wanted.map { index in
                 try PageRenderer.image(
                     page: parsed.pages[index],
                     pageSize: parsed.pageSize,
                     scale: scale,
-                    assets: parsed.assets,
+                    images: images,
+                    inkOnly: false,
                     grayscale: grayscale
                 )
             }
@@ -237,7 +245,7 @@ public struct NotebookRenderer: Sendable {
             for index in wanted.sorted() where parsed.pages.indices.contains(index) {
                 images[index] = try PageRenderer.image(
                     page: parsed.pages[index], pageSize: parsed.pageSize, scale: scale,
-                    assets: parsed.assets, inkOnly: true
+                    images: PageRenderer.PageImages(decoded: parsed.images), inkOnly: true, grayscale: false
                 )
             }
             return images
@@ -300,6 +308,158 @@ public struct NotebookRenderer: Sendable {
         onUnsupported: @Sendable (_ pages: Int) -> Void = { _ in },
         onUnreadable: @Sendable (_ pages: Int) -> Void = { _ in }
     ) async throws -> ParsedNotebook {
+        let work = try await walk(
+            documentID: documentID,
+            index: index,
+            maximumPages: maximumPages,
+            includesUnlistedPages: includesUnlistedPages,
+            onProgress: onProgress,
+            onPageCount: onPageCount,
+            onMissingImages: onMissingImages,
+            onUnsupported: onUnsupported,
+            onUnreadable: onUnreadable
+        ) { $0 }
+        return ParsedNotebook(
+            pages: work.pages,
+            pageSize: work.pageSize,
+            assets: work.assets,
+            unreadable: work.unreadable,
+            pageIDs: work.pageIDs,
+            documentPageCount: work.documentPageCount,
+            total: work.total,
+            images: work.images
+        )
+    }
+
+    /// The same walk for a render that draws as it goes: every page is
+    /// fetched and parsed for what has to be known before the first one is
+    /// drawn — the sheet the page declares, the attachments it shows, the
+    /// tallies — and let go. `draw(_:…)` parses each again when it comes to
+    /// it. Kept, every page stood parsed for the length of the render — about
+    /// a quarter of a megabyte for a page written full, and a long notebook
+    /// has thousands.
+    private func measured(
+        documentID: String,
+        index: DocumentFiles,
+        maximumPages: Int?,
+        includesUnlistedPages: Bool,
+        onProgress: @Sendable (_ completed: Int, _ total: Int) -> Void,
+        onPageCount: @Sendable (_ drawn: Int, _ document: Int) -> Void,
+        onMissingImages: @Sendable (_ pages: Int, _ images: Int) -> Void,
+        onUnsupported: @Sendable (_ pages: Int) -> Void,
+        onUnreadable: @Sendable (_ pages: Int) -> Void
+    ) async throws -> Walk<Void> {
+        try await walk(
+            documentID: documentID,
+            index: index,
+            maximumPages: maximumPages,
+            includesUnlistedPages: includesUnlistedPages,
+            onProgress: onProgress,
+            onPageCount: onPageCount,
+            onMissingImages: onMissingImages,
+            onUnsupported: onUnsupported,
+            onUnreadable: onUnreadable
+        ) { _ in }
+    }
+
+    /// Where a page of the walk comes from, so that it can be had again.
+    private enum PageSource: Sendable {
+        /// Never drawn on: a sheet with its ruling and nothing to fetch.
+        case blank(template: String?)
+        /// Did not parse, or is of an older generation: a blank sheet that
+        /// counts a block lost, as the walk made it.
+        case unread(template: String?)
+        /// A page file, parsed when it is wanted.
+        case file(DocumentFile, template: String?)
+    }
+
+    /// One walk of a document: the pages in the order the user sees them,
+    /// with `keep`'s share of each, and everything about the document the
+    /// drawing has to know before its first page.
+    private struct Walk<Kept: Sendable>: Sendable {
+        let pages: [Kept]
+        /// Where each of `pages` came from, in step with it.
+        let sources: [PageSource]
+        let pageSize: CGSize
+        /// The attachments that decoded, as bytes and as the images the
+        /// check made of them.
+        let assets: [String: Data]
+        let images: [String: CGImage]
+        let unreadable: Set<Int>
+        let pageIDs: [String?]
+        let documentPageCount: Int
+        let total: Int
+    }
+
+    /// The page `source` names, as the walk had it: the same blank sheets,
+    /// and a page file parsed again. The bytes are the ones the walk read —
+    /// a blob is named by its hash — so a page that parsed then parses now;
+    /// one that does not fails the render rather than quietly turning into
+    /// a blank sheet the tallies never counted.
+    private func page(_ source: PageSource, documentID: String, position: Int) async throws -> RMPage {
+        switch source {
+        case .blank(let template):
+            return RMPage(strokes: [], skippedBlocks: 0).with(templateName: template)
+        case .unread(let template):
+            return RMPage(strokes: [], skippedBlocks: 1).with(templateName: template)
+        case .file(let entry, let template):
+            let data = try await blobs.data(hash: entry.hash, name: entry.name, owner: documentID)
+            do {
+                return try await parse(data).with(templateName: template)
+            } catch {
+                throw RenderError.malformedPage(
+                    "page \(position) parsed when measured and not when drawn: \(String(describing: error))"
+                )
+            }
+        }
+    }
+
+    /// A measured document drawn into `consumer`, each page parsed as the
+    /// drawing comes to it — a few ahead, beside the drawing — and let go
+    /// once it is on the page.
+    private func draw(
+        _ work: Walk<Void>,
+        documentID: String,
+        paper: PaperSize,
+        author: String?,
+        into consumer: CGDataConsumer
+    ) async throws {
+        let output = try PageRenderer.PDFPages(
+            consumer: consumer, pageSize: work.pageSize, paper: paper, author: author
+        )
+        let images = PageRenderer.PageImages(decoded: work.images)
+        let sources = work.sources
+        try await RenderWork.boundedConcurrentForEach(Array(sources.indices)) { [self] position in
+            try await page(sources[position], documentID: documentID, position: position)
+        } consume: { _, page in
+            // A caller may cancel a render it does not need, and drawing is
+            // the long part of it. Asked between pages: a page is a bounded
+            // piece of work, and stopping between two of them costs nothing
+            // to reason about.
+            try Task.checkCancellation()
+            output.draw(page, images: images)
+        }
+        output.close()
+    }
+
+    /// Everything up to the drawing, with `keep` deciding what of each
+    /// parsed page is held: all of it for `parsed`, nothing for a render
+    /// that parses again as it draws. What the walk itself needs of a page —
+    /// its declared sheet, its attachments, its lost blocks — is taken where
+    /// the page is parsed, so a page `keep` lets go is gone before the next
+    /// is read.
+    private func walk<Kept: Sendable>(
+        documentID: String,
+        index: DocumentFiles,
+        maximumPages: Int?,
+        includesUnlistedPages: Bool,
+        onProgress: @Sendable (_ completed: Int, _ total: Int) -> Void,
+        onPageCount: @Sendable (_ drawn: Int, _ document: Int) -> Void,
+        onMissingImages: @Sendable (_ pages: Int, _ images: Int) -> Void,
+        onUnsupported: @Sendable (_ pages: Int) -> Void,
+        onUnreadable: @Sendable (_ pages: Int) -> Void,
+        keep: @escaping @Sendable (RMPage) -> Kept
+    ) async throws -> Walk<Kept> {
         let pageEntries = index.files.filter { $0.fileExtension == "rm" }
         let layout = await layout(
             pageEntries,
@@ -325,10 +485,12 @@ public struct NotebookRenderer: Sendable {
                 "render: \(documentID) has no pages at all — one blank sheet stands for it"
             )
             // One unit for the one sheet; the caller closes it after drawing.
-            return ParsedNotebook(
-                pages: [RMPage(strokes: [], skippedBlocks: 0)],
+            return Walk(
+                pages: [keep(RMPage(strokes: [], skippedBlocks: 0))],
+                sources: [.blank(template: nil)],
                 pageSize: layout.pageSize,
                 assets: [:],
+                images: [:],
                 unreadable: [],
                 pageIDs: [nil],
                 documentPageCount: 0,
@@ -350,13 +512,16 @@ public struct NotebookRenderer: Sendable {
         // seconds on a fifty-page notebook. The result is put back into
         // document order — the PDF and the "declared size wins" rule below
         // both depend on it.
-        var slots: [RMPage?] = Array(repeating: nil, count: layout.pages.count)
+        var slots: [Measured<Kept>?] = Array(repeating: nil, count: layout.pages.count)
+        var sources: [PageSource] = layout.pages.map { page in
+            page.entry.map { .file($0, template: page.template) } ?? .blank(template: page.template)
+        }
         // Pages that were never drawn on: nothing to fetch and nothing to
         // parse, only the ruling they were created with. Filled in before the
         // group starts so that the fan-out below is over real blobs alone.
         var blanks = 0
         for (position, page) in layout.pages.enumerated() where page.entry == nil {
-            slots[position] = RMPage(strokes: [], skippedBlocks: 0).with(templateName: page.template)
+            slots[position] = Measured(RMPage(strokes: [], skippedBlocks: 0).with(templateName: page.template), keep)
             blanks += 1
         }
         if blanks > 0 {
@@ -389,7 +554,7 @@ public struct NotebookRenderer: Sendable {
         let parsed = try await RenderWork.boundedConcurrentMap(
             jobs,
             onCompleted: { onProgress(blanks + $0, total) },
-            { [self] job -> (page: RMPage, version: Int?, unreadable: Bool) in
+            { [self] job -> (page: Measured<Kept>, version: Int?, unreadable: Bool) in
                 // The owner travels with the bytes, exactly as it does in
                 // `AnnotatedPDFRenderer`: a cache that is not told whose a
                 // blob is keeps nothing, so every one of these pages would be
@@ -408,10 +573,10 @@ public struct NotebookRenderer: Sendable {
                 // silence — the version travels back with it.
                 do {
                     let page = try await parse(data)
-                    return (page.with(templateName: job.template), nil, false)
+                    return (Measured(page.with(templateName: job.template), keep), nil, false)
                 } catch ParseError.unsupportedVersion(let version) {
                     let blank = RMPage(strokes: [], skippedBlocks: 1)
-                    return (blank.with(templateName: job.template), version, false)
+                    return (Measured(blank.with(templateName: job.template), keep), version, false)
                 } catch {
                     // Anything else is a page we cannot name: bytes that
                     // are not a header, a header of a generation with no
@@ -427,7 +592,7 @@ public struct NotebookRenderer: Sendable {
                         """
                     )
                     let blank = RMPage(strokes: [], skippedBlocks: 1)
-                    return (blank.with(templateName: job.template), nil, true)
+                    return (Measured(blank.with(templateName: job.template), keep), nil, true)
                 }
             }
         )
@@ -435,7 +600,10 @@ public struct NotebookRenderer: Sendable {
             slots[job.position] = result.page
             if let version = result.version { oldVersions.append(version) }
             if result.unreadable { unreadable += 1 }
-            if result.unreadable || result.version != nil { unreadPositions.insert(job.position) }
+            if result.unreadable || result.version != nil {
+                unreadPositions.insert(job.position)
+                sources[job.position] = .unread(template: job.template)
+            }
         }
         let pages = slots.compactMap { $0 }
 
@@ -501,21 +669,37 @@ public struct NotebookRenderer: Sendable {
         // carry a scene size — which is the ordinary case, and the reason this
         // precedence exists — would otherwise have its turn silently overruled
         // and come out upright.
-        let assets = PageAssets.decodable(
-            await assets(for: pages, index: index, owner: documentID),
-            channel: "render"
-        )
-        let holes = PageAssets.holes(in: pages, assets: assets)
+        let fetched = await assets(Set(pages.flatMap(\.imageFiles)), index: index, owner: documentID)
+        let images = PageAssets.decoded(fetched, channel: "render")
+        let holes = PageAssets.holes(in: pages.map(\.imageFiles), available: Set(images.keys))
         if holes.pages > 0 { onMissingImages(holes.pages, holes.images) }
-        return ParsedNotebook(
-            pages: pages,
+        return Walk(
+            pages: pages.map(\.kept),
+            sources: sources,
             pageSize: Self.canvas(declared: declared ?? layout.pageSize, isLandscape: layout.isLandscape),
-            assets: assets,
+            assets: fetched.filter { images[$0.key] != nil },
+            images: images,
             unreadable: unreadPositions,
             pageIDs: layout.pages.map { $0.entry?.fileBaseName },
             documentPageCount: layout.documentPageCount,
             total: total
         )
+    }
+
+    /// What the walk keeps of a page — `keep`'s share — and what it needs of
+    /// it itself, taken while the page is at hand.
+    private struct Measured<Kept: Sendable>: Sendable {
+        let kept: Kept
+        let paperSize: CGSize?
+        let imageFiles: [String]
+        let skippedBlocks: Int
+
+        init(_ page: RMPage, _ keep: (RMPage) -> Kept) {
+            kept = keep(page)
+            paperSize = page.paperSize
+            imageFiles = page.images.map(\.file)
+            skippedBlocks = page.skippedBlocks
+        }
     }
 
     /// One page of a document, in the order the user sees it.
@@ -564,11 +748,11 @@ public struct NotebookRenderer: Sendable {
     /// fetched the page has a hole where the user sees a picture. A missing
     /// or unreadable attachment costs its own image and nothing else.
     private func assets(
-        for pages: [RMPage],
+        _ wanted: Set<String>,
         index: DocumentFiles,
         owner: String?
     ) async -> [String: Data] {
-        await PageAssets.gather(for: pages, index: index, channel: "render") { entry in
+        await PageAssets.gather(wanted, index: index, channel: "render") { entry in
             try await blobs.data(hash: entry.hash, name: entry.name, owner: owner)
         }
     }
@@ -577,38 +761,6 @@ public struct NotebookRenderer: Sendable {
     /// computation and on a large notebook take a noticeable amount of time.
     private func parse(_ data: Data) async throws -> RMPage {
         try await RenderWork.detached { try RMParser.parsePage(data) }
-    }
-
-    private func render(
-        _ pages: [RMPage],
-        pageSize: CGSize,
-        paper: PaperSize,
-        assets: [String: Data] = [:],
-        author: String? = nil
-    ) async throws -> Data {
-        try await RenderWork.detached {
-            try PageRenderer.pdf(pages: pages, pageSize: pageSize, paper: paper, assets: assets, author: author)
-        }
-    }
-
-    private func render(
-        _ pages: [RMPage],
-        pageSize: CGSize,
-        paper: PaperSize,
-        assets: [String: Data] = [:],
-        author: String? = nil,
-        to output: URL
-    ) async throws {
-        try await RenderWork.detached {
-            try PageRenderer.pdf(
-                pages: pages,
-                pageSize: pageSize,
-                paper: paper,
-                assets: assets,
-                author: author,
-                to: output
-            )
-        }
     }
 
     /// The pages in the right order, with template names and the sheet size.

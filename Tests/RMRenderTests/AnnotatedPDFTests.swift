@@ -375,7 +375,9 @@ func imageIsDrawnInItsQuad() throws {
         .appending(path: "rmrender-test-\(UUID().uuidString).pdf")
     var box = CGRect(origin: .zero, size: sheet)
     let context = try #require(CGContext(url as CFURL, mediaBox: &box, nil))
-    AnnotatedPDFRenderer.drawPage(source: nil, marks: quad, sheet: sheet, into: context, assets: assets)
+    AnnotatedPDFRenderer.drawPage(
+        source: nil, marks: quad, sheet: sheet, into: context, images: PageRenderer.PageImages(bytes: assets)
+    )
     context.closePDF()
     defer { try? FileManager.default.removeItem(at: url) }
 
@@ -486,7 +488,7 @@ private func inkOfPageShowing(_ assets: [String: Data], file: String) throws -> 
         marks: pageShowingAnImage(named: file),
         sheet: sheet,
         into: context,
-        assets: assets
+        images: PageRenderer.PageImages(bytes: assets)
     )
     context.closePDF()
     defer { try? FileManager.default.removeItem(at: url) }

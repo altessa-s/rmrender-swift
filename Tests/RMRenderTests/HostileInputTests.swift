@@ -642,11 +642,11 @@ func underDeclaredAttachmentIsDropped() async throws {
     )
     let big = Data(count: PageRenderer.maximumAssetBytes + 1)
     let index = DocumentFiles(files: [DocumentFile(hash: "big", name: "doc/p0/big.png", size: 0)])
-    let assets = await PageAssets.gather(for: [page], index: index, channel: "test") { _ in big }
+    let assets = await PageAssets.gather(Set(page.images.map(\.file)), index: index, channel: "test") { _ in big }
     #expect(assets.isEmpty)
 
     let small = Data(count: 16)
-    let kept = await PageAssets.gather(for: [page], index: index, channel: "test") { _ in small }
+    let kept = await PageAssets.gather(Set(page.images.map(\.file)), index: index, channel: "test") { _ in small }
     #expect(kept["big.png"] == small)
 }
 
