@@ -51,15 +51,16 @@ func corruptImageLeavesAHole() throws {
 @Test("Undecodable attachments are dropped and counted as holes; decodable ones are kept")
 func undecodableAttachmentsAreCounted() throws {
     let good = try validPNG()
-    let kept = PageAssets.decodable(["own.png": Data("corrupt".utf8), "other.png": good], channel: "test")
-    #expect(kept == ["other.png": good])
+    let kept = Set(PageAssets.decoded(["own.png": Data("corrupt".utf8), "other.png": good], channel: "test").keys)
+    #expect(kept == ["other.png"])
 
     let other = RMPage(strokes: [], skippedBlocks: 0, images: [
         PageImage(file: "other.png", vertices: [], strokesBefore: 0),
     ])
-    let holes = PageAssets.holes(in: [quadPage, other, quadPage], assets: kept)
+    let files = { (pages: [RMPage]) in pages.map { $0.images.map(\.file) } }
+    let holes = PageAssets.holes(in: files([quadPage, other, quadPage]), available: kept)
     #expect(holes.pages == 2)
     #expect(holes.images == 1)
-    let none = PageAssets.holes(in: [other], assets: kept)
+    let none = PageAssets.holes(in: files([other]), available: kept)
     #expect(none.pages == 0 && none.images == 0)
 }

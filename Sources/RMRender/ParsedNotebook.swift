@@ -32,4 +32,7 @@ public struct ParsedNotebook: Sendable {
     public let documentPageCount: Int
     /// The units of work a bar counts — the pages and the assembly.
     let total: Int
+    /// `assets` as the images the check decoded them into, so drawing a
+    /// page does not decode them again (`PageRenderer.PageImages`).
+    let images: [String: CGImage]
 }

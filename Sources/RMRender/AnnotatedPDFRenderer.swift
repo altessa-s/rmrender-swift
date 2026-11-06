@@ -213,42 +213,54 @@ public struct AnnotatedPDFRenderer: Sendable {
         )
         onPageCount(resolved.pages.count, resolved.documentPageCount)
         let order = resolved.pages
+        // Measured, not kept: every page's marks are parsed here for what the
+        // drawing has to know before it starts — the sheet, whether there is
+        // anything to draw, which attachments to fetch — and let go. They are
+        // parsed again when their page is drawn (`marks(of:at:owner:)`).
+        // Kept, every page's marks stood parsed for the length of the render
+        // — about a quarter of a megabyte for a page marked all over, and a
+        // book has thousands of pages.
         let pages = try await sheets(
             order: order,
             index: index,
             original: original,
             owner: documentID,
             onUnsupported: onUnsupported,
-            onUnreadable: onUnreadable
+            onUnreadable: onUnreadable,
+            keep: MarkSummary.init
         )
         let total = originalBytes + Int64(pages.count)
         onProgress(originalBytes, total)
 
         let marked = pages.compactMap(\.marks)
-        let assets = PageAssets.decodable(
-            await assets(for: marked, index: index, owner: documentID),
+        let images = PageAssets.decoded(
+            await assets(Set(marked.flatMap(\.imageFiles)), index: index, owner: documentID),
             channel: "annotated"
         )
-        let holes = PageAssets.holes(in: marked, assets: assets)
+        let holes = PageAssets.holes(in: marked.map(\.imageFiles), available: Set(images.keys))
         if holes.pages > 0 { onMissingImages(holes.pages, holes.images) }
 
         // Everything from here on is drawing, and drawing is the long part of
         // a render — so it goes off the caller's executor into a detached
         // task, the way `NotebookRenderer` and `PageRenderer` already do, and
-        // one a cancelled caller cancels too (`RenderWork.detached`). The
-        // `CGContext` and the pages of the original are made inside it:
+        // one a cancelled caller cancels too (`RenderWork.detachedWaiting`).
+        // The `CGContext` and the pages of the original are made inside it:
         // neither is `Sendable`, and neither needs to cross — the original is
         // a file, and a file opens wherever the drawing happens to be.
         let source = downloaded.file
+        let marks: @Sendable (Int) async throws -> RMPage = { [self] position in
+            try await self.marks(of: pages[position], at: position, owner: documentID)
+        }
         do {
-            try await RenderWork.detached {
+            try await RenderWork.detachedWaiting {
                 // The cheap way first: append the marks to the original
                 // instead of redrawing it. It keeps the document's links and
                 // outline, which redrawing loses — and it refuses more often
                 // than not, because it only knows how to put marks onto pages
                 // that are already there.
-                if allowOverlay, try overlay(
-                    order: order, pages: pages, original: source, certified: certified, assets: assets, to: output
+                if allowOverlay, try await overlay(
+                    order: order, pages: pages, original: source, certified: certified, images: images,
+                    to: output, marks: marks
                 ) {
                     onProgress(total, total)
                     return
@@ -264,7 +276,9 @@ public struct AnnotatedPDFRenderer: Sendable {
                     )
                     onCertificationDropped()
                 }
-                try Self.redraw(pages, original: source, assets: assets, author: author, to: output) { done in
+                try await Self.redraw(
+                    pages, original: source, images: images, author: author, to: output, marks: marks
+                ) { done in
                     onProgress(originalBytes + Int64(done), total)
                 }
             }
@@ -290,18 +304,21 @@ public struct AnnotatedPDFRenderer: Sendable {
     /// The long way round: every page drawn afresh into a new PDF, the page
     /// of the original under the marks wherever there is one.
     ///
-    /// Synchronous on purpose — this is the body `renderPDF` hands to
-    /// `RenderWork.detached`, and it makes its own `CGContext` and opens the
-    /// original itself because neither may be carried into a detached task.
+    /// Run inside the task `renderPDF` hands to `RenderWork.detachedWaiting`,
+    /// and it makes its own `CGContext` and opens the original itself because
+    /// neither may be carried into a detached task. The marks of a page are
+    /// asked of `marks` when the page comes up — a few pages ahead, so the
+    /// parsing goes on beside the drawing — and let go once it is drawn.
     /// `onPageDrawn` is handed the number of pages finished, once per page.
     private static func redraw(
-        _ pages: [Sheet],
+        _ pages: [Sheet<MarkSummary>],
         original: URL,
-        assets: [String: Data],
+        images: [String: CGImage],
         author: String?,
         to output: URL,
+        marks: @escaping @Sendable (Int) async throws -> RMPage,
         onPageDrawn: (Int) -> Void
-    ) throws {
+    ) async throws {
         guard let provider = CGDataProvider(url: original as CFURL),
               let document = CGPDFDocument(provider)
         else {
@@ -320,19 +337,25 @@ public struct AnnotatedPDFRenderer: Sendable {
 
         let navigation = try PDFNavigation(original: original, document: document,
                                            mapping: pages.map { ($0.redir, $0.marks?.rootDocumentVisible != false, $0.sheet) })
-        for (done, page) in pages.enumerated() {
-            // Nothing in this loop suspends, so it is not interruptible on its
-            // own: without asking, a redraw of a five-hundred-page book runs to
-            // the end after the user has already dismissed it. The detached
-            // task this runs in is the one `RenderWork.detached` cancels, so
+        let drawing = PageRenderer.PageImages(decoded: images)
+        try await RenderWork.boundedConcurrentForEach(Array(pages.indices)) { position -> RMPage? in
+            // A page with no marks has nothing to fetch.
+            guard pages[position].marks != nil else { return nil }
+            return try await marks(position)
+        } consume: { done, pageMarks in
+            // The drawing itself does not suspend, so it is not interruptible
+            // on its own: without asking, a redraw of a five-hundred-page book
+            // runs to the end after the user has already dismissed it. The
+            // detached task this runs in is the one `RenderWork` cancels, so
             // the question is asked of the right task.
             try Task.checkCancellation()
+            let page = pages[done]
             drawPage(
                 source: originalPage(page.redir, in: document),
-                marks: page.marks,
+                marks: pageMarks,
                 sheet: page.sheet,
                 into: context,
-                assets: assets,
+                images: drawing,
                 navigation: { navigation.draw(page: done, in: $0) }
             )
             onPageDrawn(done + 1)
@@ -359,11 +382,11 @@ public struct AnnotatedPDFRenderer: Sendable {
     /// the tablet inside an imported document can carry captures like any
     /// notebook page. Through the cache, like every small blob here.
     private func assets(
-        for marks: [RMPage],
+        _ wanted: Set<String>,
         index: DocumentFiles,
         owner: String
     ) async -> [String: Data] {
-        await PageAssets.gather(for: marks, index: index, channel: "annotated") { entry in
+        await PageAssets.gather(wanted, index: index, channel: "annotated") { entry in
             try await blob(entry, owner: owner)
         }
     }
@@ -380,7 +403,7 @@ public struct AnnotatedPDFRenderer: Sendable {
         marks: RMPage?,
         sheet size: CGSize,
         into context: CGContext,
-        assets: [String: Data] = [:],
+        images: PageRenderer.PageImages = PageRenderer.PageImages(),
         navigation: ((CGContext) -> Void)? = nil
     ) {
         let sheet = CGRect(origin: .zero, size: size)
@@ -388,8 +411,10 @@ public struct AnnotatedPDFRenderer: Sendable {
         // size the strokes were written on — which is what `PageRenderer`
         // already knows how to draw into and how to measure.
         let units = AnnotationGeometry.units(of: size)
+        // The typed text laid out once, for the measuring and the drawing.
+        let geometry = marks?.text.map { TextGeometry($0, pageSize: units) }
         let bounds = marks.map {
-            PageRenderer.contentBounds(of: $0, pageSize: units, edge: Self.markEdge)
+            PageRenderer.contentBounds(of: $0, pageSize: units, edge: Self.markEdge, geometry: geometry)
         }
             ?? CGRect(origin: .zero, size: units)
         let box = AnnotationGeometry.box(bounds, on: sheet)
@@ -425,7 +450,7 @@ public struct AnnotatedPDFRenderer: Sendable {
         if let marks {
             context.saveGState()
             context.scaleBy(x: Calibration.pointsPerUnit, y: Calibration.pointsPerUnit)
-            PageRenderer.draw(marks, in: context, pageSize: units, bounds: bounds, assets: assets)
+            PageRenderer.draw(marks, in: context, pageSize: units, bounds: bounds, images: images, geometry: geometry)
             context.restoreGState()
         }
         navigation?(context)
@@ -482,12 +507,56 @@ public struct AnnotatedPDFRenderer: Sendable {
     /// `renderPDF`) that opens the document again from the file it came from
     /// and takes its page by this number. Nothing else about the sheet needs
     /// the handle — its size is read once, where the sheet is made.
-    private struct Sheet: Sendable {
+    ///
+    /// `Marks` is what is kept of the page's marks: the marks themselves for
+    /// a caller that reads them all (`marks(documentID:…)`), a `MarkSummary`
+    /// for a render, which parses them again when it draws the page.
+    private struct Sheet<Marks: Sendable>: Sendable {
         /// The page of the imported file behind the marks, counting from zero
         /// as `redir` does; `nil` for a page added on the tablet.
         let redir: Int?
-        let marks: RMPage?
+        /// The page's own file, where `.content` names one the index has.
+        let entry: DocumentFile?
+        /// `nil` where the page carries no marks that could be read.
+        let marks: Marks?
         let sheet: CGSize
+    }
+
+    /// What a render has to know of a page's marks before it draws a page:
+    /// whether they hide the original, whether there is anything to write at
+    /// all, and which attachments they show.
+    private struct MarkSummary: Sendable {
+        let rootDocumentVisible: Bool
+        /// Strokes, a highlight, an image or typed text — a page the tablet
+        /// merely opened carries an empty `.rm` and nothing to write.
+        let hasContent: Bool
+        let imageFiles: [String]
+
+        init(_ marks: RMPage) {
+            rootDocumentVisible = marks.rootDocumentVisible
+            hasContent = !marks.strokes.isEmpty || !marks.highlights.isEmpty || !marks.images.isEmpty
+                || marks.text != nil
+            imageFiles = marks.images.map(\.file)
+        }
+    }
+
+    /// The marks of a page, parsed again for the drawing: the render measured
+    /// them once (`sheets`) and kept no more than a `MarkSummary`. The same
+    /// bytes parse the same way, so a page whose marks were read then are
+    /// read now; one that does not — its blob gone, or no longer what it was
+    /// — fails the render rather than quietly losing the ink.
+    private func marks(of sheet: Sheet<MarkSummary>, at position: Int, owner: String) async throws -> RMPage {
+        guard sheet.marks != nil, let entry = sheet.entry else {
+            throw RenderError.malformedPage("page \(position) was measured without marks")
+        }
+        let data = try await blob(entry, owner: owner)
+        do {
+            return try await parse(data)
+        } catch {
+            throw RenderError.malformedPage(
+                "the marks on page \(position) parsed when measured and not when drawn: \(String(describing: error))"
+            )
+        }
     }
 
     /// Put the marks onto the original rather than redrawing it. `false` means
@@ -504,12 +573,13 @@ public struct AnnotatedPDFRenderer: Sendable {
     /// nothing to append it is copied as it stands, certification and all.
     private func overlay(
         order: [PageOrder.Page],
-        pages: [Sheet],
+        pages: [Sheet<MarkSummary>],
         original: URL,
         certified: Bool,
-        assets: [String: Data],
-        to output: URL
-    ) throws -> Bool {
+        images: [String: CGImage],
+        to output: URL,
+        marks: @escaping @Sendable (Int) async throws -> RMPage
+    ) async throws -> Bool {
         guard let file = try? PDFFile(url: original) else { return false }
         guard let originalPages = try? file.pages(), originalPages.count == order.count else { return false }
         // Page *n* of the document must be page *n* of the file: that is what
@@ -528,8 +598,7 @@ public struct AnnotatedPDFRenderer: Sendable {
         // costs nothing and the drawing below can go straight to the file.
         var marked: [Int] = []
         for (position, sheet) in pages.enumerated() {
-            guard let marks = sheet.marks else { continue }
-            guard !marks.strokes.isEmpty || !marks.highlights.isEmpty || !marks.images.isEmpty || marks.text != nil else { continue }
+            guard let marks = sheet.marks, marks.hasContent else { continue }
             let original = originalPages[position]
             guard original.mediaBox != nil, original.rotation.isMultiple(of: 90) else { return false }
             marked.append(position)
@@ -549,32 +618,59 @@ public struct AnnotatedPDFRenderer: Sendable {
             return false
         }
 
-        // Each page's marks are drawn when the writer asks for them and are
-        // gone once it has written them out: collected first, a fully marked
-        // book held every page's operators — and a PDF of every page carrying
-        // text or a picture — at once, which is what an extension is killed
-        // for. A failure of the drawing itself is not the overlay declining,
-        // and it is carried past the fallback below as what it is.
+        // Each page's marks are parsed when the writer comes to the page, a
+        // few pages ahead of it, drawn, written out and gone: collected first,
+        // a fully marked book held every page's marks and operators — and a
+        // PDF of every page carrying text or a picture — at once, which is
+        // what an extension is killed for. A failure of the drawing itself,
+        // or of fetching what it draws, is not the overlay declining, and it
+        // is carried past the fallback below as what it is.
         struct DrawingFailed: Error { let underlying: any Error }
+        let drawing = PageRenderer.PageImages(decoded: images)
         do {
-            try PDFOverlayWriter().write(
+            let revision = try PDFOverlayWriter.Revision(
+                writer: PDFOverlayWriter(),
                 file: file,
                 pages: originalPages,
                 original: original,
                 pageIndices: marked,
-                to: output
-            ) { position in
-                do {
-                    // Nothing here suspends, and a book is minutes of it:
-                    // the question is asked once a page, as the redraw asks it.
-                    try Task.checkCancellation()
-                    return try Self.overlay(pages[position], on: originalPages[position], at: position, assets: assets)
-                } catch {
-                    throw DrawingFailed(underlying: error)
+                output: output
+            )
+            do {
+                try await RenderWork.boundedConcurrentForEach(marked) { position in
+                    do {
+                        return try await marks(position)
+                    } catch {
+                        throw DrawingFailed(underlying: error)
+                    }
+                } consume: { index, pageMarks in
+                    let position = marked[index]
+                    let overlay: PDFOverlayWriter.Overlay
+                    do {
+                        // The drawing does not suspend, and a book is minutes
+                        // of it: the question is asked once a page, as the
+                        // redraw asks it.
+                        try Task.checkCancellation()
+                        overlay = try Self.overlay(
+                            pageMarks, sheet: pages[position].sheet, on: originalPages[position], at: position,
+                            images: drawing
+                        )
+                    } catch {
+                        throw DrawingFailed(underlying: error)
+                    }
+                    try revision.append(overlay)
                 }
+                try revision.finish()
+            } catch {
+                revision.abandon()
+                throw error
             }
         } catch let failure as DrawingFailed {
             throw failure.underlying
+        } catch is CancellationError {
+            // A cancelled render is not an overlay that declined: falling back
+            // to the redraw would start the whole book again for nobody.
+            throw CancellationError()
         } catch {
             // At error level: the document still goes out, drawn afresh, but
             // without its links and outline — a loss with a reason that has
@@ -590,25 +686,24 @@ public struct AnnotatedPDFRenderer: Sendable {
     /// original's page; `overlay(order:…)` has already seen that the page has
     /// marks, a media box, and a rotation by a right angle.
     private static func overlay(
-        _ sheet: Sheet,
+        _ marks: RMPage,
+        sheet: CGSize,
         on original: PDFFile.Page,
         at position: Int,
-        assets: [String: Data]
+        images: PageRenderer.PageImages
     ) throws -> PDFOverlayWriter.Overlay {
-        guard let marks = sheet.marks, let box = original.mediaBox else {
-            throw PDFReadError.malformed("an overlay for page \(position), which has no marks or no box")
+        guard let box = original.mediaBox else {
+            throw PDFReadError.malformed("an overlay for page \(position), which has no box")
         }
         let rotated = !original.rotation.isMultiple(of: 360)
-        let drawingBox = rotated ? CGRect(origin: .zero, size: sheet.sheet) : box
+        let drawingBox = rotated ? CGRect(origin: .zero, size: sheet) : box
         let built = marks.text == nil && marks.images.isEmpty ? MarkContentStream.build(marks, mediaBox: drawingBox) : nil
-        var grown = AnnotationGeometry.box(
-            PageRenderer.contentBounds(
-                of: marks,
-                pageSize: AnnotationGeometry.units(of: drawingBox.size),
-                edge: Self.markEdge
-            ),
-            on: drawingBox
-        )
+        // Measured once, for the box and for the drawing alike, with the typed
+        // text laid out once for both.
+        let units = AnnotationGeometry.units(of: drawingBox.size)
+        let geometry = marks.text.map { TextGeometry($0, pageSize: units) }
+        let bounds = PageRenderer.contentBounds(of: marks, pageSize: units, edge: Self.markEdge, geometry: geometry)
+        var grown = AnnotationGeometry.box(bounds, on: drawingBox)
         var native: Data?
         var content: Data
         if let built {
@@ -623,10 +718,7 @@ public struct AnnotatedPDFRenderer: Sendable {
             context.beginPDFPage(nil)
             context.translateBy(x: drawingBox.minX, y: drawingBox.minY)
             context.scaleBy(x: Calibration.pointsPerUnit, y: Calibration.pointsPerUnit)
-            let units = AnnotationGeometry.units(of: drawingBox.size)
-            PageRenderer.draw(marks, in: context, pageSize: units,
-                              bounds: PageRenderer.contentBounds(of: marks, pageSize: units, edge: Self.markEdge),
-                              assets: assets)
+            PageRenderer.draw(marks, in: context, pageSize: units, bounds: bounds, images: images, geometry: geometry)
             context.endPDFPage()
             context.closePDF()
             native = data as Data
@@ -692,7 +784,7 @@ public struct AnnotatedPDFRenderer: Sendable {
         let order = try await pageOrder(
             index: index, original: original, owner: documentID, maximumPages: maximumPages
         ).pages
-        let pages = try await sheets(order: order, index: index, original: original, owner: documentID)
+        let pages = try await sheets(order: order, index: index, original: original, owner: documentID) { $0 }
         return zip(order, pages).map { entry, page in
             // The page's own name travels with its marks: an edit made to
             // them later goes to that file, and the place of the page in the
@@ -706,14 +798,19 @@ public struct AnnotatedPDFRenderer: Sendable {
         }
     }
 
-    private func sheets(
+    /// The pages in order, each with its sheet and what `keep` keeps of its
+    /// marks. `keep` runs where the marks are parsed, beside the fetch, so
+    /// that what it does not keep is let go there rather than held until
+    /// every page has been read.
+    private func sheets<Marks: Sendable>(
         order: [PageOrder.Page],
         index: DocumentFiles,
         original: CGPDFDocument,
         owner: String,
         onUnsupported: @escaping @Sendable (_ pages: Int) -> Void = { _ in },
-        onUnreadable: @escaping @Sendable (_ pages: Int) -> Void = { _ in }
-    ) async throws -> [Sheet] {
+        onUnreadable: @escaping @Sendable (_ pages: Int) -> Void = { _ in },
+        keep: @escaping @Sendable (RMPage) -> Marks
+    ) async throws -> [Sheet<Marks>] {
         // A record per page, found once. Searching the index for every page
         // is a scan inside a loop, and a book runs to hundreds of both.
         var entryOfPage: [String: DocumentFile] = [:]
@@ -728,7 +825,11 @@ public struct AnnotatedPDFRenderer: Sendable {
         // them in a row while the caller waits. Order is restored by
         // position — the pages are assembled below in the document's order,
         // not in the order the blobs happen to land.
-        var marks: [RMPage?] = Array(repeating: nil, count: order.count)
+        // What the sheet needs of the marks travels beside what is kept of
+        // them: the scene's size, for a page with no original behind it, and
+        // the blocks that did not read.
+        typealias Measured = (kept: Marks, paperSize: CGSize?, skippedBlocks: Int)
+        var marks: [Measured?] = Array(repeating: nil, count: order.count)
         let jobs: [(position: Int, entry: DocumentFile)] = order.enumerated().compactMap { position, page in
             entryOfPage[page.id].map { (position, $0) }
         }
@@ -742,12 +843,13 @@ public struct AnnotatedPDFRenderer: Sendable {
         var unreadable = 0
         let parsed = try await RenderWork.boundedConcurrentMap(
             jobs
-        ) { [self] job -> (page: RMPage?, version: Int?, unreadable: Bool) in
+        ) { [self] job -> (page: Measured?, version: Int?, unreadable: Bool) in
             let data = try await blob(job.entry, owner: owner)
             // One unreadable page must not cost the whole document:
             // the original still goes out, only without its marks.
             do {
-                return (try await parse(data), nil, false)
+                let page = try await parse(data)
+                return ((keep(page), page.paperSize, page.skippedBlocks), nil, false)
             } catch ParseError.unsupportedVersion(let version) {
                 return (nil, version, false)
             } catch {
@@ -766,7 +868,7 @@ public struct AnnotatedPDFRenderer: Sendable {
             if result.unreadable { unreadable += 1 }
         }
 
-        var sheets: [Sheet] = []
+        var sheets: [Sheet<Marks>] = []
         for (position, page) in order.enumerated() {
             let source = Self.originalPage(page.redir, in: original)
             // The sheet is the original page wherever there is one. Otherwise
@@ -782,7 +884,9 @@ public struct AnnotatedPDFRenderer: Sendable {
                     forScene: PageRenderer.plausibleCanvas(marks[position]?.paperSize) ?? PageRenderer.defaultPageSize
                 )
             }
-            sheets.append(Sheet(redir: page.redir, marks: marks[position], sheet: sheet))
+            sheets.append(
+                Sheet(redir: page.redir, entry: entryOfPage[page.id], marks: marks[position]?.kept, sheet: sheet)
+            )
         }
 
         // What the parser could not read is said out loud. There are no
@@ -793,7 +897,7 @@ public struct AnnotatedPDFRenderer: Sendable {
         // count, it would vanish without a word — and it is an error
         // rather than a debug line for the same reason: a loss nobody is told
         // about is the one that ships.
-        let skipped = sheets.compactMap(\.marks).reduce(0) { $0 + $1.skippedBlocks }
+        let skipped = marks.compactMap { $0 }.reduce(0) { $0 + $1.skippedBlocks }
         if skipped > 0 {
             RMRenderLog.pageError(
                 """

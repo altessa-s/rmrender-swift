@@ -39,6 +39,68 @@ enum RenderWork {
         }
     }
 
+    /// The same for work that waits on something as it goes — a drawing that
+    /// fetches and parses its next pages while it draws this one. Named apart
+    /// rather than overloaded: a closure that does not wait would fit either,
+    /// and which one it took would be the compiler's guess.
+    static func detachedWaiting<T: Sendable>(
+        _ body: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        let work = Task.detached(priority: .userInitiated, operation: body)
+        return try await withTaskCancellationHandler {
+            try await work.value
+        } onCancel: {
+            work.cancel()
+        }
+    }
+
+    /// `jobs` run at most `limit` at a time, and each answer is handed to
+    /// `consume` in the order the jobs were given and let go once it has
+    /// been — a drawing that takes pages as they are parsed and holds no
+    /// more of them than the window.
+    ///
+    /// The window counts the answers waiting their turn as well as the jobs
+    /// still running: a new job starts only when an answer has been consumed,
+    /// so a slow page holds back what comes after it rather than letting
+    /// finished ones pile up behind it. At most `limit` answers exist at once,
+    /// and the one `consume` is working on.
+    ///
+    /// `consume` runs on the calling task, one answer at a time, while the
+    /// next jobs go on in the background: what it touches — a `CGContext`,
+    /// a file being written — is never shared. A failure, of a job or of
+    /// `consume`, ends the run the way `boundedConcurrentMap` ends one.
+    static func boundedConcurrentForEach<Job: Sendable, Out: Sendable>(
+        _ jobs: [Job],
+        limit: Int = RenderWork.pageConcurrency,
+        _ transform: @escaping @Sendable (Job) async throws -> Out,
+        consume: (_ position: Int, _ value: Out) throws -> Void
+    ) async throws {
+        try await withThrowingTaskGroup(of: (position: Int, value: Out).self) { group in
+            var next = 0
+            func addNext() {
+                guard next < jobs.count else { return }
+                let position = next
+                let job = jobs[position]
+                next += 1
+                group.addTask { (position, try await transform(job)) }
+            }
+            for _ in 0..<max(1, limit) { addNext() }
+
+            var waiting: [Int: Out] = [:]
+            for position in jobs.indices {
+                while waiting[position] == nil {
+                    // Every position below `next` is running or waiting, and
+                    // this one is below it, so the group cannot run dry here.
+                    guard let finished = try await group.next() else { return }
+                    waiting[finished.position] = finished.value
+                }
+                guard let value = waiting.removeValue(forKey: position) else { continue }
+                try consume(position, value)
+                addNext()
+            }
+        }
+    }
+
     /// `jobs` run at most `limit` at a time, and the answers come back in the
     /// order the jobs were given.
     ///
