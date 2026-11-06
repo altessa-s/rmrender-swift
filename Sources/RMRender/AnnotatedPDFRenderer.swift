@@ -523,78 +523,22 @@ public struct AnnotatedPDFRenderer: Sendable {
         // native PDF Form rendered by the same PageRenderer as fresh export.
         for sheet in pages where sheet.marks?.rootDocumentVisible == false { return false }
 
-        var overlays: [PDFOverlayWriter.Overlay] = []
+        // Which pages carry marks, and whether each of them is one the overlay
+        // can write onto — decided before a page is drawn, so that a refusal
+        // costs nothing and the drawing below can go straight to the file.
+        var marked: [Int] = []
         for (position, sheet) in pages.enumerated() {
             guard let marks = sheet.marks else { continue }
             guard !marks.strokes.isEmpty || !marks.highlights.isEmpty || !marks.images.isEmpty || marks.text != nil else { continue }
             let original = originalPages[position]
-            guard let box = original.mediaBox, original.rotation.isMultiple(of: 90) else { return false }
-            let rotated = !original.rotation.isMultiple(of: 360)
-            let drawingBox = rotated ? CGRect(origin: .zero, size: sheet.sheet) : box
-            let built = marks.text == nil && marks.images.isEmpty ? MarkContentStream.build(marks, mediaBox: drawingBox) : nil
-            var grown = AnnotationGeometry.box(
-                PageRenderer.contentBounds(
-                    of: marks,
-                    pageSize: AnnotationGeometry.units(of: drawingBox.size),
-                    edge: Self.markEdge
-                ),
-                on: drawingBox
-            )
-            var native: Data?
-            var content: Data
-            if let built {
-                content = built.content
-            } else {
-                let data = NSMutableData()
-                var media = grown
-                guard let consumer = CGDataConsumer(data: data),
-                      let context = CGContext(consumer: consumer, mediaBox: &media, nil) else {
-                    throw RenderError.pdfContextUnavailable
-                }
-                context.beginPDFPage(nil)
-                context.translateBy(x: drawingBox.minX, y: drawingBox.minY)
-                context.scaleBy(x: Calibration.pointsPerUnit, y: Calibration.pointsPerUnit)
-                let units = AnnotationGeometry.units(of: drawingBox.size)
-                PageRenderer.draw(marks, in: context, pageSize: units,
-                                  bounds: PageRenderer.contentBounds(of: marks, pageSize: units, edge: Self.markEdge),
-                                  assets: assets)
-                context.endPDFPage()
-                context.closePDF()
-                native = data as Data
-                content = Data("q /RMNative Do Q\n".utf8)
-            }
-            if rotated {
-                // Marks use the displayed page's frame. The appended Form uses
-                // the original page's frame and keeps its /Rotate unchanged.
-                let placement = CGAffineTransform(translationX: drawingBox.midX, y: drawingBox.midY)
-                    .rotated(by: -CGFloat(original.rotation % 360) * .pi / 180)
-                    .translatedBy(x: -box.midX, y: -box.midY)
-                    .inverted()
-                let matrix = [placement.a, placement.b, placement.c, placement.d, placement.tx, placement.ty]
-                    .map { PDFWriter.number(Double($0), places: 10) }.joined(separator: " ")
-                content = Data("q \(matrix) cm\n".utf8) + content + Data("\nQ\n".utf8)
-                grown = grown.applying(placement)
-            }
-            let unchangedBox = zip(
-                [grown.minX, grown.minY, grown.maxX, grown.maxY],
-                [box.minX, box.minY, box.maxX, box.maxY]
-            ).allSatisfy { abs($0 - $1) < 1e-8 }
-            overlays.append(
-                PDFOverlayWriter.Overlay(
-                    pageIndex: position,
-                    content: content,
-                    states: built?.states ?? [],
-                    images: built?.images ?? [],
-                    box: unchangedBox ? nil : grown,
-                    formPDF: native
-                )
-            )
+            guard original.mediaBox != nil, original.rotation.isMultiple(of: 90) else { return false }
+            marked.append(position)
         }
         // A document whose pages carry no marks at all — the tablet writes an
         // empty `.rm` for a page merely opened — is its own original, and the
         // best thing to do with it is nothing. Redrawing it would re-encode
         // a hundred megabytes of scan to arrive at the same document.
-        if overlays.isEmpty {
+        if marked.isEmpty {
             try? FileManager.default.removeItem(at: output)
             try FileManager.default.copyItem(at: original, to: output)
             RMRenderLog.pageDebug("annotated: no marks on any page — the original goes out as it is")
@@ -605,20 +549,113 @@ public struct AnnotatedPDFRenderer: Sendable {
             return false
         }
 
+        // Each page's marks are drawn when the writer asks for them and are
+        // gone once it has written them out: collected first, a fully marked
+        // book held every page's operators — and a PDF of every page carrying
+        // text or a picture — at once, which is what an extension is killed
+        // for. A failure of the drawing itself is not the overlay declining,
+        // and it is carried past the fallback below as what it is.
+        struct DrawingFailed: Error { let underlying: any Error }
         do {
             try PDFOverlayWriter().write(
                 file: file,
                 pages: originalPages,
                 original: original,
-                overlays: overlays,
+                pageIndices: marked,
                 to: output
-            )
+            ) { position in
+                do {
+                    // Nothing here suspends, and a book is minutes of it:
+                    // the question is asked once a page, as the redraw asks it.
+                    try Task.checkCancellation()
+                    return try Self.overlay(pages[position], on: originalPages[position], at: position, assets: assets)
+                } catch {
+                    throw DrawingFailed(underlying: error)
+                }
+            }
+        } catch let failure as DrawingFailed {
+            throw failure.underlying
         } catch {
-            RMRenderLog.pageDebug("annotated: overlay declined — \(String(describing: error))")
+            // At error level: the document still goes out, drawn afresh, but
+            // without its links and outline — a loss with a reason that has
+            // to be findable.
+            RMRenderLog.pageError("annotated: overlay declined — \(String(describing: error))")
             return false
         }
-        RMRenderLog.pageDebug("annotated: marks appended to the original, \(overlays.count) pages")
+        RMRenderLog.pageDebug("annotated: marks appended to the original, \(marked.count) pages")
         return true
+    }
+
+    /// The marks of one page as the overlay writes them, in the frame of the
+    /// original's page; `overlay(order:…)` has already seen that the page has
+    /// marks, a media box, and a rotation by a right angle.
+    private static func overlay(
+        _ sheet: Sheet,
+        on original: PDFFile.Page,
+        at position: Int,
+        assets: [String: Data]
+    ) throws -> PDFOverlayWriter.Overlay {
+        guard let marks = sheet.marks, let box = original.mediaBox else {
+            throw PDFReadError.malformed("an overlay for page \(position), which has no marks or no box")
+        }
+        let rotated = !original.rotation.isMultiple(of: 360)
+        let drawingBox = rotated ? CGRect(origin: .zero, size: sheet.sheet) : box
+        let built = marks.text == nil && marks.images.isEmpty ? MarkContentStream.build(marks, mediaBox: drawingBox) : nil
+        var grown = AnnotationGeometry.box(
+            PageRenderer.contentBounds(
+                of: marks,
+                pageSize: AnnotationGeometry.units(of: drawingBox.size),
+                edge: Self.markEdge
+            ),
+            on: drawingBox
+        )
+        var native: Data?
+        var content: Data
+        if let built {
+            content = built.content
+        } else {
+            let data = NSMutableData()
+            var media = grown
+            guard let consumer = CGDataConsumer(data: data),
+                  let context = CGContext(consumer: consumer, mediaBox: &media, nil) else {
+                throw RenderError.pdfContextUnavailable
+            }
+            context.beginPDFPage(nil)
+            context.translateBy(x: drawingBox.minX, y: drawingBox.minY)
+            context.scaleBy(x: Calibration.pointsPerUnit, y: Calibration.pointsPerUnit)
+            let units = AnnotationGeometry.units(of: drawingBox.size)
+            PageRenderer.draw(marks, in: context, pageSize: units,
+                              bounds: PageRenderer.contentBounds(of: marks, pageSize: units, edge: Self.markEdge),
+                              assets: assets)
+            context.endPDFPage()
+            context.closePDF()
+            native = data as Data
+            content = Data("q /RMNative Do Q\n".utf8)
+        }
+        if rotated {
+            // Marks use the displayed page's frame. The appended Form uses
+            // the original page's frame and keeps its /Rotate unchanged.
+            let placement = CGAffineTransform(translationX: drawingBox.midX, y: drawingBox.midY)
+                .rotated(by: -CGFloat(original.rotation % 360) * .pi / 180)
+                .translatedBy(x: -box.midX, y: -box.midY)
+                .inverted()
+            let matrix = [placement.a, placement.b, placement.c, placement.d, placement.tx, placement.ty]
+                .map { PDFWriter.number(Double($0), places: 10) }.joined(separator: " ")
+            content = Data("q \(matrix) cm\n".utf8) + content + Data("\nQ\n".utf8)
+            grown = grown.applying(placement)
+        }
+        let unchangedBox = zip(
+            [grown.minX, grown.minY, grown.maxX, grown.maxY],
+            [box.minX, box.minY, box.maxX, box.maxY]
+        ).allSatisfy { abs($0 - $1) < 1e-8 }
+        return PDFOverlayWriter.Overlay(
+            pageIndex: position,
+            content: content,
+            states: built?.states ?? [],
+            images: built?.images ?? [],
+            box: unchangedBox ? nil : grown,
+            formPDF: native
+        )
     }
 
     /// Where the marker went on every page, in the frame the flattened

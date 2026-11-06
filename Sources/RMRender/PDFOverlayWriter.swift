@@ -49,10 +49,22 @@ enum PDFWriter {
                 start = end
             } while start < data.count
         }
+        // Reduced every 5552 bytes rather than every byte: the most that
+        // can be summed before `b` would overflow 32 bits. Every page of an
+        // overlay passes through here, so the per-byte division showed.
         var a: UInt32 = 1, b: UInt32 = 0
-        for byte in data {
-            a = (a + UInt32(byte)) % 65521
-            b = (b + a) % 65521
+        data.withUnsafeBytes { buffer in
+            var start = 0
+            while start < buffer.count {
+                let end = min(start + 5552, buffer.count)
+                for byte in buffer[start..<end] {
+                    a += UInt32(byte)
+                    b += a
+                }
+                a %= 65521
+                b %= 65521
+                start = end
+            }
         }
         let adler = (b << 16) | a
         out.append(contentsOf: [UInt8(adler >> 24), UInt8((adler >> 16) & 0xFF)])
@@ -278,24 +290,55 @@ public struct PDFOverlayWriter: Sendable {
         overlays: [Overlay],
         to output: URL
     ) throws {
+        var remaining = overlays.makeIterator()
+        try write(
+            file: file,
+            pages: pages,
+            original: original,
+            pageIndices: overlays.map(\.pageIndex),
+            to: output
+        ) { _ in
+            // Asked for once per index and in their order, so the list
+            // cannot run out before the indices do.
+            guard let overlay = remaining.next() else {
+                throw PDFReadError.malformed("fewer overlays than pages")
+            }
+            return overlay
+        }
+    }
+
+    /// The same, a page at a time: `overlay` is asked for the marks of each
+    /// page in `pageIndices`, once and in that order, and what it hands back
+    /// is written out before the next page is asked for. A book's worth of
+    /// marks is never in memory at once — one page of it is, and the
+    /// cross-reference — where collecting them first took a fully marked
+    /// book of two thousand pages to 2.9 GB, the size of the extension that
+    /// does it.
+    ///
+    /// What can be refused from what is known up front — a certified
+    /// original, a page index the original does not have, a `/Size` past
+    /// what the format counts — is refused before anything is written. What
+    /// fails later — `overlay` throwing, a page that does not hold together,
+    /// an overlay for a page other than the one asked for — stops the write
+    /// where it is: the half-written copy is removed and `output` is left as
+    /// it was.
+    public func write(
+        file: PDFFile,
+        pages: [PDFFile.Page],
+        original: URL,
+        pageIndices: [Int],
+        to output: URL,
+        overlay make: (_ pageIndex: Int) throws -> Overlay
+    ) throws {
         let root = try file.resolve(file.trailer["Root"]).dictionaryValue
         guard root?["Perms"] == nil else {
             throw RenderError.unsupportedFormat("a certified PDF (/Perms) takes no incremental update")
         }
-        for overlay in overlays {
-            guard overlay.pageIndex >= 0, overlay.pageIndex < pages.count else {
-                throw OverlayError.noSuchPage(overlay.pageIndex)
+        for pageIndex in pageIndices {
+            guard pageIndex >= 0, pageIndex < pages.count else {
+                throw OverlayError.noSuchPage(pageIndex)
             }
         }
-
-        // Validate and construct the revision before touching the destination.
-        let offset = file.bytes.count
-        var body = Data()
-        if file.bytes.last != 0x0A {
-            body.append(0x0A)
-        }
-        var newOffsets: [Int: Int] = [:]
-        var newGenerations: [Int: Int] = [:]
         // `/Size` is the file's own word, and a word past any object number
         // the format can write is refused rather than counted on from: every
         // object this update adds is one more than the last, and one more
@@ -305,20 +348,75 @@ public struct PDFOverlayWriter: Sendable {
         guard size <= PDFFile.objectNumberLimit else {
             throw PDFReadError.malformed("a trailer /Size of \(size)")
         }
+
+        let temporary = output.deletingLastPathComponent()
+            .appendingPathComponent(".rmrender-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        try FileManager.default.copyItem(at: original, to: temporary)
+        let handle = try FileHandle(forWritingTo: temporary)
+        do {
+            // Every offset written below counts from the end of the file that
+            // was read. A copy of another length — the original replaced
+            // between the read and now — would put each of them in the wrong
+            // place.
+            let offset = file.bytes.count
+            guard try handle.seekToEnd() == UInt64(offset) else {
+                throw PDFReadError.malformed("the original changed after it was read")
+            }
+            try appendRevision(to: handle, file: file, pages: pages, pageIndices: pageIndices, overlay: make)
+            try handle.close()
+        } catch {
+            try? handle.close()
+            throw error
+        }
+        // POSIX rename replaces an existing destination atomically on its volume.
+        guard rename(temporary.path, output.path) == 0 else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+    }
+
+    /// The update itself, written to `handle` as it is made: objects are
+    /// gathered into a buffer of about a megabyte and the buffer goes to the
+    /// file, so what is held is that and the offsets, whatever the length of
+    /// the book.
+    private func appendRevision(
+        to handle: FileHandle,
+        file: PDFFile,
+        pages: [PDFFile.Page],
+        pageIndices: [Int],
+        overlay make: (_ pageIndex: Int) throws -> Overlay
+    ) throws {
+        // Bytes already in the file, and those made but not yet written to
+        // it: an object's offset is their sum at the moment it begins.
+        var flushed = file.bytes.count
+        var pending = Data()
+        func position() -> Int { flushed + pending.count }
+        func flush() throws {
+            guard !pending.isEmpty else { return }
+            try handle.write(contentsOf: pending)
+            flushed += pending.count
+            pending.removeAll(keepingCapacity: true)
+        }
+
+        if file.bytes.last != 0x0A {
+            pending.append(0x0A)
+        }
+        var newOffsets: [Int: Int] = [:]
+        var newGenerations: [Int: Int] = [:]
         // Past every number any section names, free ones included: a number
         // freed in one revision may still be what an older object refers to,
         // and a new object under it would answer that reference.
-        var nextNumber = max(file.highestObjectNumber + 1, size)
+        var nextNumber = max(file.highestObjectNumber + 1, file.trailer["Size"]?.intValue ?? 1)
 
         func emit(_ object: PDFObject, number: Int? = nil) -> Int {
             let assigned = number ?? nextNumber
             if number == nil { nextNumber += 1 }
-            newOffsets[assigned] = offset + body.count
+            newOffsets[assigned] = position()
             let generation = number.flatMap { file.generations[$0] } ?? 0
             newGenerations[assigned] = generation
-            body.append(contentsOf: Array("\(assigned) \(generation) obj\n".utf8))
-            PDFWriter.append(object, to: &body)
-            body.append(contentsOf: Array("\nendobj\n".utf8))
+            pending.append(contentsOf: Array("\(assigned) \(generation) obj\n".utf8))
+            PDFWriter.append(object, to: &pending)
+            pending.append(contentsOf: Array("\nendobj\n".utf8))
             return assigned
         }
 
@@ -351,8 +449,12 @@ public struct PDFOverlayWriter: Sendable {
             return number
         }
 
-        for overlay in overlays {
-            let page = pages[overlay.pageIndex]
+        for pageIndex in pageIndices {
+            let overlay = try make(pageIndex)
+            guard overlay.pageIndex == pageIndex else {
+                throw PDFReadError.malformed("an overlay for page \(overlay.pageIndex) where \(pageIndex) was asked for")
+            }
+            let page = pages[pageIndex]
 
             // The states by the names this page's content says them. Two
             // pages may both say `/RMGs0` and mean different things by it;
@@ -460,17 +562,23 @@ public struct PDFOverlayWriter: Sendable {
                     "Type": .name("XObject"), "Subtype": .name("Form"),
                     "BBox": rectangle(first.mediaBox ?? .zero),
                     "Resources": try copy(source.resolve(first.resources)),
-                ], content))
+                    "Filter": .name("FlateDecode"),
+                ], PDFWriter.flate(content)))
                 scopedObjects["RMNative"] = .reference(number: native, generation: 0)
             }
 
             scoped["ExtGState"] = .dictionary(scopedStates)
             scoped["XObject"] = .dictionary(scopedObjects)
+            // Deflated, like the stencils: the operators are text — numbers
+            // and a letter, point after point — and written as they stand
+            // they made a fully marked book of 2,000 pages a file of 1.7 GB,
+            // three times what drawing it afresh comes to.
             let form = emit(stream([
                 "Type": .name("XObject"), "Subtype": .name("Form"),
                 "BBox": rectangle(overlay.box ?? page.mediaBox ?? .zero),
                 "Resources": .dictionary(scoped),
-            ], overlay.content))
+                "Filter": .name("FlateDecode"),
+            ], PDFWriter.flate(overlay.content)))
             var objects = try file.resolve(resources["XObject"]).dictionaryValue ?? [:]
             var name = "RMOverlay"
             while objects[name] != nil { name += "_" }
@@ -489,9 +597,10 @@ public struct PDFOverlayWriter: Sendable {
             // The same object number: an incremental update replaces a page by
             // writing it again, and the newest cross-reference wins.
             _ = emit(.dictionary(dictionary), number: page.number)
+            if pending.count >= 1 << 20 { try flush() }
         }
 
-        let crossReference = offset + body.count
+        let crossReference = position()
         if file.usesCrossReferenceStreams {
             let number = nextNumber
             nextNumber += 1
@@ -517,39 +626,17 @@ public struct PDFOverlayWriter: Sendable {
             if file.trailer["XRefStm"] != nil { dictionary.removeValue(forKey: "Prev") }
             _ = emit(stream(dictionary, rows), number: number)
             if file.trailer["XRefStm"] != nil {
-                let tableOffset = offset + body.count
-                body.append(crossReferenceTable(newOffsets, generations: newGenerations))
-                body.append(trailer(of: file, size: nextNumber, crossReference: tableOffset, hybrid: crossReference))
+                let tableOffset = position()
+                pending.append(crossReferenceTable(newOffsets, generations: newGenerations))
+                pending.append(trailer(of: file, size: nextNumber, crossReference: tableOffset, hybrid: crossReference))
             } else {
-                body.append(Data("startxref\n\(crossReference)\n%%EOF\n".utf8))
+                pending.append(Data("startxref\n\(crossReference)\n%%EOF\n".utf8))
             }
         } else {
-            body.append(crossReferenceTable(newOffsets, generations: newGenerations))
-            body.append(trailer(of: file, size: nextNumber, crossReference: crossReference))
+            pending.append(crossReferenceTable(newOffsets, generations: newGenerations))
+            pending.append(trailer(of: file, size: nextNumber, crossReference: crossReference))
         }
-
-        let temporary = output.deletingLastPathComponent()
-            .appendingPathComponent(".rmrender-\(UUID().uuidString).pdf")
-        defer { try? FileManager.default.removeItem(at: temporary) }
-        try FileManager.default.copyItem(at: original, to: temporary)
-        let handle = try FileHandle(forWritingTo: temporary)
-        do {
-            // Every offset in `body` counts from the end of the file that was
-            // read. A copy of another length — the original replaced between
-            // the read and now — would put each of them in the wrong place.
-            guard try handle.seekToEnd() == UInt64(offset) else {
-                throw PDFReadError.malformed("the original changed after it was read")
-            }
-            try handle.write(contentsOf: body)
-            try handle.close()
-        } catch {
-            try? handle.close()
-            throw error
-        }
-        // POSIX rename replaces an existing destination atomically on its volume.
-        guard rename(temporary.path, output.path) == 0 else {
-            throw CocoaError(.fileWriteUnknown)
-        }
+        try flush()
     }
 
     /// A box the way PDF writes one: lower left corner, then upper right.
@@ -595,13 +682,18 @@ public struct PDFOverlayWriter: Sendable {
     /// grouped into runs of consecutive numbers.
     func crossReferenceTable(_ offsets: [Int: Int], generations: [Int: Int]) -> Data {
         var out = Data("xref\n".utf8)
-        var numbers = offsets.keys.sorted()
-        while !numbers.isEmpty {
-            var run = [numbers.removeFirst()]
-            while let next = numbers.first, next == run[run.count - 1] + 1 {
-                run.append(numbers.removeFirst())
+        // Walked by index: taking each number off the front of the array
+        // moved all the rest every time, and a book's update is thousands.
+        let numbers = offsets.keys.sorted()
+        var start = 0
+        while start < numbers.count {
+            var end = start + 1
+            while end < numbers.count, numbers[end] == numbers[end - 1] + 1 {
+                end += 1
             }
-            out.append(contentsOf: Array("\(run[0]) \(run.count)\n".utf8))
+            let run = numbers[start..<end]
+            start = end
+            out.append(contentsOf: Array("\(run[run.startIndex]) \(run.count)\n".utf8))
             for number in run {
                 // Twenty bytes a row, exactly: offset, generation, kind.
                 out.append(contentsOf: Array(String(format: "%010ld %05ld n \n", offsets[number] ?? 0, generations[number] ?? 0).utf8))
