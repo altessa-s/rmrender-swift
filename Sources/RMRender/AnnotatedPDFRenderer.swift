@@ -618,52 +618,37 @@ public struct AnnotatedPDFRenderer: Sendable {
             return false
         }
 
-        // Each page's marks are parsed when the writer comes to the page, a
-        // few pages ahead of it, drawn, written out and gone: collected first,
-        // a fully marked book held every page's marks and operators — and a
-        // PDF of every page carrying text or a picture — at once, which is
-        // what an extension is killed for. A failure of the drawing itself,
-        // or of fetching what it draws, is not the overlay declining, and it
-        // is carried past the fallback below as what it is.
+        // Each page's marks are parsed a few pages ahead of the writer, drawn
+        // and deflated there, then written out in page order and gone:
+        // collected first, a fully marked book held every page's marks and
+        // operators — and a PDF of every page carrying text or a picture — at
+        // once, which is what an extension is killed for. The drawing and the
+        // deflating are most of the time and need nothing of the update, so
+        // the pages in the window do them side by side, each into a context
+        // of its own (`PDFOverlayWriter.writeConcurrently`); the file is the
+        // one a page at a time gives. A failure of the drawing itself, or of
+        // fetching what it draws, is not the overlay declining, and it is
+        // carried past the fallback below as what it is.
         struct DrawingFailed: Error { let underlying: any Error }
         let drawing = PageRenderer.PageImages(decoded: images)
+        let sheets = pages.map(\.sheet)
         do {
-            let revision = try PDFOverlayWriter.Revision(
-                writer: PDFOverlayWriter(),
-                file: file,
-                pages: originalPages,
-                original: original,
-                pageIndices: marked,
-                output: output
-            )
-            do {
-                try await RenderWork.boundedConcurrentForEach(marked) { position in
-                    do {
-                        return try await marks(position)
-                    } catch {
-                        throw DrawingFailed(underlying: error)
-                    }
-                } consume: { index, pageMarks in
-                    let position = marked[index]
-                    let overlay: PDFOverlayWriter.Overlay
-                    do {
-                        // The drawing does not suspend, and a book is minutes
-                        // of it: the question is asked once a page, as the
-                        // redraw asks it.
-                        try Task.checkCancellation()
-                        overlay = try Self.overlay(
-                            pageMarks, sheet: pages[position].sheet, on: originalPages[position], at: position,
-                            images: drawing
-                        )
-                    } catch {
-                        throw DrawingFailed(underlying: error)
-                    }
-                    try revision.append(overlay)
+            try await PDFOverlayWriter().writeConcurrently(
+                file: file, pages: originalPages, original: original, pageIndices: marked, to: output
+            ) { position in
+                do {
+                    let pageMarks = try await marks(position)
+                    // The drawing does not suspend, and a book is minutes of
+                    // it: the question is asked once a page, as the redraw
+                    // asks it.
+                    try Task.checkCancellation()
+                    return try Self.overlay(
+                        pageMarks, sheet: sheets[position], on: originalPages[position], at: position,
+                        images: drawing
+                    )
+                } catch {
+                    throw DrawingFailed(underlying: error)
                 }
-                try revision.finish()
-            } catch {
-                revision.abandon()
-                throw error
             }
         } catch let failure as DrawingFailed {
             throw failure.underlying

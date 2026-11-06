@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 import CoreGraphics
+import CoreText
 import Foundation
 import PDFKit
 @testable import RMRender
@@ -282,4 +283,251 @@ func aLongBookIsStreamed() throws {
     #expect(document.numberOfPages == pages)
     #expect(try darkPixels(output, page: pages) > (try darkPixels(original, page: pages)))
     #expect(try leftovers(beside: output).isEmpty)
+}
+
+// MARK: - Pages made side by side
+
+/// A one-page PDF with a line of text and a picture on it: its resources
+/// are objects of their own — a font, its descriptor and file, an image —
+/// which the overlay copies over and numbers afresh.
+private func nativeDrawing(_ seed: Int) throws -> Data {
+    let data = NSMutableData()
+    var box = CGRect(x: 0, y: 0, width: 200, height: 300)
+    let consumer = try #require(CGDataConsumer(data: data))
+    let context = try #require(CGContext(consumer: consumer, mediaBox: &box, nil))
+    context.beginPDFPage(nil)
+    let font = CTFontCreateWithName("Helvetica" as CFString, 14, nil)
+    let text = NSAttributedString(
+        string: "page \(seed)",
+        attributes: [NSAttributedString.Key(kCTFontAttributeName as String): font]
+    )
+    context.textPosition = CGPoint(x: 20, y: 250)
+    CTLineDraw(CTLineCreateWithAttributedString(text), context)
+    let pixels = (0..<64).map { UInt8(truncatingIfNeeded: $0 &* 37 &+ seed) }
+    let provider = try #require(CGDataProvider(data: Data(pixels) as CFData))
+    let picture = try #require(
+        CGImage(
+            width: 8, height: 8, bitsPerComponent: 8, bitsPerPixel: 8, bytesPerRow: 8,
+            space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGBitmapInfo(rawValue: 0),
+            provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent
+        )
+    )
+    context.draw(picture, in: CGRect(x: 40, y: 40, width: 80, height: 80))
+    context.endPDFPage()
+    context.closePDF()
+    return data as Data
+}
+
+/// Overlays of every kind the writer takes, a different one on each page:
+/// shared and per-page states, stencils under a grown box, native drawings
+/// with objects of their own, and plain lines.
+private func mixedOverlays(pages: [Int]) throws -> [Int: PDFOverlayWriter.Overlay] {
+    var overlays: [Int: PDFOverlayWriter.Overlay] = [:]
+    for page in pages {
+        switch page % 4 {
+        case 0:
+            overlays[page] = PDFOverlayWriter.Overlay(
+                pageIndex: page,
+                content: Data("/RMGs0 gs 0 0 1 RG 8 w 20 \(page) m 180 \(page) l S /RMGs1 gs 20 40 m 180 90 l S\n".utf8),
+                states: [
+                    .init(name: "RMGs0", blendMode: "Multiply", alpha: 0.5),
+                    .init(name: "RMGs1", blendMode: nil, alpha: Double(page % 3 + 1) / 4),
+                ]
+            )
+        case 1:
+            let bits = Data((0..<16).map { UInt8(truncatingIfNeeded: $0 &* 13 &+ page) })
+            overlays[page] = PDFOverlayWriter.Overlay(
+                pageIndex: page,
+                content: Data("0 g q 160 0 0 80 20 100 cm /RMIm0 Do Q\n".utf8),
+                states: [],
+                images: [.init(name: "RMIm0", width: 16, height: 8, bits: bits)],
+                box: CGRect(x: -10, y: -20, width: 230, height: 340)
+            )
+        case 2:
+            overlays[page] = PDFOverlayWriter.Overlay(
+                pageIndex: page, content: Data("q /RMNative Do Q\n".utf8), states: [], formPDF: try nativeDrawing(page)
+            )
+        default:
+            overlays[page] = line(page, y: 20 + page)
+        }
+    }
+    return overlays
+}
+
+/// Which pages have been asked for and which handed back, to check the
+/// window: a page is asked for only once the page `limit` before it is
+/// done — its answer waiting its turn counts against the window as much as
+/// a page being made does.
+private final class Window: @unchecked Sendable {
+    private let lock = NSLock()
+    private var finished: Set<Int> = []
+    private var breaches: [Int] = []
+
+    func started(_ position: Int, limit: Int) {
+        lock.withLock {
+            if position >= limit, !(0...(position - limit)).allSatisfy(finished.contains) {
+                breaches.append(position)
+            }
+        }
+    }
+
+    func finished(_ position: Int) {
+        _ = lock.withLock { finished.insert(position) }
+    }
+
+    var breached: [Int] { lock.withLock { breaches } }
+}
+
+/// `object` with every reference replaced by what it names, all the way
+/// down: two updates that number the same objects differently resolve alike.
+private func resolvedDeep(_ object: PDFObject?, in file: PDFFile, depth: Int = 0) throws -> PDFObject {
+    guard depth < 64 else { throw PDFReadError.malformed("too deep") }
+    switch try file.resolve(object) {
+    case .array(let items):
+        return .array(try items.map { try resolvedDeep($0, in: file, depth: depth + 1) })
+    case .dictionary(let entries):
+        return .dictionary(try entries.mapValues { try resolvedDeep($0, in: file, depth: depth + 1) })
+    case .stream(let dictionary, let data):
+        return .stream(dictionary: try dictionary.mapValues { try resolvedDeep($0, in: file, depth: depth + 1) }, data: data)
+    case let resolved:
+        return resolved
+    }
+}
+
+@Test(
+    "Pages made side by side are written in order: the file is the one a page at a time makes",
+    arguments: [false, true]
+)
+func concurrentWriteMatchesSequential(nativeDrawings: Bool) async throws {
+    let pageCount = 30
+    let original = try blankDocument(pages: pageCount)
+    let sequential = original.deletingPathExtension().appendingPathExtension("sequential.pdf")
+    let concurrent = original.deletingPathExtension().appendingPathExtension("concurrent.pdf")
+    defer { try? FileManager.default.removeItem(at: original.deletingLastPathComponent()) }
+    // Every page but every fifth: the update's numbers run past pages that
+    // are not in it.
+    let indices = (0..<pageCount).filter { !$0.isMultiple(of: 5) && (nativeDrawings || $0 % 4 != 2) }
+    let overlays = try mixedOverlays(pages: indices)
+    let file = try PDFFile(url: original)
+
+    try PDFOverlayWriter().write(
+        file: file, pages: try file.pages(), original: original, pageIndices: indices, to: sequential
+    ) { page in try #require(overlays[page]) }
+
+    let limit = 3
+    let window = Window()
+    let positions = Dictionary(uniqueKeysWithValues: indices.enumerated().map { ($1, $0) })
+    try await PDFOverlayWriter().writeConcurrently(
+        file: file, pages: try file.pages(), original: original, pageIndices: indices, to: concurrent, limit: limit
+    ) { page in
+        let position = try #require(positions[page])
+        window.started(position, limit: limit)
+        // The first of every few pages the slowest, so that the pages after
+        // it finish first and wait.
+        try await Task.sleep(for: .milliseconds(position.isMultiple(of: 4) ? 8 : 1))
+        window.finished(position)
+        return try #require(overlays[page])
+    }
+
+    let written = try Data(contentsOf: concurrent)
+    let expected = try Data(contentsOf: sequential)
+    // A native drawing's objects are numbered in the order its dictionaries
+    // are walked, and a dictionary's order is its hash seed's: two runs in
+    // one process may number them differently, as two runs of the writer
+    // always could. Under deterministic hashing they may not; otherwise the
+    // two files must say the same thing however they number it.
+    if !nativeDrawings || ProcessInfo.processInfo.environment["SWIFT_DETERMINISTIC_HASHING"] != nil {
+        #expect(written == expected)
+    } else {
+        #expect(written.count == expected.count)
+        let one = try PDFFile(bytes: written), other = try PDFFile(bytes: expected)
+        for page in indices {
+            let mine = try resolvedDeep(try form("RMOverlay", of: one, page: page).dictionary["Resources"], in: one)
+            let theirs = try resolvedDeep(try form("RMOverlay", of: other, page: page).dictionary["Resources"], in: other)
+            #expect(mine == theirs, "page \(page)")
+            #expect(try form("RMOverlay", of: one, page: page).data == (try form("RMOverlay", of: other, page: page).data))
+        }
+    }
+    #expect(window.breached.isEmpty, "pages asked for past the window: \(window.breached)")
+    #expect(try PDFFile(url: concurrent).pages().count == pageCount)
+    #expect(PDFDocument(url: concurrent)?.pageCount == pageCount)
+    for page in indices.prefix(4) {
+        #expect(try darkPixels(concurrent, page: page + 1) > (try darkPixels(original, page: page + 1)), "page \(page)")
+    }
+    #expect(try leftovers(beside: concurrent).isEmpty)
+}
+
+@Test("A page that fails half way, being made or being prepared, leaves the destination as it was")
+func concurrentWriteCleansUpAfterAFailure() async throws {
+    struct Stop: Error {}
+    let original = try blankDocument(pages: 12)
+    let output = original.deletingPathExtension().appendingPathExtension("out.pdf")
+    defer { try? FileManager.default.removeItem(at: original.deletingLastPathComponent()) }
+    let earlier = Data("what was here before".utf8)
+    try earlier.write(to: output)
+    let file = try PDFFile(url: original)
+
+    // Made: the caller's closure throws.
+    await #expect(throws: Stop.self) {
+        try await PDFOverlayWriter().writeConcurrently(
+            file: file, pages: try file.pages(), original: original, pageIndices: Array(0..<12), to: output, limit: 3
+        ) { page in
+            guard page != 6 else { throw Stop() }
+            return line(page)
+        }
+    }
+    #expect(try Data(contentsOf: output) == earlier)
+    #expect(try leftovers(beside: output).isEmpty)
+
+    // Prepared: the native drawing handed over is no PDF.
+    await #expect(throws: PDFReadError.self) {
+        try await PDFOverlayWriter().writeConcurrently(
+            file: file, pages: try file.pages(), original: original, pageIndices: Array(0..<12), to: output, limit: 3
+        ) { page in
+            guard page == 6 else { return line(page) }
+            return PDFOverlayWriter.Overlay(
+                pageIndex: page, content: Data("q /RMNative Do Q\n".utf8), states: [], formPDF: Data("not a PDF".utf8)
+            )
+        }
+    }
+    #expect(try Data(contentsOf: output) == earlier)
+    #expect(try leftovers(beside: output).isEmpty)
+}
+
+@Test("A write cancelled half way stops and leaves no file behind")
+func concurrentWriteStopsWhenCancelled() async throws {
+    let original = try blankDocument(pages: 12)
+    let output = original.deletingPathExtension().appendingPathExtension("out.pdf")
+    defer { try? FileManager.default.removeItem(at: original.deletingLastPathComponent()) }
+    let file = try PDFFile(url: original)
+    let pages = try file.pages()
+    let gate = Gate()
+    let work = Task {
+        try await PDFOverlayWriter().writeConcurrently(
+            file: file, pages: pages, original: original, pageIndices: Array(0..<12), to: output, limit: 3
+        ) { page in
+            if page == 4 { await gate.stopHere() }
+            // What the renderer asks once a page.
+            try Task.checkCancellation()
+            return line(page)
+        }
+    }
+    await gate.waitForArrival()
+    work.cancel()
+    await gate.open()
+    await #expect(throws: CancellationError.self) { try await work.value }
+    #expect(!FileManager.default.fileExists(atPath: output.path))
+    #expect(try leftovers(beside: output).isEmpty)
+}
+
+@Test("A cross-reference row is padded as the formatter pads it")
+func crossReferencePadding() {
+    let values = [0, 1, 9, 10, 99_999, 100_000, 123_456_789, 9_999_999_999, 10_000_000_000, Int.max, -1, -42, Int.min]
+    for value in values {
+        for width in [5, 10] {
+            var padded: [UInt8] = []
+            PDFOverlayWriter.appendPadded(value, width: width, to: &padded)
+            #expect(String(decoding: padded, as: UTF8.self) == String(format: "%0*ld", width, value), "\(value)")
+        }
+    }
 }
