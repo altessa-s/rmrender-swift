@@ -440,14 +440,51 @@ public struct PDFOverlayWriter: Sendable {
         }
     }
 
+    /// The same, with the pages made side by side: `overlay` is asked for up
+    /// to `limit` pages at once, each is prepared — deflated, its native
+    /// drawing read — on the task that made it, and they are appended in
+    /// the order of `pageIndices`. The file is the one `write(…overlay:)`
+    /// makes from the same overlays, to the byte.
+    ///
+    /// A page waiting its turn counts against `limit` as one being made
+    /// does (`RenderWork.boundedConcurrentForEach`), so what is held is at
+    /// most `limit` prepared pages, whatever the length of the book. The
+    /// first failure — of `overlay`, of preparing a page, of writing one —
+    /// ends the run, cancels the pages still being made, and leaves `output`
+    /// as it was, as cancelling the caller does.
+    func writeConcurrently(
+        file: PDFFile,
+        pages: [PDFFile.Page],
+        original: URL,
+        pageIndices: [Int],
+        to output: URL,
+        limit: Int = RenderWork.pageConcurrency,
+        overlay make: @escaping @Sendable (_ pageIndex: Int) async throws -> Overlay
+    ) async throws {
+        let revision = try Revision(
+            writer: self, file: file, pages: pages, original: original, pageIndices: pageIndices, output: output
+        )
+        do {
+            try await RenderWork.boundedConcurrentForEach(pageIndices, limit: limit) { pageIndex in
+                try prepare(try await make(pageIndex))
+            } consume: { _, prepared in
+                try revision.append(prepared)
+            }
+            try revision.finish()
+        } catch {
+            revision.abandon()
+            throw error
+        }
+    }
+
     /// An incremental update being written: begun, handed the overlays one
     /// page at a time, then finished or abandoned.
     ///
-    /// The loop above in pieces, for a caller whose overlays arrive as it
-    /// waits for them — `AnnotatedPDFRenderer` fetches and parses the marks of
-    /// the next pages while it writes this one, and a closure asked for a page
-    /// cannot wait. The checks, the bytes and the order of the objects are the
-    /// loop's: it is this, driven by a `for`.
+    /// The loops above in pieces: `write(…overlay:)` drives it with a `for`,
+    /// `writeConcurrently` with pages made side by side and handed over in
+    /// order. The checks, the bytes and the order of the objects are the
+    /// same either way: the objects are numbered and placed here, as each
+    /// page is appended, and nowhere else.
     ///
     /// Written to the file as it is made: objects are gathered into a buffer
     /// of about a megabyte and the buffer goes to the file, so what is held is
@@ -594,12 +631,18 @@ public struct PDFOverlayWriter: Sendable {
 
         /// The overlay of the next page of `pageIndices`, written out.
         func append(_ overlay: Overlay) throws {
+            try append(try writer.prepare(overlay))
+        }
+
+        /// The same, for a page made ready apart from the update — see
+        /// `PreparedPage`.
+        func append(_ prepared: PreparedPage) throws {
             guard written < pageIndices.count else {
-                throw PDFReadError.malformed("an overlay for page \(overlay.pageIndex) past the pages asked for")
+                throw PDFReadError.malformed("an overlay for page \(prepared.pageIndex) past the pages asked for")
             }
             let pageIndex = pageIndices[written]
-            guard overlay.pageIndex == pageIndex else {
-                throw PDFReadError.malformed("an overlay for page \(overlay.pageIndex) where \(pageIndex) was asked for")
+            guard prepared.pageIndex == pageIndex else {
+                throw PDFReadError.malformed("an overlay for page \(prepared.pageIndex) where \(pageIndex) was asked for")
             }
             written += 1
             let page = pages[pageIndex]
@@ -608,7 +651,7 @@ public struct PDFOverlayWriter: Sendable {
             // pages may both say `/RMGs0` and mean different things by it;
             // each gets the object for what it meant.
             var states: [String: PDFObject] = [:]
-            for state in overlay.states {
+            for state in prepared.states {
                 states[state.name] = .reference(number: stateObject(for: state), generation: 0)
             }
 
@@ -617,26 +660,12 @@ public struct PDFOverlayWriter: Sendable {
             // names them; two pages may both say `/RMIm0` and mean their
             // own.
             var stencils: [String: PDFObject] = [:]
-            for image in overlay.images {
-                let number = emit(
-                    writer.stream(
-                        [
-                            "Type": .name("XObject"),
-                            "Subtype": .name("Image"),
-                            "ImageMask": .boolean(true),
-                            "Width": .integer(image.width),
-                            "Height": .integer(image.height),
-                            "BitsPerComponent": .integer(1),
-                            "Filter": .name("FlateDecode"),
-                        ],
-                        PDFWriter.flate(image.bits)
-                    )
-                )
-                stencils[image.name] = .reference(number: number, generation: 0)
+            for stencil in prepared.stencils {
+                stencils[stencil.name] = .reference(number: emit(stencil.object), generation: 0)
             }
 
             var dictionary = page.dictionary
-            if let box = overlay.box {
+            if let box = prepared.box {
                 // Written onto the page itself even where the original left
                 // the box to the page tree to say: a value inherited from the
                 // parent would go on applying to every other page too.
@@ -663,70 +692,28 @@ public struct PDFOverlayWriter: Sendable {
             var scopedObjects = try file.resolve(resources["XObject"]).dictionaryValue ?? [:]
             scopedStates.merge(states) { _, added in added }
             scopedObjects.merge(stencils) { _, added in added }
-            if let pdf = overlay.formPDF {
-                let source = try PDFFile(bytes: pdf)
-                let imported = try source.pages()
-                guard imported.count == 1, let first = imported.first else {
-                    throw PDFReadError.malformed("overlay PDF must have one page")
+            if let native = prepared.native {
+                // Numbered from here, as they would have been numbered had
+                // the PDF been read now: the objects take the numbers after
+                // the last one made, in the order the reading reached them,
+                // and the Form the one after those.
+                let base = nextNumber
+                nextNumber += native.objects.count
+                for object in native.objects {
+                    _ = emit(PDFOverlayWriter.renumbered(object.object, from: base), number: base + object.number)
                 }
-                var mapped: [Int: Int] = [:]
-                func copy(_ value: PDFObject, depth: Int = 0) throws -> PDFObject {
-                    guard depth < 128 else { throw PDFReadError.malformed("overlay resource depth") }
-                    switch value {
-                    case .reference(let number, let generation):
-                        guard source.generations[number] == generation else {
-                            throw PDFReadError.malformed("overlay resource generation")
-                        }
-                        if let assigned = mapped[number] { return .reference(number: assigned, generation: 0) }
-                        let assigned = nextNumber
-                        nextNumber += 1
-                        mapped[number] = assigned
-                        let cloned = try copy(source.object(number), depth: depth + 1)
-                        _ = emit(cloned, number: assigned)
-                        return .reference(number: assigned, generation: 0)
-                    case .array(let values): return .array(try values.map { try copy($0, depth: depth + 1) })
-                    case .dictionary(let values): return .dictionary(try values.mapValues { try copy($0, depth: depth + 1) })
-                    case .stream(var dictionary, let data):
-                        dictionary["Length"] = .integer(data.count)
-                        return .stream(dictionary: try dictionary.mapValues { try copy($0, depth: depth + 1) }, data: data)
-                    default: return value
-                    }
-                }
-                var content = Data()
-                func appendContent(_ value: PDFObject?, depth: Int = 0) throws {
-                    guard depth < 128 else { throw PDFReadError.malformed("overlay content depth") }
-                    let resolved = try source.resolve(value)
-                    if case .array(let values) = resolved {
-                        for value in values { try appendContent(value, depth: depth + 1) }
-                    } else if case .stream(let dictionary, let bytes) = resolved {
-                        content.append(try source.decode(dictionary, bytes))
-                        content.append(10)
-                    } else if case .null = resolved { } else {
-                        throw PDFReadError.malformed("overlay content is not a stream")
-                    }
-                }
-                try appendContent(first.dictionary["Contents"])
-                let native = emit(writer.stream([
-                    "Type": .name("XObject"), "Subtype": .name("Form"),
-                    "BBox": writer.rectangle(first.mediaBox ?? .zero),
-                    "Resources": try copy(source.resolve(first.resources)),
-                    "Filter": .name("FlateDecode"),
-                ], PDFWriter.flate(content)))
-                scopedObjects["RMNative"] = .reference(number: native, generation: 0)
+                let form = emit(PDFOverlayWriter.renumbered(native.form, from: base))
+                scopedObjects["RMNative"] = .reference(number: form, generation: 0)
             }
 
             scoped["ExtGState"] = .dictionary(scopedStates)
             scoped["XObject"] = .dictionary(scopedObjects)
-            // Deflated, like the stencils: the operators are text — numbers
-            // and a letter, point after point — and written as they stand
-            // they made a fully marked book of 2,000 pages a file of 1.7 GB,
-            // three times what drawing it afresh comes to.
             let form = emit(writer.stream([
                 "Type": .name("XObject"), "Subtype": .name("Form"),
-                "BBox": writer.rectangle(overlay.box ?? page.mediaBox ?? .zero),
+                "BBox": writer.rectangle(prepared.box ?? page.mediaBox ?? .zero),
                 "Resources": .dictionary(scoped),
                 "Filter": .name("FlateDecode"),
-            ], PDFWriter.flate(overlay.content)))
+            ], prepared.content))
             var objects = try file.resolve(resources["XObject"]).dictionaryValue ?? [:]
             var name = "RMOverlay"
             while objects[name] != nil { name += "_" }
@@ -806,6 +793,145 @@ public struct PDFOverlayWriter: Sendable {
         }
     }
 
+    /// One page's overlay with everything worked out that does not depend
+    /// on where in the update it lands: its streams deflated and a native
+    /// drawing's objects read out of the PDF they came in.
+    ///
+    /// Deflating is most of what writing an overlay costs — a sample of a
+    /// fully marked book spent the writing task in `longest_match` — and it
+    /// needs nothing of the update. So it is done here, on as many pages at
+    /// once as the caller likes, and `Revision.append` is left only what
+    /// has to be done in order: numbering the objects and placing them.
+    /// The bytes are the ones appending the overlay itself gives.
+    ///
+    /// Holds the deflated streams, not the overlay's own bytes: what waits
+    /// its turn is the size it will be in the file.
+    struct PreparedPage: Sendable {
+        /// A native drawing's objects, numbered from nought in the order
+        /// the reading reached them and referring to one another by those
+        /// numbers; `form` is the Form that draws them.
+        struct Native: Sendable {
+            let objects: [(number: Int, object: PDFObject)]
+            let form: PDFObject
+        }
+
+        let pageIndex: Int
+        let states: [GraphicsState]
+        /// The stencil image objects, by the names the content says them.
+        let stencils: [(name: String, object: PDFObject)]
+        let box: CGRect?
+        let native: Native?
+        /// The overlay's operators, deflated.
+        let content: Data
+    }
+
+    /// `overlay` made ready to append — see `PreparedPage`. Touches nothing
+    /// but the overlay, so pages may be prepared side by side.
+    func prepare(_ overlay: Overlay) throws -> PreparedPage {
+        let stencils = overlay.images.map { image in
+            (
+                name: image.name,
+                object: stream(
+                    [
+                        "Type": .name("XObject"),
+                        "Subtype": .name("Image"),
+                        "ImageMask": .boolean(true),
+                        "Width": .integer(image.width),
+                        "Height": .integer(image.height),
+                        "BitsPerComponent": .integer(1),
+                        "Filter": .name("FlateDecode"),
+                    ],
+                    PDFWriter.flate(image.bits)
+                )
+            )
+        }
+        // Deflated, like the stencils: the operators are text — numbers and
+        // a letter, point after point — and written as they stand they made
+        // a fully marked book of 2,000 pages a file of 1.7 GB, three times
+        // what drawing it afresh comes to.
+        return PreparedPage(
+            pageIndex: overlay.pageIndex,
+            states: overlay.states,
+            stencils: stencils,
+            box: overlay.box,
+            native: try overlay.formPDF.map(native),
+            content: PDFWriter.flate(overlay.content)
+        )
+    }
+
+    /// A one-page PDF as a Form and the objects it needs, numbered from
+    /// nought: each object takes the next number when a reference to it is
+    /// first reached, and is listed once all it refers to has been.
+    private func native(_ pdf: Data) throws -> PreparedPage.Native {
+        let source = try PDFFile(bytes: pdf)
+        let imported = try source.pages()
+        guard imported.count == 1, let first = imported.first else {
+            throw PDFReadError.malformed("overlay PDF must have one page")
+        }
+        var mapped: [Int: Int] = [:]
+        var objects: [(number: Int, object: PDFObject)] = []
+        func copy(_ value: PDFObject, depth: Int = 0) throws -> PDFObject {
+            guard depth < 128 else { throw PDFReadError.malformed("overlay resource depth") }
+            switch value {
+            case .reference(let number, let generation):
+                guard source.generations[number] == generation else {
+                    throw PDFReadError.malformed("overlay resource generation")
+                }
+                if let assigned = mapped[number] { return .reference(number: assigned, generation: 0) }
+                let assigned = mapped.count
+                mapped[number] = assigned
+                let cloned = try copy(source.object(number), depth: depth + 1)
+                objects.append((number: assigned, object: cloned))
+                return .reference(number: assigned, generation: 0)
+            case .array(let values): return .array(try values.map { try copy($0, depth: depth + 1) })
+            case .dictionary(let values): return .dictionary(try values.mapValues { try copy($0, depth: depth + 1) })
+            case .stream(var dictionary, let data):
+                dictionary["Length"] = .integer(data.count)
+                return .stream(dictionary: try dictionary.mapValues { try copy($0, depth: depth + 1) }, data: data)
+            default: return value
+            }
+        }
+        var content = Data()
+        func appendContent(_ value: PDFObject?, depth: Int = 0) throws {
+            guard depth < 128 else { throw PDFReadError.malformed("overlay content depth") }
+            let resolved = try source.resolve(value)
+            if case .array(let values) = resolved {
+                for value in values { try appendContent(value, depth: depth + 1) }
+            } else if case .stream(let dictionary, let bytes) = resolved {
+                content.append(try source.decode(dictionary, bytes))
+                content.append(10)
+            } else if case .null = resolved { } else {
+                throw PDFReadError.malformed("overlay content is not a stream")
+            }
+        }
+        try appendContent(first.dictionary["Contents"])
+        let form = stream([
+            "Type": .name("XObject"), "Subtype": .name("Form"),
+            "BBox": rectangle(first.mediaBox ?? .zero),
+            "Resources": try copy(source.resolve(first.resources)),
+            "Filter": .name("FlateDecode"),
+        ], PDFWriter.flate(content))
+        return PreparedPage.Native(objects: objects, form: form)
+    }
+
+    /// `object` with every reference in it moved up by `base`: a prepared
+    /// native drawing's numbers turned into the update's. Every reference in
+    /// such an object is one `native` made, so all of them move.
+    private static func renumbered(_ object: PDFObject, from base: Int) -> PDFObject {
+        switch object {
+        case .reference(let number, let generation):
+            return .reference(number: base + number, generation: generation)
+        case .array(let items):
+            return .array(items.map { renumbered($0, from: base) })
+        case .dictionary(let entries):
+            return .dictionary(entries.mapValues { renumbered($0, from: base) })
+        case .stream(let dictionary, let data):
+            return .stream(dictionary: dictionary.mapValues { renumbered($0, from: base) }, data: data)
+        default:
+            return object
+        }
+    }
+
     /// A box the way PDF writes one: lower left corner, then upper right.
     private func rectangle(_ box: CGRect) -> PDFObject {
         .array([.real(box.minX), .real(box.minY), .real(box.maxX), .real(box.maxY)])
@@ -848,10 +974,11 @@ public struct PDFOverlayWriter: Sendable {
     /// The new cross-reference section: the objects this update changed,
     /// grouped into runs of consecutive numbers.
     func crossReferenceTable(_ offsets: [Int: Int], generations: [Int: Int]) -> Data {
-        var out = Data("xref\n".utf8)
+        var out = Array("xref\n".utf8)
         // Walked by index: taking each number off the front of the array
         // moved all the rest every time, and a book's update is thousands.
         let numbers = offsets.keys.sorted()
+        out.reserveCapacity(out.count + numbers.count * 20)
         var start = 0
         while start < numbers.count {
             var end = start + 1
@@ -860,13 +987,28 @@ public struct PDFOverlayWriter: Sendable {
             }
             let run = numbers[start..<end]
             start = end
-            out.append(contentsOf: Array("\(run[run.startIndex]) \(run.count)\n".utf8))
+            out.append(contentsOf: "\(run[run.startIndex]) \(run.count)\n".utf8)
             for number in run {
                 // Twenty bytes a row, exactly: offset, generation, kind.
-                out.append(contentsOf: Array(String(format: "%010ld %05ld n \n", offsets[number] ?? 0, generations[number] ?? 0).utf8))
+                // Padded here rather than by `String(format:)`, which read
+                // its format afresh for every object of the update.
+                Self.appendPadded(offsets[number] ?? 0, width: 10, to: &out)
+                out.append(UInt8(ascii: " "))
+                Self.appendPadded(generations[number] ?? 0, width: 5, to: &out)
+                out.append(contentsOf: " n \n".utf8)
             }
         }
-        return out
+        return Data(out)
+    }
+
+    /// `value` in decimal, at least `width` characters, zeros after any
+    /// sign: what `%0*ld` writes.
+    static func appendPadded(_ value: Int, width: Int, to out: inout [UInt8]) {
+        let digits = String(value.magnitude).utf8
+        if value < 0 { out.append(UInt8(ascii: "-")) }
+        let zeros = width - digits.count - (value < 0 ? 1 : 0)
+        if zeros > 0 { out.append(contentsOf: repeatElement(UInt8(ascii: "0"), count: zeros)) }
+        out.append(contentsOf: digits)
     }
 
     private func trailer(of file: PDFFile, size: Int, crossReference: Int, hybrid: Int? = nil) -> Data {
