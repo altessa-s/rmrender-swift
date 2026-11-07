@@ -101,10 +101,12 @@ public struct NotebookRenderer: Sendable {
             onUnreadable: onUnreadable
         )
         let drawn = try await RenderWork.detachedWaiting { [self] in
-            guard let buffer = CFDataCreateMutable(nil, 0), let consumer = CGDataConsumer(data: buffer) else {
+            guard let buffer = CFDataCreateMutable(nil, 0) else {
                 throw RenderError.pdfContextUnavailable
             }
-            let unfetched = try await draw(work, documentID: documentID, paper: paper, author: author, into: consumer)
+            let unfetched = try await draw(
+                work, documentID: documentID, paper: paper, author: author, into: PDFSink(data: buffer)
+            )
             return (pdf: buffer as Data, unfetched: unfetched)
         }
         Self.report(unfetched: work.unfetched.union(drawn.unfetched), of: work, documentID: documentID, to: onUnfetched)
@@ -151,11 +153,10 @@ public struct NotebookRenderer: Sendable {
             onUnreadable: onUnreadable
         )
         let unfetched = try await RenderWork.detachedWaiting { [self] in
-            guard let consumer = CGDataConsumer(url: output as CFURL) else {
-                throw RenderError.pdfContextUnavailable
-            }
             do {
-                return try await draw(work, documentID: documentID, paper: paper, author: author, into: consumer)
+                return try await draw(
+                    work, documentID: documentID, paper: paper, author: author, into: PDFSink(url: output)
+                )
             } catch {
                 // A cancelled or failed render leaves a truncated PDF behind,
                 // and a truncated PDF at the path the caller asked for is
@@ -452,25 +453,32 @@ public struct NotebookRenderer: Sendable {
         }
     }
 
-    /// A measured document drawn into `consumer`, each page parsed as the
+    /// A measured document drawn into `sink`, each page parsed as the
     /// drawing comes to it — a few ahead, beside the drawing — and let go
     /// once it is on the page. Answers the positions of the pages whose
     /// bytes did not arrive this time round (`page(_:documentID:position:)`).
+    ///
+    /// A page's ink is written where it is parsed, beside the drawing
+    /// (`PageRenderer.PDFPages`): that is most of what a written page costs,
+    /// and it needs nothing of the document. The drawing takes the pages in
+    /// their order and draws the rest of each.
     private func draw(
         _ work: Walk<Void>,
         documentID: String,
         paper: PaperSize,
         author: String?,
-        into consumer: CGDataConsumer
+        into sink: PDFSink
     ) async throws -> Set<Int> {
         let output = try PageRenderer.PDFPages(
-            consumer: consumer, pageSize: work.pageSize, paper: paper, author: author
+            sink: sink, pageSize: work.pageSize, paper: paper, author: author
         )
+        let sheets = output.sheets
         let images = PageRenderer.PageImages(decoded: work.images)
         let sources = work.sources
         var unfetched: Set<Int> = []
-        try await RenderWork.boundedConcurrentForEach(Array(sources.indices)) { [self] position in
-            try await page(sources[position], documentID: documentID, position: position)
+        try await RenderWork.boundedConcurrentForEach(Array(sources.indices), limit: RenderWork.inkConcurrency) { [self] position in
+            let drawn = try await page(sources[position], documentID: documentID, position: position)
+            return (prepared: sheets.prepare(drawn.page), unfetched: drawn.unfetched)
         } consume: { position, drawn in
             // A caller may cancel a render it does not need, and drawing is
             // the long part of it. Asked between pages: a page is a bounded
@@ -478,9 +486,9 @@ public struct NotebookRenderer: Sendable {
             // to reason about.
             try Task.checkCancellation()
             if drawn.unfetched { unfetched.insert(position) }
-            output.draw(drawn.page, images: images)
+            try output.draw(drawn.prepared, images: images)
         }
-        output.close()
+        try output.close()
         return unfetched
     }
 
