@@ -126,6 +126,47 @@ enum InkTesting {
         return data as Data
     }
 
+    /// The overlay of page `index` as `AnnotatedPDFRenderer` draws a native
+    /// one on a sheet standing at `sheet`: CoreGraphics' share and the
+    /// written ink (`AnnotatedPDFRenderer.nativeShares`) — or, `writesInk`
+    /// off, all of it drawn by CoreGraphics, as develop drew it.
+    static func nativeOverlay(
+        _ marks: RMPage, index: Int = 0, sheet: CGRect, images: PageRenderer.PageImages = PageRenderer.PageImages(),
+        writesInk: Bool = true
+    ) throws -> PDFOverlayWriter.Overlay {
+        let units = AnnotationGeometry.units(of: sheet.size)
+        let geometry = marks.text.map { TextGeometry($0, pageSize: units) }
+        let bounds = PageRenderer.contentBounds(
+            of: marks, pageSize: units, edge: AnnotatedPDFRenderer.markEdge, geometry: geometry
+        )
+        let grown = AnnotationGeometry.box(bounds, on: sheet)
+        let shares = try AnnotatedPDFRenderer.nativeShares(
+            marks, drawingBox: sheet, mediaBox: grown, units: units, bounds: bounds, geometry: geometry, images: images,
+            writesInk: writesInk
+        )
+        return PDFOverlayWriter.Overlay(
+            pageIndex: index, content: InkForm.content(native: shares.pdf != nil, ink: shares.ink != nil), states: [],
+            box: grown, formPDF: shares.pdf, ink: shares.ink
+        )
+    }
+
+    /// `overlays` written onto a PDF of `pages` blank pages of `sheet`.
+    static func overlaid(_ overlays: [PDFOverlayWriter.Overlay], pages: Int = 1, sheet: CGRect) throws -> Data {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "rmrender-ink-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let original = folder.appending(path: "original.pdf"), output = folder.appending(path: "overlaid.pdf")
+        var box = sheet
+        let context = try #require(CGContext(original as CFURL, mediaBox: &box, nil))
+        for _ in 0..<pages {
+            context.beginPDFPage(nil)
+            context.endPDFPage()
+        }
+        context.closePDF()
+        try PDFOverlayWriter().write(original: original, overlays: overlays, to: output)
+        return try Data(contentsOf: output)
+    }
+
     /// `pdf` with what CoreGraphics makes up afresh each time — the dates
     /// and the identifier — written over, so that two renders can be
     /// compared to the byte.
@@ -176,7 +217,7 @@ enum InkTesting {
 
 /// Random numbers for the marks: a generator of its own, so that a failure
 /// can be had again.
-private struct Marks {
+struct Marks {
     var random: SplitMix64
 
     mutating func uniform(_ low: Double, _ high: Double) -> Double {
@@ -198,15 +239,21 @@ private struct Marks {
         }
     }
 
-    /// A page of `count` strokes of every tool, erasers and shaders among
-    /// them; `pictures` places images among the strokes as well, `text`
-    /// typed text with handwriting anchored to it and a marker over it.
-    mutating func page(strokes count: Int, pictures: Bool = false, text: Bool = false, template: String? = nil) -> RMPage {
-        let tools: [PenTool] = [
-            .paintbrush1, .pencil1, .ballpoint1, .marker1, .fineliner1, .highlighter1, .mechanicalPencil1,
-            .paintbrush2, .mechanicalPencil2, .pencil2, .ballpoint2, .marker2, .fineliner2, .highlighter2,
-            .caligraphy, .shader, .eraser, .eraserArea,
-        ]
+    /// Every tool, erasers and shaders among them.
+    static let allTools: [PenTool] = [
+        .paintbrush1, .pencil1, .ballpoint1, .marker1, .fineliner1, .highlighter1, .mechanicalPencil1,
+        .paintbrush2, .mechanicalPencil2, .pencil2, .ballpoint2, .marker2, .fineliner2, .highlighter2,
+        .caligraphy, .shader, .eraser, .eraserArea,
+    ]
+
+    /// A page of `count` strokes of `tools`; `pictures` places images among
+    /// the strokes as well, `text` typed text with handwriting anchored to it
+    /// and a marker over it, `blankText` a text block of the lines given, as
+    /// the tablet writes on a page nobody typed on.
+    mutating func page(
+        strokes count: Int, tools: [PenTool] = allTools, pictures: Bool = false, text: Bool = false,
+        blankText: [String]? = nil, template: String? = nil
+    ) -> RMPage {
         let colors: [PenColor] = [.black, .gray, .blue, .red, .yellow, .green]
         var strokes: [Stroke] = []
         for index in 0..<count {
@@ -244,6 +291,8 @@ private struct Marks {
                 )
             }
             highlights.append(Highlight(rectangles: [CGRect(x: -500, y: 280, width: 600, height: 50)], color: .yellow))
+        } else if let blankText {
+            block = typedText(blankText)
         }
         return RMPage(
             strokes: strokes, skippedBlocks: 0, templateName: template, text: block, highlights: highlights, images: images
@@ -459,7 +508,7 @@ private func randomNotebook(seed: UInt64, pages: Int) -> (pages: [RMPage], asset
 }
 
 /// A small opaque picture.
-private func testPicture() -> Data {
+func testPicture() -> Data {
     let size = 16
     var pixels = [UInt8](repeating: 0, count: size * size * 4)
     for index in 0..<(size * size) {
@@ -646,22 +695,12 @@ func overlayNativePagesPaintAsCoreGraphicsDoes() throws {
     var marks = Marks(random: SplitMix64(seed: 0x0E41))
     let images = PageRenderer.PageImages(bytes: ["picture.png": testPicture()])
     let sheet = CGRect(origin: .zero, size: CGSize(width: 612, height: 792))
-    let units = AnnotationGeometry.units(of: sheet.size)
     var written: [PDFOverlayWriter.Overlay] = [], native: [PDFOverlayWriter.Overlay] = []
     for index in 0..<pages {
         // Typed text on every page, so that every overlay is a native one.
         let page = marks.page(strokes: 30, pictures: index.isMultiple(of: 2), text: true)
-        let geometry = page.text.map { TextGeometry($0, pageSize: units) }
-        let bounds = PageRenderer.contentBounds(of: page, pageSize: units, edge: AnnotatedPDFRenderer.markEdge, geometry: geometry)
-        let grown = AnnotationGeometry.box(bounds, on: sheet)
         for writesInk in [true, false] {
-            let form = try AnnotatedPDFRenderer.nativeMarks(
-                page, drawingBox: sheet, mediaBox: grown, units: units, bounds: bounds, geometry: geometry,
-                images: images, writesInk: writesInk
-            )
-            let overlay = PDFOverlayWriter.Overlay(
-                pageIndex: index, content: Data("q /RMNative Do Q\n".utf8), states: [], box: grown, formPDF: form
-            )
+            let overlay = try InkTesting.nativeOverlay(page, index: index, sheet: sheet, images: images, writesInk: writesInk)
             if writesInk { written.append(overlay) } else { native.append(overlay) }
         }
     }

@@ -866,10 +866,13 @@ public struct AnnotatedPDFRenderer: Sendable {
     /// written as the page's native Form: it is text, which the overlay's
     /// own operators do not set.
     ///
-    /// The native Form is drawn as a page of `batch`'s PDF, shared with the
-    /// other pages of the run, and `drawingPage` says which; a page without a
-    /// batch, or one the batch refuses (`NativeBatch.page`), carries a PDF of
-    /// its own, as `formPDF`.
+    /// A page the overlay's own operators cannot say is drawn natively, in
+    /// two shares (`nativeShares`): CoreGraphics' is drawn as a page of
+    /// `batch`'s PDF, shared with the other pages of the run, and
+    /// `drawingPage` says which — a page without a batch, or one the batch
+    /// refuses (`NativeBatch.page`), carries a PDF of its own, as `formPDF`
+    /// — and the ink after it goes as a Form of its own (`InkForm`). A page
+    /// CoreGraphics would paint nothing of is its ink alone.
     private static func overlay(
         _ marks: RMPage,
         sheet: CGSize,
@@ -894,32 +897,28 @@ public struct AnnotatedPDFRenderer: Sendable {
         var grown = AnnotationGeometry.box(bounds, on: drawingBox)
         var native: Data?
         var drawingPage: Int?
+        var ink: InkForm?
         var content: Data
         if let built {
             content = built.content
         } else if placeholder {
             drawingPage = try batch?.page(mediaBox: grown, ink: nil) { context, _ in
                 UnfetchedPlaceholder.draw(on: drawingBox, in: context)
-            }
+            }?.number
             if drawingPage == nil { native = try UnfetchedPlaceholder.form(drawingBox: drawingBox, mediaBox: grown) }
             content = Data("q /RMNative Do Q\n".utf8)
         } else {
-            if let batch {
-                drawingPage = try Self.nativeMarks(
-                    marks, drawingBox: drawingBox, mediaBox: grown, units: units, bounds: bounds, geometry: geometry,
-                    images: images, into: batch
-                )
-                if drawingPage == nil {
-                    RMRenderLog.pageDebug("annotated: page \(position) drawn alone — a mask it shares would change size")
-                }
+            let shares = try Self.nativeShares(
+                marks, drawingBox: drawingBox, mediaBox: grown, units: units, bounds: bounds, geometry: geometry,
+                images: images, batch: batch
+            )
+            if batch != nil, shares.pdf != nil {
+                RMRenderLog.pageDebug("annotated: page \(position) drawn alone — a mask it shares would change size")
             }
-            if drawingPage == nil {
-                native = try Self.nativeMarks(
-                    marks, drawingBox: drawingBox, mediaBox: grown, units: units, bounds: bounds, geometry: geometry,
-                    images: images
-                )
-            }
-            content = Data("q /RMNative Do Q\n".utf8)
+            native = shares.pdf
+            drawingPage = shares.drawingPage
+            ink = shares.ink
+            content = InkForm.content(native: native != nil || drawingPage != nil, ink: ink != nil)
         }
         if rotated {
             // Marks use the displayed page's frame. The appended Form uses
@@ -943,7 +942,8 @@ public struct AnnotatedPDFRenderer: Sendable {
             states: built?.states ?? [],
             images: built?.images ?? [],
             box: unchangedBox ? nil : grown,
-            formPDF: native
+            formPDF: native,
+            ink: ink
         )
         return (overlay, drawingPage)
     }
@@ -1010,16 +1010,31 @@ public struct AnnotatedPDFRenderer: Sendable {
         return units
     }
 
-    /// The marks of an overlay page as a PDF of one page, `mediaBox` its
-    /// box, drawn in the frame of `drawingBox` — what the overlay imports as
-    /// its native Form where its own operators cannot say what the marks
-    /// hold (typed text, pictures).
+    /// A page's native drawing in its two shares: what CoreGraphics draws —
+    /// the text and the pictures, and the strokes up to the last of them —
+    /// and the ink after it, written apart (`InkStream`). The overlay draws
+    /// the one and then the other (`InkForm`).
+    struct NativeShares {
+        /// CoreGraphics' share as a PDF of one page, `mediaBox` its box;
+        /// `nil` where it is a page of the run's PDF, or paints nothing.
+        let pdf: Data?
+        /// The page of the run's PDF that is CoreGraphics' share (`NativeBatch`).
+        let drawingPage: Int?
+        let ink: InkForm?
+    }
+
+    /// The marks of an overlay page in the two shares of a native drawing,
+    /// on a page of `mediaBox` in the frame of `drawingBox`: what the overlay
+    /// imports where its own operators cannot say what the marks hold (typed
+    /// text, pictures, an eraser).
     ///
-    /// CoreGraphics draws the text and the pictures, and the ink after the
-    /// last of them is written apart and appended (`InkStream`), as on a
-    /// page of a redraw or a notebook; `writesInk` off leaves it all to
+    /// CoreGraphics' share is drawn as a page of `batch`'s PDF where the
+    /// batch takes it, as a PDF of its own where it does not or there is no
+    /// batch, and not at all where it would paint nothing
+    /// (`coreGraphicsPaints`): a page of handwriting under a text layer of
+    /// empty lines is its ink alone. `writesInk` off leaves it all to
     /// CoreGraphics, the drawing the written ink is held against.
-    static func nativeMarks(
+    static func nativeShares(
         _ marks: RMPage,
         drawingBox: CGRect,
         mediaBox: CGRect,
@@ -1027,55 +1042,72 @@ public struct AnnotatedPDFRenderer: Sendable {
         bounds: CGRect,
         geometry: TextGeometry?,
         images: PageRenderer.PageImages,
+        batch: NativeBatch? = nil,
         writesInk: Bool = true
-    ) throws -> Data {
+    ) throws -> NativeShares {
         let place = nativePlacement(drawingBox)
-        let ink = writesInk
+        let written = writesInk
             ? PageRenderer.writtenInk(of: marks, pageSize: units, geometry: geometry, place: place)
             : (split: Int.max, ink: nil)
+        func draw(_ context: CGContext, masks: InkMaskLedger?) {
+            place(context)
+            PageRenderer.draw(
+                marks, in: context, pageSize: units, bounds: bounds, images: images, geometry: geometry,
+                inkSplit: written.split, masks: masks
+            )
+        }
+        guard coreGraphicsPaints(marks, split: written.split) else {
+            // A page of its own as far as its masks go, as it would have been
+            // in a PDF of its own: CoreGraphics drew none of them on it.
+            return NativeShares(
+                pdf: nil, drawingPage: nil, ink: written.ink.map { InkForm($0, box: mediaBox, masks: InkMaskLedger()) }
+            )
+        }
+        if let batch, let page = try batch.page(mediaBox: mediaBox, ink: written.ink, draw: { draw($0, masks: $1) }) {
+            return NativeShares(pdf: nil, drawingPage: page.number, ink: page.ink)
+        }
+        let masks = InkMaskLedger()
         guard let data = CFDataCreateMutable(nil, 0) else { throw RenderError.pdfContextUnavailable }
         let sink = PDFSink(data: data)
-        let update = InkUpdate()
         var media = mediaBox
         guard let consumer = sink.consumer(),
               let context = CGContext(consumer: consumer, mediaBox: &media, nil) else {
             throw RenderError.pdfContextUnavailable
         }
         context.beginPDFPage(nil)
-        place(context)
-        PageRenderer.draw(
-            marks, in: context, pageSize: units, bounds: bounds, images: images, geometry: geometry,
-            inkSplit: ink.split, masks: writesInk ? update.masks : nil
-        )
+        draw(context, masks: writesInk ? masks : nil)
         context.endPDFPage()
         context.closePDF()
-        if let written = ink.ink { try update.append(written, page: 0) }
-        try update.finish(into: sink)
-        return data as Data
+        try sink.close()
+        return NativeShares(
+            pdf: data as Data, drawingPage: nil, ink: written.ink.map { InkForm($0, box: mediaBox, masks: masks) }
+        )
     }
 
-    /// The same drawing as a page of `batch`'s PDF: the page's number in
-    /// it, or `nil` where the batch refuses the page and it has to be drawn
-    /// alone (`NativeBatch.page`).
-    static func nativeMarks(
-        _ marks: RMPage,
-        drawingBox: CGRect,
-        mediaBox: CGRect,
-        units: CGSize,
-        bounds: CGRect,
-        geometry: TextGeometry?,
-        images: PageRenderer.PageImages,
-        into batch: NativeBatch
-    ) throws -> Int? {
-        let place = nativePlacement(drawingBox)
-        let ink = PageRenderer.writtenInk(of: marks, pageSize: units, geometry: geometry, place: place)
-        return try batch.page(mediaBox: mediaBox, ink: ink.ink) { context, masks in
-            place(context)
-            PageRenderer.draw(
-                marks, in: context, pageSize: units, bounds: bounds, images: images, geometry: geometry,
-                inkSplit: ink.split, masks: masks
-            )
+    /// Whether CoreGraphics' share of a page — everything `PageRenderer.draw`
+    /// draws with its strokes stopped at `split` — may paint anything.
+    ///
+    /// Said of the marks before anything is drawn, and only ever wrong the
+    /// safe way: a share it calls blank paints nothing, and a share that
+    /// paints nothing may still be called otherwise, and is then drawn, as
+    /// it always was. Blank is a share with no stroke before `split`, no
+    /// picture, no highlight, no template shown, and typed text — if any —
+    /// of empty lines and no list, whose markers and boxes are drawn on
+    /// lines of no text. The tablet writes a text block of one empty line on
+    /// every page nobody typed on, and it would otherwise send every page of
+    /// handwriting through CoreGraphics for nothing.
+    ///
+    /// Empty, and not merely white: CoreText sets a glyph for a space, a tab
+    /// and a line break, and CoreGraphics writes it into the page — it inks
+    /// nothing, but it is text, a typeface embedded for it, and what the
+    /// page says is the page's.
+    static func coreGraphicsPaints(_ marks: RMPage, split: Int) -> Bool {
+        guard split == 0, marks.images.isEmpty, marks.highlights.isEmpty else { return true }
+        if marks.backgroundVisible, let name = marks.templateName, TemplateStore.shared.template(named: name) != nil {
+            return true
         }
+        guard let text = marks.text else { return false }
+        return text.formats.values.contains { $0.style?.listFamily != nil } || text.lines.contains { !$0.isEmpty }
     }
 
     /// Where the marks of a native Form stand on its page: the frame of

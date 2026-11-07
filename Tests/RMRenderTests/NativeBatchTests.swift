@@ -25,7 +25,8 @@ import Testing
 /// most of them, each page in letters of its own so that no two pages cut a
 /// face alike; a picture now and then, pencil and an eraser on some, and a
 /// page of strokes alone — which the overlay writes with its own operators —
-/// on every third.
+/// on every third, every other one of those under a text block of one empty
+/// line, as the tablet writes on a page nobody typed on (`blankTextPage`).
 private func batchDocument(pages count: Int) throws -> [String: Data] {
     var random = SplitMix64(seed: 0xBA7C)
     func below(_ bound: Int) -> Int { Int(random.next() % UInt64(bound)) }
@@ -41,7 +42,7 @@ private func batchDocument(pages count: Int) throws -> [String: Data] {
     var records: [String] = []
     for index in 0..<count {
         let strokesAlone = index % 3 == 2
-        let paragraphs: [RMPageDraft.Paragraph] = strokesAlone ? [] : [
+        let paragraphs: [RMPageDraft.Paragraph] = strokesAlone ? (blankTextPage(index) ? [.init("")] : []) : [
             .init(words(3), style: 2), .init(words(30), style: 1), .init(words(8), style: 1, bold: true),
             .init(words(8), style: 1, italic: true),
         ]
@@ -78,6 +79,10 @@ private func batchDocument(pages count: Int) throws -> [String: Data] {
     files["doc.content"] = Data(#"{"formatVersion": 2, "cPages": {"pages": [\#(records.joined(separator: ", "))]}}"#.utf8)
     return files
 }
+
+/// Whether page `index` of `batchDocument` is strokes under a blank text
+/// block: written as its ink alone, carried in a run between pages of type.
+private func blankTextPage(_ index: Int) -> Bool { index % 6 == 5 }
 
 private func originalPDF(pages: Int) throws -> Data {
     let data = NSMutableData()
@@ -189,6 +194,35 @@ func runsPaintAsPagesAlone() async throws {
     }
 }
 
+@Test("A page of a run whose text layer sets nothing is its ink alone, and no page of the run's PDF")
+func blankTextPagesInARunAreTheirInkAlone() async throws {
+    let folder = try temporaryFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let files = try batchDocument(pages: batchPages)
+    let blank = (0..<batchPages).filter(blankTextPage)
+    for index in blank {
+        let text = try RMParser.parsePage(try #require(files["doc/p\(index).rm"])).text
+        #expect(text?.lines.allSatisfy { $0.allSatisfy(\.isWhitespace) } == true, "page \(index) has no blank text layer")
+    }
+    let file = try PDFFile(
+        bytes: try await overlaid(files, runPages: AnnotatedPDFRenderer.nativeRunPages, in: folder, name: "batched.pdf")
+    )
+    let pages = try file.pages()
+    for index in blank {
+        let resources = try file.resolve(pages[index].resources).dictionaryValue ?? [:]
+        let overlay = try #require(try file.resolve(resources["XObject"]).dictionaryValue?["RMOverlay"])
+        let form = try file.resolve(overlay)
+        guard case .stream(let dictionary, _) = form else {
+            Issue.record("page \(index): no overlay Form")
+            continue
+        }
+        let formResources = try file.resolve(dictionary["Resources"]).dictionaryValue ?? [:]
+        let objects = try file.resolve(formResources["XObject"]).dictionaryValue ?? [:]
+        #expect(objects[InkForm.name] != nil, "page \(index)")
+        #expect(objects["RMNative"] == nil, "page \(index)")
+    }
+}
+
 @Test("A face is embedded once a run, not once a page")
 func facesAreEmbeddedOnceARun() async throws {
     let folder = try temporaryFolder()
@@ -239,9 +273,9 @@ func batchRefusesAResizedMask() throws {
     let same = try batch.page(mediaBox: box, ink: nil) { _, masks in
         _ = masks.dimensions(of: digest, width: 30, height: 16)
     }
-    #expect(first == 0)
+    #expect(first?.number == 0)
     #expect(resized == nil)
-    #expect(same == 2)
+    #expect(same?.number == 2)
     let url = try #require(try batch.finish())
     #expect(try PDFFile(url: url).pages().count == 3)
     // Read once, the file is gone.
