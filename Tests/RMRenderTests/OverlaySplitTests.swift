@@ -81,7 +81,7 @@ func blankTextLayersPaintNothing() throws {
     }
 }
 
-@Test("CoreGraphics' share is blank only with nothing before the split, no picture, no highlight and no template")
+@Test("CoreGraphics' share is blank only with nothing before the split, no picture, no highlight it draws and no template")
 func coreGraphicsShareRule() {
     _ = FixtureTemplates.installed
     let blank = typedText([""])
@@ -102,6 +102,13 @@ func coreGraphicsShareRule() {
     #expect(AnnotatedPDFRenderer.coreGraphicsPaints(RMPage(strokes: [], skippedBlocks: 0, images: [picture]), split: 0))
     let highlight = Highlight(rectangles: [CGRect(x: 0, y: 0, width: 50, height: 10)], color: .yellow)
     #expect(AnnotatedPDFRenderer.coreGraphicsPaints(RMPage(strokes: [], skippedBlocks: 0, highlights: [highlight]), split: 0))
+    // Unless the highlights are written with the ink.
+    #expect(!AnnotatedPDFRenderer.coreGraphicsPaints(
+        RMPage(strokes: [], skippedBlocks: 0, text: blank, highlights: [highlight]), split: 0, writtenHighlights: true
+    ))
+    #expect(AnnotatedPDFRenderer.coreGraphicsPaints(
+        RMPage(strokes: [], skippedBlocks: 0, highlights: [highlight], images: [picture]), split: 0, writtenHighlights: true
+    ))
     #expect(AnnotatedPDFRenderer.coreGraphicsPaints(RMPage(strokes: [], skippedBlocks: 0, templateName: "Fixture Lines"), split: 0))
     // A template the page hides, or one nobody has, is not drawn.
     #expect(!AnnotatedPDFRenderer.coreGraphicsPaints(

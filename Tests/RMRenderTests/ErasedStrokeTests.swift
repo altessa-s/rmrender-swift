@@ -116,10 +116,10 @@ private func redraw(_ marks: RMPage, writesInk: Bool) throws -> Data {
         ? PageRenderer.writtenInk(of: marks, pageSize: units, geometry: nil) {
             $0.scaleBy(x: Calibration.pointsPerUnit, y: Calibration.pointsPerUnit)
         }
-        : (split: marks.strokes.count, ink: nil)
+        : (split: marks.strokes.count, highlights: false, ink: nil)
     AnnotatedPDFRenderer.drawPage(
         source: nil, marks: marks, sheet: sheet, into: context, inkSplit: written.split,
-        masks: writesInk ? update.masks : nil
+        writtenHighlights: written.highlights, masks: writesInk ? update.masks : nil
     )
     context.closePDF()
     if let ink = written.ink { try update.append(ink, page: 0) }

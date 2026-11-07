@@ -184,6 +184,45 @@ func makeHighlightPage(
     return Data(file.bytes)
 }
 
+/// A highlight block (`0x03`) of `rectangles` in the palette's `color`, the
+/// file's own `argb` beside it where given, to append to a page: the block
+/// the tablet writes for a run of the marker over a PDF's text.
+func highlightBlock(rectangles: [HighlightRect], color: UInt32, argb: UInt32? = nil, item: UInt64) -> [UInt8] {
+    var boxes = FixtureWriter()
+    boxes.append(varuint: UInt64(rectangles.count))
+    for rectangle in rectangles {
+        boxes.append(double: rectangle.x)
+        boxes.append(double: rectangle.y)
+        boxes.append(double: rectangle.width)
+        boxes.append(double: rectangle.height)
+    }
+    var value = FixtureWriter()
+    value.append(0x01)                                    // value type
+    value.appendTag(index: 4, type: 0x4)
+    value.append(uint32: color)
+    value.appendBlock(index: 6, boxes.bytes)
+    if let argb {
+        value.appendTag(index: 10, type: 0x4)
+        value.append(uint32: argb)
+    }
+    var payload = FixtureWriter()
+    payload.appendID(index: 1, (author: 0, counter: 11))  // parent: the root layer
+    payload.appendID(index: 2, (author: 2, counter: item))
+    payload.appendID(index: 3, (author: 0, counter: 0))   // left
+    payload.appendID(index: 4, (author: 0, counter: 0))   // right
+    payload.appendTag(index: 5, type: 0x4)
+    payload.append(uint32: 0)                             // deleted length
+    payload.appendBlock(index: 6, value.bytes)
+    var block = FixtureWriter()
+    block.append(uint32: UInt32(payload.bytes.count))
+    block.append(0)                                       // reserved zero
+    block.append(2)                                       // min_version
+    block.append(2)                                       // current_version
+    block.append(0x03)                                    // SceneGlyphItem
+    block.append(contentsOf: payload.bytes)
+    return block.bytes
+}
+
 /// One sample of a stroke as the file carries it.
 ///
 /// The tablet stores no curves at all: it samples the pen fast enough that the

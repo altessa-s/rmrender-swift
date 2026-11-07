@@ -14,8 +14,9 @@ import Foundation
 /// library's global locale lock, so pages drawn side by side wait on one
 /// another. Ink — the fills, lines and pencil grain of `PageRenderer.drawStroke`
 /// — is simple enough to write ourselves, so it is written here, on whichever
-/// task prepares the page, and CoreGraphics keeps the rest: templates, text,
-/// pictures, layers.
+/// task prepares the page — with the highlights' bands, where nothing
+/// CoreGraphics draws comes after them — and CoreGraphics keeps the rest:
+/// templates, text, pictures, layers.
 ///
 /// What CoreGraphics does with the same calls, operator for operator, so
 /// that the page paints what it would have painted, to the pixel:
@@ -32,6 +33,8 @@ import Foundation
 ///   the translation fused: `fma(a, x, tx)`.
 /// - Colours are in sRGB through an ICC-based space; the alpha goes to `/ca`
 ///   for a fill and `/CA` for a line, the blend mode to `/BM`.
+/// - A highlight's band is a rectangle, `re`, mapped as `CGRect.applying`
+///   maps it, filled at full alpha with `/BM /Multiply`.
 /// - Every number goes through `QuartzNumber`, CoreGraphics' own printing:
 ///   a coordinate or a colour as it prints those, an alpha as it prints that
 ///   into a graphics state — to four places.
@@ -100,7 +103,7 @@ final class InkStream {
     private var strokeColor: (Double, Double, Double)?
     private var fillAlpha = 1.0
     private var strokeAlpha = 1.0
-    private var darkens = false
+    private var blend = Blend.normal
     private var lineWidth = 1.0
     private var lineCap: Int32 = 0
     private var lineJoin: Int32 = 0
@@ -145,7 +148,7 @@ final class InkStream {
     func fill(_ path: CGPath, red: Double, green: Double, blue: Double, alpha: Double, darkens: Bool) {
         guard !path.isEmpty else { return }
         setFillColor(red, green, blue)
-        setState(fill: alpha, stroke: strokeAlpha, darkens: darkens)
+        setState(fill: alpha, stroke: strokeAlpha, blend: darkens ? .darken : .normal)
         devicePath(path)
         put("f\n")
     }
@@ -167,7 +170,7 @@ final class InkStream {
         guard points.count > 1 else { return }
         setLine(width: width, cap: cap, join: join, miterLimit: miterLimit)
         setStrokeColor(red, green, blue)
-        setState(fill: fillAlpha, stroke: alpha, darkens: darkens)
+        setState(fill: fillAlpha, stroke: alpha, blend: darkens ? .darken : .normal)
         put("q ")
         for value in [transform.a, transform.b, transform.c, transform.d, transform.tx, transform.ty] {
             number(value)
@@ -207,12 +210,12 @@ final class InkStream {
         put("/Perceptual ri\n")
         // Inside `q`: the colour and the state end at its `Q`, so what is
         // tracked outside it stays as it was.
-        let outside = (fillColor, fillAlpha, darkens: self.darkens)
+        let outside = (fillColor, fillAlpha, blend)
         setFillColor(red, green, blue)
-        setState(fill: alpha, stroke: strokeAlpha, darkens: darkens)
+        setState(fill: alpha, stroke: strokeAlpha, blend: darkens ? .darken : .normal)
         fillColor = outside.0
         fillAlpha = outside.1
-        self.darkens = outside.darkens
+        blend = outside.2
 
         let t = transform
         let x = Double(rectangle.minX), y = Double(rectangle.minY)
@@ -227,7 +230,32 @@ final class InkStream {
         put("cm\n/\(name) Do\nQ\nQ\n")
     }
 
+    /// A band of a text highlight: `rectangle` filled in an opaque colour,
+    /// multiplied onto what is under it — what `setBlendMode(.multiply)`,
+    /// `setFillColor` and `fill(_:)` of a rectangle paint at a context's
+    /// full alpha. CoreGraphics writes a rectangle as one, `re`, its corners
+    /// in device space: the rectangle mapped through the transform and
+    /// standardized, as `CGRect.applying` maps it.
+    func highlight(_ rectangle: CGRect, red: Double, green: Double, blue: Double) {
+        setFillColor(red, green, blue)
+        setState(fill: 1, stroke: strokeAlpha, blend: .multiply)
+        let device = rectangle.applying(transform)
+        number(Double(device.minX))
+        number(Double(device.minY))
+        number(Double(device.width))
+        number(Double(device.height))
+        put("re f\n")
+    }
+
     // MARK: - State
+
+    /// The blend modes the ink is painted with, as a graphics state names
+    /// them.
+    private enum Blend: String {
+        case normal = "Normal"
+        case darken = "Darken"
+        case multiply = "Multiply"
+    }
 
     private func setFillColor(_ red: Double, _ green: Double, _ blue: Double) {
         if let fillColor, fillColor == (red, green, blue) { return }
@@ -253,7 +281,7 @@ final class InkStream {
 
     /// The fill alpha, the line alpha and the blend mode moved to the values
     /// given, a graphics state for each that changes.
-    private func setState(fill: Double, stroke: Double, darkens: Bool) {
+    private func setState(fill: Double, stroke: Double, blend: Blend) {
         if fill != fillAlpha {
             useState("/ca " + QuartzNumber.alphaText(fill))
             fillAlpha = fill
@@ -262,9 +290,9 @@ final class InkStream {
             useState("/CA " + QuartzNumber.alphaText(stroke))
             strokeAlpha = stroke
         }
-        if darkens != self.darkens {
-            useState(darkens ? "/BM /Darken" : "/BM /Normal")
-            self.darkens = darkens
+        if blend != self.blend {
+            useState("/BM /" + blend.rawValue)
+            self.blend = blend
         }
     }
 
