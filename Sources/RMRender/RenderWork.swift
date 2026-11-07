@@ -13,6 +13,18 @@ import Foundation
 /// owns. One shared symbol says "the same as the other one, for the same
 /// reason" better than a comment in each could.
 enum RenderWork {
+    /// Why a page's marks did not make it into the drawing, as both
+    /// renderers tally it: each cause reaches the caller through a callback
+    /// of its own.
+    enum PageLoss: Sendable {
+        /// An older `.rm` generation, by its number.
+        case unsupported(version: Int)
+        /// Bytes that arrived and did not parse.
+        case unreadable
+        /// Bytes that never arrived.
+        case unfetched
+    }
+
     /// How many pages are in flight at once: a notebook must not turn into
     /// fifty parallel connections.
     static let pageConcurrency = 8
@@ -52,6 +64,19 @@ enum RenderWork {
         } onCancel: {
             work.cancel()
         }
+    }
+
+    /// Whether a failure is the caller having stopped waiting rather than
+    /// something gone wrong with the one thing asked for.
+    ///
+    /// A page whose bytes would not arrive costs that page and no more (see
+    /// the renderers' `onUnfetched`); a cancelled render costs the render,
+    /// and has to. The two can look alike from inside a fetch: a transport
+    /// cancelled under a cancelled task answers with an error of its own
+    /// rather than `CancellationError`. So the task is asked as well — once
+    /// it is cancelled, whatever failed is the cancellation's doing.
+    static func isCancellation(_ error: any Error) -> Bool {
+        error is CancellationError || Task.isCancelled
     }
 
     /// `jobs` run at most `limit` at a time, and each answer is handed to

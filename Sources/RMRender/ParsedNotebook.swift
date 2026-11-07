@@ -21,6 +21,10 @@ public struct ParsedNotebook: Sendable {
     /// holds, and a reader that must not pass over an unread page can tell
     /// them from pages nobody wrote on.
     public let unreadable: Set<Int>
+    /// Those of `unreadable` whose bytes never arrived — the fetch failed,
+    /// rather than the page failing to parse. Told apart because the one
+    /// may come right on another try and the other will not.
+    public let unfetched: Set<Int>
     /// The document's own name for each page of `pages`, in step with it —
     /// the `.rm` file it was read from — for an edit made to that file
     /// later. `nil` for a page with no file behind it: one never drawn on.
