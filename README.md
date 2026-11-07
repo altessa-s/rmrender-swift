@@ -267,13 +267,30 @@ attachments are missing (`NotebookRenderer` has the same callback).
 it.
 
 A page whose bytes **do not arrive** — `PageBlobs` failing with anything other
-than a cancellation — costs that page alone: it is drawn as a page that does
-not parse is (a blank sheet on its template in a notebook, the original page
-without its marks in an annotated document), the export goes on, and
-`onUnfetched` reports how many pages were lost that way, separately from
-`onUnreadable`. A caller that keeps what it is handed may prefer to fail and
-retry instead. Cancelling a render still ends it, and a missing or unopenable
-original is still an error.
+than a cancellation — is handled as `unfetchedPages:` says, on every document
+renderer (`NotebookRenderer.renderPDF`, `renderImages`, `parsed`,
+`renderInkImages`, and `AnnotatedPDFRenderer.renderPDF`):
+
+| `UnfetchedPagePolicy` | Notebook page | Annotated page | `onUnfetched` |
+|---|---|---|---|
+| `.placeholder` (default) | a plain white sheet of the page's size, "Rendering error" in the middle | the original page, the same label over it | called |
+| `.blank` | a blank sheet on its template, as a page that does not parse | the original page without its marks | called |
+| `.strict` | the render throws `PageFetchError(page:pageID:underlying:)` and writes no output | the same | not called |
+
+The label is dark grey on a light rounded box, sized to the page's width and
+set in Noto Sans, the face typed text is set in. On an annotated document taken
+the incremental way it is written into the update as a native Form, so the
+original's links and outline stay. Bitmaps carry it too — which a text
+recogniser will read, so an OCR caller wants `.blank` or `.strict`; ink-only
+bitmaps (`renderInkImages`) never show it. `parsed` keeps such pages as blank
+sheets in `ParsedNotebook.unfetched` and leaves the look to
+`renderImages(_:unfetchedPages:)`.
+
+`onUnfetched` is told separately from `onUnreadable`: a page that arrived and
+does not parse is drawn as it always was, whatever the policy, because it will
+not parse on the next try either. Cancelling a render still ends it with the
+cancellation, under every policy, and a missing or unopenable original or an
+output that cannot be written is still an error.
 
 A page with a `/UserUnit` other than 1 is refused with
 `RenderError.unsupportedFormat`.
