@@ -265,7 +265,7 @@ func redrawHoldsAWindowOfMarks() async throws {
         }
     )
     #expect(fetches.secondFetches == pages - 1)
-    #expect(fetches.furthestLead <= RenderWork.pageConcurrency)
+    #expect(fetches.furthestLead <= RenderWork.inkConcurrency)
     #expect(fetches.count("doc/p2.rm") == 0)
     #expect(try #require(CGPDFDocument(output as CFURL)).numberOfPages == pages)
 }

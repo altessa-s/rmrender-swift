@@ -87,12 +87,13 @@ public enum PageRenderer {
         assets: [String: Data] = [:],
         author: String? = nil
     ) throws -> Data {
-        guard let buffer = CFDataCreateMutable(nil, 0),
-              let consumer = CGDataConsumer(data: buffer)
-        else {
+        guard let buffer = CFDataCreateMutable(nil, 0) else {
             throw RenderError.pdfContextUnavailable
         }
-        try pdf(pages: pages, pageSize: pageSize, paper: paper, assets: assets, author: author, into: consumer)
+        try pdf(
+            pages: pages, pageSize: pageSize, paper: paper, assets: assets, author: author,
+            into: PDFSink(data: buffer)
+        )
         return buffer as Data
     }
 
@@ -213,11 +214,8 @@ public enum PageRenderer {
         author: String? = nil,
         to url: URL
     ) throws {
-        guard let consumer = CGDataConsumer(url: url as CFURL) else {
-            throw RenderError.pdfContextUnavailable
-        }
         do {
-            try pdf(pages: pages, pageSize: pageSize, paper: paper, assets: assets, author: author, into: consumer)
+            try pdf(pages: pages, pageSize: pageSize, paper: paper, assets: assets, author: author, into: PDFSink(url: url))
         } catch {
             // A cancelled or failed render leaves a truncated PDF behind, and
             // a truncated PDF at the path the caller asked for is worse than
@@ -233,9 +231,9 @@ public enum PageRenderer {
         paper: PaperSize,
         assets: [String: Data],
         author: String?,
-        into consumer: CGDataConsumer
+        into sink: PDFSink
     ) throws {
-        let output = try PDFPages(consumer: consumer, pageSize: pageSize, paper: paper, author: author)
+        let output = try PDFPages(sink: sink, pageSize: pageSize, paper: paper, author: author)
         let images = PageImages(bytes: assets)
         // An empty notebook must still produce a file that opens.
         for page in pages.isEmpty ? [RMPage(strokes: [], skippedBlocks: 0)] : pages {
@@ -244,9 +242,9 @@ public enum PageRenderer {
             // rather than inside a page: a page is a bounded piece of work,
             // and stopping between two of them costs nothing to reason about.
             try Task.checkCancellation()
-            output.draw(page, images: images)
+            try output.draw(page, images: images)
         }
-        output.close()
+        try output.close()
     }
 
     /// A notebook's PDF written a page at a time.
@@ -257,55 +255,139 @@ public enum PageRenderer {
     /// the loop above takes — is the memory that keeps a long notebook from
     /// being exported at all. Not `Sendable`: it is a `CGContext`, and it is
     /// used from the one task that made it.
+    ///
+    /// A page is drawn in two halves. Its ink — the strokes after the last
+    /// thing only CoreGraphics draws (`inkSplit(of:images:)`) — is written
+    /// apart by `Sheets.prepare`, which touches nothing shared and so runs
+    /// on as many pages at once as the caller likes; CoreGraphics draws the
+    /// rest, the template and the typed text and the pictures, here, a page
+    /// at a time. The ink is appended after CoreGraphics' drawing of the
+    /// page when the document is closed (`InkUpdate`), and the page paints
+    /// what CoreGraphics drawing it all would have painted.
     final class PDFPages {
-        private let context: CGContext
-        private let pageSize: CGSize
-        private let paperSize: CGSize
-        private let scale: CGFloat
+        /// What a page's sheet is worked out from: the same for every page
+        /// of the document, and all a page's preparation needs.
+        struct Sheets: Sendable {
+            let pageSize: CGSize
+            let paperSize: CGSize
+            let scale: CGFloat
 
-        init(consumer: CGDataConsumer, pageSize: CGSize, paper: PaperSize, author: String?) throws {
+            /// `page` made ready to draw: its sheet measured and its ink
+            /// written. Touches nothing but the page.
+            func prepare(_ page: RMPage) -> Prepared {
+                // The sheet is worked out per page. One sheet for the whole
+                // notebook would mean that a single page written far down
+                // squeezes all the others: on a three-page document the scale
+                // would fall to 20%. Exported PDFs do the same — their pages
+                // differ in height while the scale stays put.
+                let geometry = page.text.map { TextGeometry($0, pageSize: pageSize) }
+                let bounds = contentBounds(of: page, pageSize: pageSize, edge: .ribbon, geometry: geometry)
+                let sheet = grownSheet(from: bounds, floor: paperSize, scale: scale)
+                let placement = placement(of: bounds, on: sheet, scale: scale)
+                let ink = writtenInk(of: page, pageSize: pageSize, geometry: geometry) { $0.concatenate(placement) }
+                return Prepared(page: page, bounds: bounds, sheet: sheet, split: ink.split, ink: ink.ink)
+            }
+        }
+
+        /// A page made ready to draw, by `Sheets.prepare`.
+        struct Prepared: Sendable {
+            let page: RMPage
+            let bounds: CGRect
+            let sheet: CGSize
+            /// Where CoreGraphics' strokes end and the written ink begins.
+            let split: Int
+            let ink: PreparedInk?
+        }
+
+        private let context: CGContext
+        private let sink: PDFSink
+        private let update = InkUpdate()
+        let sheets: Sheets
+        private var drawn = 0
+
+        init(sink: PDFSink, pageSize: CGSize, paper: PaperSize, author: String?) throws {
             // The page canvas decides the sheet only for the "as tablet" paper:
             // each tablet model declares its own canvas.
             let paperSize = paper.points(forCanvas: pageSize)
             var mediaBox = CGRect(origin: .zero, size: paperSize)
             let info = PDFDocumentInfo.dictionary(author: author)
-            guard let context = CGContext(consumer: consumer, mediaBox: &mediaBox, info) else {
+            guard let consumer = sink.consumer(), let context = CGContext(consumer: consumer, mediaBox: &mediaBox, info) else {
                 throw RenderError.pdfContextUnavailable
             }
             self.context = context
-            self.pageSize = pageSize
-            self.paperSize = paperSize
+            self.sink = sink
             // The scale is set by the width and is one for the whole document:
             // the tablet's page fits exactly into the width of the chosen sheet.
             // That way nothing is squeezed — exactly as in exported PDFs, where
             // every page carries one and the same coefficient.
-            scale = paperSize.width / pageSize.width
+            sheets = Sheets(pageSize: pageSize, paperSize: paperSize, scale: paperSize.width / pageSize.width)
         }
 
-        func draw(_ page: RMPage, images: PageImages) {
-            // The sheet is worked out per page. One sheet for the whole
-            // notebook would mean that a single page written far down
-            // squeezes all the others: on a three-page document the scale
-            // would fall to 20%. Exported PDFs do the same — their pages
-            // differ in height while the scale stays put.
-            let geometry = page.text.map { TextGeometry($0, pageSize: pageSize) }
-            let bounds = contentBounds(of: page, pageSize: pageSize, edge: .ribbon, geometry: geometry)
-            let sheet = grownSheet(from: bounds, floor: paperSize, scale: scale)
+        func draw(_ page: RMPage, images: PageImages) throws {
+            try draw(sheets.prepare(page), images: images)
+        }
 
-            context.beginPDFPage(pageInfo(mediaBox: CGRect(origin: .zero, size: sheet)))
+        /// A prepared page drawn: CoreGraphics' half now, the ink when the
+        /// document is closed.
+        func draw(_ prepared: Prepared, images: PageImages) throws {
+            let pageSize = sheets.pageSize
+            let geometry = prepared.page.text.map { TextGeometry($0, pageSize: pageSize) }
+            context.beginPDFPage(pageInfo(mediaBox: CGRect(origin: .zero, size: prepared.sheet)))
             context.saveGState()
-            context.concatenate(placement(of: bounds, on: sheet, scale: scale))
+            context.concatenate(placement(of: prepared.bounds, on: prepared.sheet, scale: sheets.scale))
             PageRenderer.draw(
-                page, in: context, pageSize: pageSize, bounds: bounds, images: images, geometry: geometry,
-                templateIsArtifact: true
+                prepared.page, in: context, pageSize: pageSize, bounds: prepared.bounds, images: images,
+                geometry: geometry, templateIsArtifact: true, inkSplit: prepared.split, masks: update.masks
             )
             context.restoreGState()
             context.endPDFPage()
+            if let ink = prepared.ink { try update.append(ink, page: drawn) }
+            drawn += 1
         }
 
-        func close() {
+        /// The document finished: CoreGraphics' half closed, the ink
+        /// appended.
+        func close() throws {
             context.closePDF()
+            try update.finish(into: sink)
+            try sink.close()
         }
+    }
+
+    /// The ink of `page` written apart, and where it begins: the strokes
+    /// from `inkSplit(of:images:)` on, written under the transform the page
+    /// is drawn under — `place` applied to a fresh context, the way the
+    /// drawing applies it to its own, so that the transform is CoreGraphics'
+    /// to the bit. A page whose transform the writer does not take
+    /// (`InkStream.init(transform:)`) is CoreGraphics' whole: its split is
+    /// its count of strokes, and it has no ink.
+    static func writtenInk(
+        of page: RMPage, pageSize: CGSize, geometry: TextGeometry?, place: (CGContext) -> Void
+    ) -> (split: Int, ink: PreparedInk?) {
+        let placed = strokes(of: page, geometry: geometry)
+        let split = inkSplit(of: placed, images: images(of: page, geometry: geometry))
+        guard split < placed.count,
+              let transform = contextTransform(place),
+              let stream = InkStream(transform: transform)
+        else { return (placed.count, nil) }
+        writeInk(page, into: stream, pageSize: pageSize, geometry: geometry, from: split)
+        // Ink that could not be deflated is CoreGraphics' again, all of it.
+        guard let ink = PreparedInk(stream) else { return stream.isEmpty ? (split, nil) : (placed.count, nil) }
+        return (split, ink)
+    }
+
+    /// The transform a context is left with by `apply`, from a fresh one's.
+    /// A one-pixel bitmap does the arithmetic: a context's transform is
+    /// worked the same whatever it draws into, and its own starts where a
+    /// PDF page's does, at the identity.
+    static func contextTransform(_ apply: (CGContext) -> Void) -> CGAffineTransform? {
+        guard let context = CGContext(
+            data: nil, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ), context.ctm.isIdentity
+        else { return nil }
+        apply(context)
+        return context.ctm
     }
 
     /// The sheet size for one PDF page.
@@ -361,6 +443,12 @@ public enum PageRenderer {
 
     /// Draw a page's contents into a context already placed in `.rm` space.
     ///
+    /// `inkSplit` stops the strokes there: the rest are written apart
+    /// (`writeInk`) and appended after what is drawn here, which is the page
+    /// up to them (`inkSplit(of:images:)`). `masks` is the document's record
+    /// of the grain masks drawn so far, for a PDF whose ink is partly
+    /// written apart — see `InkMaskLedger`.
+    ///
     /// Internal rather than private because `AnnotatedPDFRenderer` puts the
     /// same strokes onto a page of an imported PDF. The alternative would be
     /// a second copy of the stroke drawing — the most intricate part of the
@@ -374,7 +462,9 @@ public enum PageRenderer {
         images pictures: PageImages = PageImages(),
         inkOnly: Bool = false,
         geometry laidOut: TextGeometry? = nil,
-        templateIsArtifact: Bool = false
+        templateIsArtifact: Bool = false,
+        inkSplit: Int? = nil,
+        masks: InkMaskLedger? = nil
     ) {
         // The template comes first: the handwriting is drawn over it, as on
         // the tablet. Unless the user hid it — the flag is the page's own
@@ -480,6 +570,10 @@ public enum PageRenderer {
         // under others. `strokesBefore` is its place in that sequence.
         let placed = strokes(of: page, geometry: geometry)
         let placedImages = inkOnly ? [] : images(of: page, geometry: geometry)
+        // The strokes from `split` on are written apart (`writeInk`); they
+        // come after everything drawn here, so what is drawn here is the
+        // page up to them.
+        let split = min(inkSplit ?? placed.count, placed.count)
         var nextImage = 0
         func drawImages(before position: Int) {
             while nextImage < placedImages.count,
@@ -489,26 +583,7 @@ public enum PageRenderer {
             }
         }
 
-        // What the erasers take off, cut out of the ink rather than painted
-        // over it.
-        //
-        // Painting is what a blend mode would do, and there is no blend mode
-        // for it here: `destinationOut` is not one of the modes a PDF carries,
-        // and CoreGraphics drops it without a word, so the page would come
-        // out unchanged. White paint is no answer either, because the
-        // eraser leaves the template alone and white would cover it. So the
-        // ink is cut: the band an eraser laid down is subtracted from the
-        // outline of every stroke drawn **before** it, and a stroke drawn
-        // after is untouched, exactly as on the tablet.
-        //
-        // Only tool 6. The area eraser is tool 8 and takes nothing off — its
-        // page in a Move export of `Fixture 13` came back whole where the
-        // other came back with half the ink gone.
-        let erasers = placed.enumerated().compactMap { position, stroke in
-            stroke.tool == .eraser && stroke.points.count > 1
-                ? (position: position, band: outline(of: stroke, pageSize: pageSize))
-                : nil
-        }
+        let erasers = split > 0 ? Self.erasers(of: placed, pageSize: pageSize) : []
         // The pieces an eraser left of one shader stroke share a layer: drawn
         // opaque inside it, and the layer is darkened onto the page once at
         // the stroke's own alpha, so the pieces read as the one stroke they
@@ -528,7 +603,7 @@ public enum PageRenderer {
             context.restoreGState()
             sharedLayer = nil
         }
-        for (position, stroke) in placed.enumerated() {
+        for (position, stroke) in placed.enumerated().prefix(split) {
             if nextImage < placedImages.count, placedImages[nextImage].strokesBefore <= position {
                 closeSharedLayer()
             }
@@ -544,24 +619,100 @@ public enum PageRenderer {
                     sharedLayer = layer
                 }
             }
-            // Only the erasers that could have reached this stroke. A page with
-            // an eraser in one corner should draw the other corner exactly as a
-            // page without one: cutting is a different path through the drawing
-            // — a stroked tool has to become a filled outline to have anything
-            // to cut — and a stroke nobody erased must not take it.
-            let reach = erasers.isEmpty ? .null : coveredBox(of: stroke, pageSize: pageSize)
-            drawStroke(
-                stroke,
-                in: context,
-                pageSize: pageSize,
-                erasedBy: erasers
-                    .filter { $0.position > position && $0.band.boundingBox.intersects(reach) }
-                    .map(\.band),
-                inSharedLayer: layer != nil
-            )
+            paint(
+                of: stroke, at: position, pageSize: pageSize, erasers: erasers, inSharedLayer: layer != nil
+            )?.draw(in: context, masks: masks)
         }
         closeSharedLayer()
         drawImages(before: Int.max)
+    }
+
+    /// The bands of a page's erasers, each with its place in the sequence.
+    ///
+    /// What the erasers take off, cut out of the ink rather than painted
+    /// over it.
+    ///
+    /// Painting is what a blend mode would do, and there is no blend mode
+    /// for it here: `destinationOut` is not one of the modes a PDF carries,
+    /// and CoreGraphics drops it without a word, so the page would come
+    /// out unchanged. White paint is no answer either, because the
+    /// eraser leaves the template alone and white would cover it. So the
+    /// ink is cut: the band an eraser laid down is subtracted from the
+    /// outline of every stroke drawn **before** it, and a stroke drawn
+    /// after is untouched, exactly as on the tablet.
+    ///
+    /// Only tool 6. The area eraser is tool 8 and takes nothing off — its
+    /// page in a Move export of `Fixture 13` came back whole where the
+    /// other came back with half the ink gone.
+    private static func erasers(of placed: [Stroke], pageSize: CGSize) -> [(position: Int, band: CGPath)] {
+        placed.enumerated().compactMap { position, stroke in
+            stroke.tool == .eraser && stroke.points.count > 1
+                ? (position: position, band: outline(of: stroke, pageSize: pageSize))
+                : nil
+        }
+    }
+
+    /// What the stroke at `position` paints, less whatever the erasers after
+    /// it took off.
+    private static func paint(
+        of stroke: Stroke,
+        at position: Int,
+        pageSize: CGSize,
+        erasers: [(position: Int, band: CGPath)],
+        inSharedLayer: Bool
+    ) -> StrokePaint? {
+        // Only the erasers that could have reached this stroke. A page with
+        // an eraser in one corner should draw the other corner exactly as a
+        // page without one: cutting is a different path through the drawing
+        // — a stroked tool has to become a filled outline to have anything
+        // to cut — and a stroke nobody erased must not take it.
+        let reach = erasers.isEmpty ? .null : coveredBox(of: stroke, pageSize: pageSize)
+        return paint(
+            of: stroke,
+            pageSize: pageSize,
+            erasedBy: erasers
+                .filter { $0.position > position && $0.band.boundingBox.intersects(reach) }
+                .map(\.band),
+            inSharedLayer: inSharedLayer
+        )
+    }
+
+    /// Where a page's ink can be written apart from CoreGraphics' drawing:
+    /// the position of the first stroke after the last thing only
+    /// CoreGraphics draws — a picture, or a stroke in a shared layer. The
+    /// strokes from there on come after everything else on the page, so
+    /// they can be written after it (`writeInk`) and the page paints the
+    /// same. The page's count when nothing can be.
+    static func inkSplit(of placed: [Stroke], images placedImages: [PageImage]) -> Int {
+        var split = 0
+        for image in placedImages {
+            // Drawn before the stroke at `strokesBefore`, or after them all.
+            split = max(split, min(max(image.strokesBefore, 0), placed.count))
+        }
+        for (position, stroke) in placed.enumerated() where sharedLayerKey(of: stroke) != nil {
+            split = max(split, position + 1)
+        }
+        return split
+    }
+
+    /// The strokes of a page from `split` on, written into `stream` — the
+    /// part of `draw` that `draw(…inkSplit:)` leaves out, painting what it
+    /// would have painted. `geometry` is the page's typed text laid out, as
+    /// `draw` is handed it.
+    static func writeInk(
+        _ page: RMPage,
+        into stream: InkStream,
+        pageSize: CGSize,
+        geometry: TextGeometry?,
+        from split: Int
+    ) {
+        let placed = strokes(of: page, geometry: geometry)
+        guard split < placed.count else { return }
+        let erasers = erasers(of: placed, pageSize: pageSize)
+        for (position, stroke) in placed.enumerated().dropFirst(split) {
+            paint(of: stroke, at: position, pageSize: pageSize, erasers: erasers, inSharedLayer: false)?
+                .write(into: stream)
+        }
     }
 
     /// Which shared layer a stroke goes into, or `nil` when it is drawn on its
@@ -633,16 +784,113 @@ public enum PageRenderer {
         )
     }
 
-    /// One stroke, exactly as the loop above draws it in place, less
-    /// whatever the erasers drawn after it took off.
-    private static func drawStroke(
-        _ stroke: Stroke,
-        in context: CGContext,
+    /// What one stroke paints, worked out once and painted by either of the
+    /// two that paint a page's ink: CoreGraphics (`draw(in:masks:)`), or the
+    /// writer that writes it in CoreGraphics' place (`write(into:)`). The
+    /// decisions — which shape, which colour, cut by which erasers — are
+    /// made here, so the two cannot come to paint different things.
+    struct StrokePaint {
+        enum Shape {
+            /// A contour filled, nonzero.
+            case fill(CGPath)
+            /// A pencil: the contour is the clip, the mask decides which units
+            /// inside it are graphite and which are paper, laid over
+            /// `rectangle`.
+            case mask(clip: CGPath, bits: StrokeGrainMask.Bits, rectangle: CGRect)
+            /// A stroked line through the points.
+            case line(points: [CGPoint], width: Double, cap: CGLineCap, join: CGLineJoin)
+        }
+
+        let shape: Shape
+        let red: Double
+        let green: Double
+        let blue: Double
+        let alpha: Double
+        let darkens: Bool
+        /// Inside a shared layer the blend and the alpha are the layer's, put
+        /// on once when it is composited; a stroke drawn there is opaque.
+        let inSharedLayer: Bool
+
+        /// The stroke painted by CoreGraphics, call for call as it always
+        /// was. `masks` is the document's record of grain masks where part
+        /// of its ink is written apart (`InkMaskLedger`).
+        func draw(in context: CGContext, masks: InkMaskLedger? = nil) {
+            context.saveGState()
+            // Darken rather than an alpha, for the highlighter and the shader:
+            // that is what exported PDFs declare, and it is what leaves
+            // the text under the band alone instead of washing it out.
+            if !inSharedLayer {
+                if darkens { context.setBlendMode(.darken) }
+                context.setAlpha(alpha)
+            }
+            switch shape {
+            case .fill(let path):
+                context.setFillColor(red: red, green: green, blue: blue, alpha: 1)
+                context.addPath(path)
+                context.fillPath(using: .winding)
+            case .mask(let clip, let bits, let rectangle):
+                context.setFillColor(red: red, green: green, blue: blue, alpha: 1)
+                if let mask = StrokeGrainMask.image(of: masks?.drawn(bits) ?? bits) {
+                    // Nothing is interpolated: a texel is a unit of the page,
+                    // and a blurred texel is a grey that an export never
+                    // draws.
+                    context.addPath(clip)
+                    context.clip()
+                    context.interpolationQuality = .none
+                    context.draw(mask, in: rectangle)
+                } else {
+                    context.addPath(clip)
+                    context.fillPath(using: .winding)
+                }
+            case .line(let points, let width, let cap, let join):
+                context.setStrokeColor(red: red, green: green, blue: blue, alpha: 1)
+                context.setLineWidth(width)
+                context.setLineCap(cap)
+                context.setLineJoin(join)
+                context.setMiterLimit(CGFloat(PenTool.lineMiterLimit))
+                context.beginPath()
+                for (index, point) in points.enumerated() {
+                    if index == 0 {
+                        context.move(to: point)
+                    } else {
+                        context.addLine(to: point)
+                    }
+                }
+                context.strokePath()
+            }
+            context.restoreGState()
+        }
+
+        /// The stroke written in CoreGraphics' place, painting what `draw`
+        /// paints. Never inside a shared layer: a layer is CoreGraphics'
+        /// (`inkSplit(of:images:)`).
+        func write(into stream: InkStream) {
+            switch shape {
+            case .fill(let path):
+                stream.fill(path, red: red, green: green, blue: blue, alpha: alpha, darkens: darkens)
+            case .mask(let clip, let bits, let rectangle):
+                stream.mask(
+                    bits, in: rectangle, clip: clip, red: red, green: green, blue: blue, alpha: alpha, darkens: darkens
+                )
+            case .line(let points, let width, let cap, let join):
+                stream.stroke(
+                    points, width: width, cap: cap, join: join, miterLimit: PenTool.lineMiterLimit,
+                    red: red, green: green, blue: blue, alpha: alpha, darkens: darkens
+                )
+            }
+        }
+    }
+
+    /// What one stroke paints, exactly as the loop above draws it in place,
+    /// less whatever the erasers drawn after it took off; `nil` where it
+    /// paints nothing.
+    private static func paint(
+        of stroke: Stroke,
         pageSize: CGSize,
-        erasedBy erasers: [CGPath] = [],
-        inSharedLayer: Bool = false
-    ) {
-        guard stroke.points.count > 1 else { return }
+        erasedBy erasers: [CGPath],
+        inSharedLayer: Bool
+    ) -> StrokePaint? {
+        guard stroke.points.count > 1 else { return nil }
         // Do not paint the eraser: its stroke looks like ink, and drawing it
         // would cover the page where the user was rubbing out. The taking-off
         // is in `draw`, by subtracting this band from strokes laid down
@@ -654,18 +902,13 @@ public enum PageRenderer {
         //
         // Taken off rather than painted over: white would cover the template
         // too, and the eraser leaves the template alone.
-        if stroke.tool?.isEraser == true { return }
+        if stroke.tool?.isEraser == true { return nil }
         let rgb = stroke.rgb
-        let blend = stroke.blend
-        context.saveGState()
-        // Darken rather than an alpha, for the highlighter and the shader:
-        // that is what exported PDFs declare, and it is what leaves
-        // the text under the band alone instead of washing it out.
-        // Inside a shared layer the blend and the alpha are the layer's, put
-        // on once when it is composited; a stroke drawn there is opaque.
-        if !inSharedLayer {
-            if blend.darkens { context.setBlendMode(.darken) }
-            context.setAlpha(stroke.alpha)
+        func painted(_ shape: StrokePaint.Shape) -> StrokePaint {
+            StrokePaint(
+                shape: shape, red: rgb.red, green: rgb.green, blue: rgb.blue, alpha: stroke.alpha,
+                darkens: stroke.blend.darkens, inSharedLayer: inSharedLayer
+            )
         }
 
         if !stroke.isStroked || !erasers.isEmpty {
@@ -676,7 +919,6 @@ public enum PageRenderer {
             // The two stroked tools come through here as well when
             // something erased them: a line has no shape to cut a hole in, so
             // it is turned into the band it covers first.
-            context.setFillColor(red: rgb.red, green: rgb.green, blue: rgb.blue, alpha: 1)
             var shape = stroke.isStroked
                 ? strokedOutline(of: stroke, pageSize: pageSize)
                 : outline(of: stroke, pageSize: pageSize)
@@ -684,44 +926,27 @@ public enum PageRenderer {
             let grain = stroke.grain
             if grain != .solid,
                let box = StrokeGrainMask.box(of: stroke),
-               let mask = StrokeGrainMask.image(for: stroke, grain: grain, in: box) {
+               let bits = StrokeGrainMask.bits(for: stroke, grain: grain, in: box) {
                 // The pencils: the contour still decides the edge — it is the
                 // clip — and the mask decides which units inside it are
-                // graphite and which are paper. Nothing is interpolated: a
-                // texel is a unit of the page, and a blurred texel is a grey
-                // that an export never draws.
-                context.addPath(shape)
-                context.clip()
-                context.interpolationQuality = .none
+                // graphite and which are paper.
                 let corner = convert(x: box.minX, y: box.maxY, pageSize: pageSize)
-                context.draw(
-                    mask,
-                    in: CGRect(x: corner.x, y: corner.y, width: box.width, height: box.height)
-                )
-            } else {
-                context.addPath(shape)
-                context.fillPath(using: .winding)
+                return painted(.mask(
+                    clip: shape,
+                    bits: bits,
+                    rectangle: CGRect(x: corner.x, y: corner.y, width: box.width, height: box.height)
+                ))
             }
-        } else {
-            // A stroked line: what an export does with the fineliner and
-            // the highlighter, and cheaper than a contour for the same picture.
-            context.setStrokeColor(red: rgb.red, green: rgb.green, blue: rgb.blue, alpha: 1)
-            context.setLineWidth(stroke.lineWidth)
-            context.setLineCap(stroke.end.lineCap)
-            context.setLineJoin(stroke.tool?.lineJoin ?? .round)
-            context.setMiterLimit(CGFloat(PenTool.lineMiterLimit))
-            context.beginPath()
-            for (index, point) in stroke.points.enumerated() {
-                let location = convert(point, pageSize: pageSize)
-                if index == 0 {
-                    context.move(to: location)
-                } else {
-                    context.addLine(to: location)
-                }
-            }
-            context.strokePath()
+            return painted(.fill(shape))
         }
-        context.restoreGState()
+        // A stroked line: what an export does with the fineliner and
+        // the highlighter, and cheaper than a contour for the same picture.
+        return painted(.line(
+            points: stroke.points.map { convert($0, pageSize: pageSize) },
+            width: stroke.lineWidth,
+            cap: stroke.end.lineCap,
+            join: stroke.tool?.lineJoin ?? .round
+        ))
     }
 
     /// An image on the page, placed by its four vertices.

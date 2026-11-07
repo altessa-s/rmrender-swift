@@ -63,9 +63,12 @@ enum StrokeGrainMask {
     /// The mask over `box` as an image, or `nil` when there is nothing to
     /// build it from.
     static func image(for stroke: Stroke, grain: StrokeGrain, in box: CGRect) -> CGImage? {
-        guard let bits = bits(for: stroke, grain: grain, in: box),
-              let provider = CGDataProvider(data: Data(bits.data) as CFData)
-        else { return nil }
+        bits(for: stroke, grain: grain, in: box).flatMap(image(of:))
+    }
+
+    /// The mask `bits` say, as an image.
+    static func image(of bits: Bits) -> CGImage? {
+        guard let provider = CGDataProvider(data: Data(bits.data) as CFData) else { return nil }
         return CGImage(
             maskWidth: bits.width,
             height: bits.height,

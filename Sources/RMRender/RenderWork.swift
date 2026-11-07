@@ -29,6 +29,18 @@ enum RenderWork {
     /// fifty parallel connections.
     static let pageConcurrency = 8
 
+    /// How many pages a drawing that writes their ink (`InkStream`) keeps
+    /// in flight: one a core, and never fewer than `pageConcurrency`.
+    ///
+    /// Writing a page's ink is most of what drawing it costs, and it is done
+    /// where the page is fetched and parsed. Pages are handed to the drawing
+    /// in their order, so one slow page holds back the window behind it; at
+    /// eight pages a notebook written full kept half of fourteen cores busy,
+    /// and took twice as long as at one a core. The pages fetched here were
+    /// fetched once already to be measured, out of the caller's cache where
+    /// it keeps one.
+    static let inkConcurrency = max(pageConcurrency, ProcessInfo.processInfo.activeProcessorCount)
+
     /// Heavy, actor-free computation, run so that cancelling the caller
     /// cancels it too.
     ///

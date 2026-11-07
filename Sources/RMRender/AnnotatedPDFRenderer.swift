@@ -370,26 +370,30 @@ public struct AnnotatedPDFRenderer: Sendable {
         else {
             throw RenderError.malformedPage("the document's PDF does not open")
         }
-        guard let consumer = CGDataConsumer(url: output as CFURL) else {
-            throw RenderError.pdfContextUnavailable
-        }
+        let sink = try PDFSink(url: output)
         // The box here is a default only: every page overrides its own,
         // because one document can mix formats — see `AnnotationGeometry`.
         var mediaBox = CGRect(origin: .zero, size: pages.first?.sheet ?? PaperSize.a4.points())
         let info = PDFDocumentInfo.dictionary(author: author)
-        guard let context = CGContext(consumer: consumer, mediaBox: &mediaBox, info) else {
+        guard let consumer = sink.consumer(), let context = CGContext(consumer: consumer, mediaBox: &mediaBox, info) else {
             throw RenderError.pdfContextUnavailable
         }
 
         let navigation = try PDFNavigation(original: original, document: document,
                                            mapping: pages.map { ($0.redir, $0.marks?.rootDocumentVisible != false, $0.sheet) })
         let drawing = PageRenderer.PageImages(decoded: images)
-        try await RenderWork.boundedConcurrentForEach(Array(pages.indices)) { position -> RMPage? in
+        // The ink of a page is written where its marks are parsed, beside the
+        // drawing, and appended once the document is closed — see
+        // `PageRenderer.PDFPages`, which does the same for a notebook.
+        let update = InkUpdate()
+        try await RenderWork.boundedConcurrentForEach(
+            Array(pages.indices), limit: RenderWork.inkConcurrency
+        ) { position -> PreparedMarks? in
             // A page with no marks has nothing to fetch; one whose marks did
             // not arrive comes back as `nil` too, and is drawn without them.
-            guard pages[position].marks != nil else { return nil }
-            return try await marks(position)
-        } consume: { done, pageMarks in
+            guard pages[position].marks != nil, let marks = try await marks(position) else { return nil }
+            return PreparedMarks(marks, sheet: pages[position].sheet)
+        } consume: { done, prepared in
             // The drawing itself does not suspend, so it is not interruptible
             // on its own: without asking, a redraw of a five-hundred-page book
             // runs to the end after the user has already dismissed it. The
@@ -399,16 +403,44 @@ public struct AnnotatedPDFRenderer: Sendable {
             let page = pages[done]
             drawPage(
                 source: originalPage(page.redir, in: document),
-                marks: pageMarks,
+                marks: prepared?.marks,
                 sheet: page.sheet,
                 into: context,
                 images: drawing,
-                navigation: { navigation.draw(page: done, in: $0) }
+                navigation: { navigation.draw(page: done, in: $0) },
+                inkSplit: prepared?.split,
+                masks: update.masks
             )
+            if let ink = prepared?.ink { try update.append(ink, page: done) }
             onPageDrawn(done + 1)
         }
         navigation.finish(in: context)
         context.closePDF()
+        try update.finish(into: sink)
+        try sink.close()
+    }
+
+    /// A page's marks with their ink written, ready for `drawPage` to draw
+    /// the rest: the ink of a redrawn page is written apart, beside the
+    /// drawing, as a notebook's is (`PageRenderer.PDFPages`).
+    private struct PreparedMarks: Sendable {
+        let marks: RMPage
+        /// Where CoreGraphics' strokes end and the written ink begins.
+        let split: Int
+        let ink: PreparedInk?
+
+        /// The marks on a sheet of `size`, under the transform `drawPage`
+        /// draws them under.
+        init(_ marks: RMPage, sheet size: CGSize) {
+            let units = AnnotationGeometry.units(of: size)
+            let geometry = marks.text.map { TextGeometry($0, pageSize: units) }
+            let written = PageRenderer.writtenInk(of: marks, pageSize: units, geometry: geometry) {
+                $0.scaleBy(x: Calibration.pointsPerUnit, y: Calibration.pointsPerUnit)
+            }
+            self.marks = marks
+            split = written.split
+            ink = written.ink
+        }
     }
 
     /// The page of the original a `redir` names, or `nil` where it names
@@ -445,13 +477,18 @@ public struct AnnotatedPDFRenderer: Sendable {
     /// at a time: the box and the placement inside it are the easiest things
     /// here to get wrong, and from `renderPDF` neither is reachable without a
     /// live source of documents.
+    ///
+    /// `inkSplit` and `masks` are `PageRenderer.draw`'s: the redraw writes a
+    /// page's ink apart and draws the rest here.
     static func drawPage(
         source: CGPDFPage?,
         marks: RMPage?,
         sheet size: CGSize,
         into context: CGContext,
         images: PageRenderer.PageImages = PageRenderer.PageImages(),
-        navigation: ((CGContext) -> Void)? = nil
+        navigation: ((CGContext) -> Void)? = nil,
+        inkSplit: Int? = nil,
+        masks: InkMaskLedger? = nil
     ) {
         let sheet = CGRect(origin: .zero, size: size)
         // The drawing happens in `.rm` units: the sheet becomes a page of the
@@ -497,7 +534,10 @@ public struct AnnotatedPDFRenderer: Sendable {
         if let marks {
             context.saveGState()
             context.scaleBy(x: Calibration.pointsPerUnit, y: Calibration.pointsPerUnit)
-            PageRenderer.draw(marks, in: context, pageSize: units, bounds: bounds, images: images, geometry: geometry)
+            PageRenderer.draw(
+                marks, in: context, pageSize: units, bounds: bounds, images: images, geometry: geometry,
+                inkSplit: inkSplit, masks: masks
+            )
             context.restoreGState()
         }
         navigation?(context)
@@ -759,19 +799,10 @@ public struct AnnotatedPDFRenderer: Sendable {
         if let built {
             content = built.content
         } else {
-            let data = NSMutableData()
-            var media = grown
-            guard let consumer = CGDataConsumer(data: data),
-                  let context = CGContext(consumer: consumer, mediaBox: &media, nil) else {
-                throw RenderError.pdfContextUnavailable
-            }
-            context.beginPDFPage(nil)
-            context.translateBy(x: drawingBox.minX, y: drawingBox.minY)
-            context.scaleBy(x: Calibration.pointsPerUnit, y: Calibration.pointsPerUnit)
-            PageRenderer.draw(marks, in: context, pageSize: units, bounds: bounds, images: images, geometry: geometry)
-            context.endPDFPage()
-            context.closePDF()
-            native = data as Data
+            native = try Self.nativeMarks(
+                marks, drawingBox: drawingBox, mediaBox: grown, units: units, bounds: bounds, geometry: geometry,
+                images: images
+            )
             content = Data("q /RMNative Do Q\n".utf8)
         }
         if rotated {
@@ -798,6 +829,53 @@ public struct AnnotatedPDFRenderer: Sendable {
             box: unchangedBox ? nil : grown,
             formPDF: native
         )
+    }
+
+    /// The marks of an overlay page as a PDF of one page, `mediaBox` its
+    /// box, drawn in the frame of `drawingBox` — what the overlay imports as
+    /// its native Form where its own operators cannot say what the marks
+    /// hold (typed text, pictures).
+    ///
+    /// CoreGraphics draws the text and the pictures, and the ink after the
+    /// last of them is written apart and appended (`InkStream`), as on a
+    /// page of a redraw or a notebook; `writesInk` off leaves it all to
+    /// CoreGraphics, the drawing the written ink is held against.
+    static func nativeMarks(
+        _ marks: RMPage,
+        drawingBox: CGRect,
+        mediaBox: CGRect,
+        units: CGSize,
+        bounds: CGRect,
+        geometry: TextGeometry?,
+        images: PageRenderer.PageImages,
+        writesInk: Bool = true
+    ) throws -> Data {
+        func place(_ context: CGContext) {
+            context.translateBy(x: drawingBox.minX, y: drawingBox.minY)
+            context.scaleBy(x: Calibration.pointsPerUnit, y: Calibration.pointsPerUnit)
+        }
+        let ink = writesInk
+            ? PageRenderer.writtenInk(of: marks, pageSize: units, geometry: geometry, place: place)
+            : (split: Int.max, ink: nil)
+        guard let data = CFDataCreateMutable(nil, 0) else { throw RenderError.pdfContextUnavailable }
+        let sink = PDFSink(data: data)
+        let update = InkUpdate()
+        var media = mediaBox
+        guard let consumer = sink.consumer(),
+              let context = CGContext(consumer: consumer, mediaBox: &media, nil) else {
+            throw RenderError.pdfContextUnavailable
+        }
+        context.beginPDFPage(nil)
+        place(context)
+        PageRenderer.draw(
+            marks, in: context, pageSize: units, bounds: bounds, images: images, geometry: geometry,
+            inkSplit: ink.split, masks: writesInk ? update.masks : nil
+        )
+        context.endPDFPage()
+        context.closePDF()
+        if let written = ink.ink { try update.append(written, page: 0) }
+        try update.finish(into: sink)
+        return data as Data
     }
 
     /// Where the marker went on every page, in the frame the flattened
