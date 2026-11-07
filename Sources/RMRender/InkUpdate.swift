@@ -175,6 +175,8 @@ struct PreparedInk: Sendable {
     let states: [String]
     /// Deflated already, as the writer made them.
     let masks: [InkStream.Mask]
+    /// The transparency groups the content paints (`InkStream.Group`).
+    let groups: [InkStream.Group]
     let usesColorSpace: Bool
 
     /// What `stream` wrote, or `nil` for a page with none.
@@ -183,7 +185,47 @@ struct PreparedInk: Sendable {
         content = ink.content
         states = ink.states
         masks = ink.masks
+        groups = ink.groups
         usesColorSpace = ink.usesColorSpace
+    }
+
+    /// The colour space a transparency group blends in, as CoreGraphics
+    /// writes a layer's: the Generic RGB profile — not sRGB, which the
+    /// colours are in. Named by its string: Swift does not offer the
+    /// constant, deprecated in favour of sRGB for drawing, though it is what
+    /// CoreGraphics' layers still blend in. Held against a layer CoreGraphics
+    /// wrote in the tests. Resolved once, the first time it is asked for;
+    /// where it is not to be had, no group is written
+    /// (`InkStream.groupsAvailable`).
+    static let groupProfile: Data? = CGColorSpace(name: "kCGColorSpaceGenericRGB" as CFString)?.copyICCData() as Data?
+
+    /// A group's Form dictionary, ahead of its deflated operators: its box,
+    /// the group — isolated, non-knockout, in the colour space `space` — and
+    /// the resources it names, `resource` giving the object of each by the
+    /// name the operators say it by.
+    static func groupDictionary(
+        _ group: InkStream.Group, length: Int, space: PDFObject, resource: (String) -> PDFObject
+    ) -> [String: PDFObject] {
+        var resources: [String: PDFObject] = [:]
+        if group.usesColorSpace {
+            resources["ColorSpace"] = .dictionary([InkStream.colorSpaceName: resource(InkStream.colorSpaceName)])
+        }
+        func names(_ prefix: String, _ indices: [Int]) -> PDFObject {
+            .dictionary(Dictionary(uniqueKeysWithValues: indices.map { ("\(prefix)\($0)", resource("\(prefix)\($0)")) }))
+        }
+        if !group.states.isEmpty { resources["ExtGState"] = names(InkStream.statePrefix, group.states) }
+        if !group.masks.isEmpty { resources["XObject"] = names(InkStream.maskPrefix, group.masks) }
+        return [
+            "Type": .name("XObject"), "Subtype": .name("Form"), "FormType": .integer(1),
+            // The text CoreGraphics prints, as it stands: `.string` is
+            // written as it is given.
+            "BBox": .array(group.box.map { .string(Data($0.utf8)) }),
+            "Group": .dictionary([
+                "S": .name("Transparency"), "CS": space, "I": .boolean(true), "K": .boolean(false),
+            ]),
+            "Resources": .dictionary(resources),
+            "Length": .integer(length), "Filter": .name("FlateDecode"),
+        ]
     }
 }
 
@@ -223,10 +265,23 @@ final class InkUpdate {
         let content: Int?
         let states: [Int]
         let masks: [Int]
+        /// The ink's transparency groups, by the index of their Forms
+        /// among the spooled objects.
+        let groups: [Int]
         let usesColorSpace: Bool
         /// The shared template the page starts with, by its index in
         /// `templates`.
         let template: Int?
+    }
+
+    /// A group's Form as it is spooled: its operators, and what its
+    /// dictionary is made of once the objects are numbered — the group
+    /// without its operators, its length, and the spooled object of each
+    /// resource it names, by the name.
+    private struct GroupForm {
+        let group: InkStream.Group
+        let length: Int
+        let objects: [String: Int]
     }
 
     private let spool = Spool()
@@ -234,6 +289,9 @@ final class InkUpdate {
     private var stateObjects: [String: Int] = [:]
     private var maskObjects: [SHA256.Digest: Int] = [:]
     private var usesColorSpace = false
+    /// The groups' Forms, by their index among the spooled objects: their
+    /// dictionaries name objects numbered only once the update is.
+    private var groupForms: [Int: GroupForm] = [:]
     /// The shared templates, in the order they were first drawn: the Form
     /// of each and the objects it names, numbered from nought.
     private var templates: [PDFOverlayWriter.PreparedPage.Native] = []
@@ -266,7 +324,10 @@ final class InkUpdate {
         guard let ink else {
             if let template {
                 pages.append(
-                    PageRecord(index: index, content: nil, states: [], masks: [], usesColorSpace: false, template: template)
+                    PageRecord(
+                        index: index, content: nil, states: [], masks: [], groups: [], usesColorSpace: false,
+                        template: template
+                    )
                 )
             }
             return
@@ -293,6 +354,22 @@ final class InkUpdate {
             maskObjects[mask.digest] = number
             return number
         }
+        // A group's operators alone: its dictionary is written around them
+        // when the update is (`finish`).
+        let groups = try ink.groups.map { group in
+            let number = try spool.add(group.content)
+            var objects: [String: Int] = [:]
+            for index in group.states { objects["\(InkStream.statePrefix)\(index)"] = states[index] }
+            for index in group.masks { objects["\(InkStream.maskPrefix)\(index)"] = masks[index] }
+            groupForms[number] = GroupForm(
+                group: InkStream.Group(
+                    content: [], box: group.box, states: group.states, masks: group.masks,
+                    usesColorSpace: group.usesColorSpace
+                ),
+                length: group.content.reduce(0) { $0 + $1.count }, objects: objects
+            )
+            return number
+        }
         let length = ink.content.reduce(0) { $0 + $1.count }
         let content = try spool.add(
             [Data("<< /Length \(length) /Filter /FlateDecode >>\nstream\n".utf8)] + ink.content
@@ -301,8 +378,8 @@ final class InkUpdate {
         usesColorSpace = usesColorSpace || ink.usesColorSpace
         pages.append(
             PageRecord(
-                index: index, content: content, states: states, masks: masks, usesColorSpace: ink.usesColorSpace,
-                template: template
+                index: index, content: content, states: states, masks: masks, groups: groups,
+                usesColorSpace: ink.usesColorSpace, template: template
             )
         )
     }
@@ -322,10 +399,17 @@ final class InkUpdate {
             throw PDFReadError.malformed("ink for a page CoreGraphics did not draw")
         }
         let start = max(base.highestObjectNumber + 1, base.trailer["Size"]?.intValue ?? 1)
+        var next = start + 2
+        func reserve(_ wanted: Bool) -> Int? {
+            guard wanted else { return nil }
+            next += 1
+            return next - 1
+        }
+        let profile = reserve(usesColorSpace), space = reserve(usesColorSpace)
+        let groupProfile = reserve(!groupForms.isEmpty), groupSpace = reserve(!groupForms.isEmpty)
         let numbers = Numbers(
-            open: start, close: start + 1,
-            profile: usesColorSpace ? start + 2 : nil, space: usesColorSpace ? start + 3 : nil,
-            first: usesColorSpace ? start + 4 : start + 2
+            open: start, close: start + 1, profile: profile, space: space, groupProfile: groupProfile,
+            groupSpace: groupSpace, first: next
         )
         var offsets: [Int: Int] = [:]
         var generations: [Int: Int] = [:]
@@ -360,15 +444,43 @@ final class InkUpdate {
             sink.write("[ /ICCBased \(profile) 0 R ]")
             end()
         }
+        if let profile = numbers.groupProfile, let space = numbers.groupSpace {
+            // The profile CoreGraphics' transparency layers blend in.
+            guard let icc = PreparedInk.groupProfile else { throw RenderError.pdfContextUnavailable }
+            let deflated = PDFWriter.flate(icc)
+            begin(profile)
+            sink.write("<< /N 3 /Alternate /DeviceRGB /Length \(deflated.count) /Filter /FlateDecode >>\nstream\n")
+            sink.write(deflated)
+            sink.write("\nendstream")
+            end()
+            begin(space)
+            sink.write("[ /ICCBased \(profile) 0 R ]")
+            end()
+        }
         try spool.copy { index, body in
             begin(numbers.first + index)
-            sink.write(body)
+            if let form = groupForms[index], let space = numbers.groupSpace {
+                let dictionary = PreparedInk.groupDictionary(
+                    form.group, length: form.length, space: .reference(number: space, generation: 0)
+                ) { name in
+                    if name == InkStream.colorSpaceName, let colors = numbers.space {
+                        return .reference(number: colors, generation: 0)
+                    }
+                    return form.objects[name].map { .reference(number: numbers.first + $0, generation: 0) } ?? .null
+                }
+                sink.write(PDFWriter.bytes(of: .dictionary(dictionary)))
+                sink.write("\nstream\n")
+                sink.write(body)
+                sink.write("\nendstream")
+            } else {
+                sink.write(body)
+            }
             end()
             if index.isMultiple(of: 64) { try sink.flush() }
         }
         // The shared templates after the spooled objects: each one's objects,
         // its Form, and the stream that draws it, `/RMIt Do`.
-        var next = numbers.first + spool.count
+        next = numbers.first + spool.count
         var invocations: [(form: Int, stream: Int)] = []
         for template in templates {
             let renumbering = template.objects.indices.map { next + $0 }
@@ -417,13 +529,17 @@ final class InkUpdate {
     }
 
     /// The numbers of the update's own objects: the wrapper's two streams,
-    /// the colour space and its profile where any ink is coloured, and the
-    /// first of the spooled objects, which follow one another from it.
+    /// the colour space and its profile where any ink is coloured, the space
+    /// transparency groups blend in and its profile where any ink has a
+    /// group, and the first of the spooled objects, which follow one another
+    /// from it.
     private struct Numbers {
         let open: Int
         let close: Int
         let profile: Int?
         let space: Int?
+        let groupProfile: Int?
+        let groupSpace: Int?
         let first: Int
     }
 
@@ -461,6 +577,7 @@ final class InkUpdate {
         try add(
             "XObject",
             record.masks.enumerated().map { ("\(InkStream.maskPrefix)\($0.offset)", first + $0.element) }
+                + record.groups.enumerated().map { ("\(InkStream.groupPrefix)\($0.offset)", first + $0.element) }
                 + (template.map { [(Self.templateName, $0.form)] } ?? [])
         )
         dictionary["Resources"] = .dictionary(resources)

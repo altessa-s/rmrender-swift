@@ -318,7 +318,9 @@ public enum PageRenderer {
                 let bounds = contentBounds(of: page, pageSize: pageSize, edge: .ribbon, geometry: geometry)
                 let sheet = grownSheet(from: bounds, floor: paperSize, scale: scale)
                 let placement = placement(of: bounds, on: sheet, scale: scale)
-                let ink = writtenInk(of: page, pageSize: pageSize, geometry: geometry) { $0.concatenate(placement) }
+                let ink = writtenInk(
+                    of: page, pageSize: pageSize, geometry: geometry, box: CGRect(origin: .zero, size: sheet)
+                ) { $0.concatenate(placement) }
                 return Prepared(
                     page: page, bounds: bounds, sheet: sheet, split: ink.split, highlights: ink.highlights, ink: ink.ink
                 )
@@ -566,18 +568,24 @@ public enum PageRenderer {
     /// nothing, and ink of their own would put the page into the update
     /// (`InkUpdate`) for them alone — a redrawn book of highlights came out
     /// 7% larger and no faster.
+    ///
+    /// `box` is the media box of the page CoreGraphics draws the rest on:
+    /// the box a transparency layer is clipped to. Where it is given, the
+    /// layers are written with the ink (`InkStream.beginGroup`); where it is
+    /// not, they are CoreGraphics', and the ink begins after the last of
+    /// them.
     static func writtenInk(
         of page: RMPage, pageSize: CGSize, geometry: TextGeometry?, highlightsAlone: Bool = false,
-        place: (CGContext) -> Void
+        box: CGRect? = nil, place: (CGContext) -> Void
     ) -> (split: Int, highlights: Bool, ink: PreparedInk?) {
         let placed = strokes(of: page, geometry: geometry)
         let pictures = images(of: page, geometry: geometry)
-        let split = inkSplit(of: placed, images: pictures)
+        let split = inkSplit(of: placed, images: pictures, groups: InkStream.layerBox(box) != nil)
         let highlights = (highlightsAlone || split < placed.count)
             && writesHighlights(of: page, split: split, images: pictures)
         guard split < placed.count || highlights,
               let transform = contextTransform(place),
-              let stream = InkStream(transform: transform)
+              let stream = InkStream(transform: transform, box: box)
         else { return (placed.count, false, nil) }
         if highlights { writeHighlights(of: page, into: stream, pageSize: pageSize) }
         writeInk(page, into: stream, pageSize: pageSize, geometry: geometry, from: split)
@@ -898,18 +906,24 @@ public enum PageRenderer {
 
     /// Where a page's ink can be written apart from CoreGraphics' drawing:
     /// the position of the first stroke after the last thing only
-    /// CoreGraphics draws — a picture, or a stroke in a shared layer. The
+    /// CoreGraphics draws — a picture, or, where the writer takes no
+    /// transparency layer (`groups` off), a stroke in a shared layer. The
     /// strokes from there on come after everything else on the page, so
     /// they can be written after it (`writeInk`) and the page paints the
     /// same. The page's count when nothing can be.
-    static func inkSplit(of placed: [Stroke], images placedImages: [PageImage]) -> Int {
+    ///
+    /// A picture closes the shared layer open before it (`draw`), so the
+    /// strokes after it start no layer CoreGraphics began.
+    static func inkSplit(of placed: [Stroke], images placedImages: [PageImage], groups: Bool = false) -> Int {
         var split = 0
         for image in placedImages {
             // Drawn before the stroke at `strokesBefore`, or after them all.
             split = max(split, min(max(image.strokesBefore, 0), placed.count))
         }
-        for (position, stroke) in placed.enumerated() where sharedLayerKey(of: stroke) != nil {
-            split = max(split, position + 1)
+        if !groups {
+            for (position, stroke) in placed.enumerated() where sharedLayerKey(of: stroke) != nil {
+                split = max(split, position + 1)
+            }
         }
         return split
     }
@@ -928,10 +942,20 @@ public enum PageRenderer {
         let placed = strokes(of: page, geometry: geometry)
         guard split < placed.count else { return }
         let erasers = erasers(of: placed, pageSize: pageSize)
+        // The shared layers as `draw` opens and closes them, written as the
+        // transparency groups CoreGraphics makes of them.
+        var sharedLayer: SceneItemID?
         for (position, stroke) in placed.enumerated().dropFirst(split) {
-            paint(of: stroke, at: position, pageSize: pageSize, erasers: erasers, inSharedLayer: false)?
+            let layer = stream.takesGroups ? sharedLayerKey(of: stroke) : nil
+            if layer != sharedLayer {
+                if sharedLayer != nil { stream.endGroup() }
+                if layer != nil { stream.beginGroup(alpha: stroke.alpha, darkens: true) }
+                sharedLayer = layer
+            }
+            paint(of: stroke, at: position, pageSize: pageSize, erasers: erasers, inSharedLayer: layer != nil)?
                 .write(into: stream)
         }
+        if sharedLayer != nil { stream.endGroup() }
     }
 
     /// Which shared layer a stroke goes into, or `nil` when it is drawn on its
@@ -1085,9 +1109,12 @@ public enum PageRenderer {
         }
 
         /// The stroke written in CoreGraphics' place, painting what `draw`
-        /// paints. Never inside a shared layer: a layer is CoreGraphics'
-        /// (`inkSplit(of:images:)`).
+        /// paints. Inside a shared layer — a group the writer has open
+        /// (`InkStream.beginGroup`) — opaque and unblended, as `draw` leaves
+        /// it there.
         func write(into stream: InkStream) {
+            let alpha = inSharedLayer ? 1 : alpha
+            let darkens = inSharedLayer ? false : darkens
             switch shape {
             case .fill(let path):
                 stream.fill(path, red: red, green: green, blue: blue, alpha: alpha, darkens: darkens)

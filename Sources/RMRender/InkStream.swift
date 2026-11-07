@@ -15,8 +15,9 @@ import Foundation
 /// another. Ink — the fills, lines and pencil grain of `PageRenderer.drawStroke`
 /// — is simple enough to write ourselves, so it is written here, on whichever
 /// task prepares the page — with the highlights' bands, where nothing
-/// CoreGraphics draws comes after them — and CoreGraphics keeps the rest:
-/// templates, text, pictures, layers.
+/// CoreGraphics draws comes after them, and with the transparency layers
+/// the pieces of an erased shader stroke are drawn in — and CoreGraphics
+/// keeps the rest: templates, text, pictures.
 ///
 /// What CoreGraphics does with the same calls, operator for operator, so
 /// that the page paints what it would have painted, to the pixel:
@@ -35,6 +36,9 @@ import Foundation
 ///   for a fill and `/CA` for a line, the blend mode to `/BM`.
 /// - A highlight's band is a rectangle, `re`, mapped as `CGRect.applying`
 ///   maps it, filled at full alpha with `/BM /Multiply`.
+/// - A transparency layer — the pieces an eraser left of one shader stroke
+///   (`PageRenderer.sharedLayerKey`) — is a Form of its own, a group as
+///   CoreGraphics writes one (`beginGroup`).
 /// - Every number goes through `QuartzNumber`, CoreGraphics' own printing:
 ///   a coordinate or a colour as it prints those, an alpha as it prints that
 ///   into a graphics state — to four places.
@@ -65,16 +69,36 @@ final class InkStream {
         let deflated: [Data]
     }
 
+    /// A transparency group the content paints, `/RMIf<i>`: a Form of its
+    /// own, its operators deflated, and the resources of the page's ink it
+    /// names — by their indices in `Ink`, under the names the page gives
+    /// them.
+    struct Group: Sendable {
+        /// Deflated, in pieces (`StreamingFlate`).
+        let content: [Data]
+        /// The Form's box, as CoreGraphics prints it: the lower left corner,
+        /// then the upper right (`beginGroup`).
+        let box: [String]
+        /// The graphics states it names, by index, in order.
+        let states: [Int]
+        /// The masks it names, by index, in order.
+        let masks: [Int]
+        let usesColorSpace: Bool
+    }
+
     /// What a page's ink comes to: its operators, deflated, and the
     /// resources they name, by index — `/RMIg<i>` is `states[i]`,
-    /// `/RMIx<i>` is `masks[i]`, `/RMIc` the sRGB colour space when
-    /// `usesColorSpace`.
+    /// `/RMIx<i>` is `masks[i]`, `/RMIf<i>` is `groups[i]`, `/RMIc` the sRGB
+    /// colour space when `usesColorSpace`. A group's own operators name
+    /// states, masks and the colour space the same way; every group blends
+    /// in the Generic RGB space (`InkUpdate`).
     struct Ink: Sendable {
         /// Deflated, in pieces (`StreamingFlate`).
         let content: [Data]
         /// The entries of each graphics state, `/ca 0.5` and the like.
         let states: [String]
         let masks: [Mask]
+        let groups: [Group]
         let usesColorSpace: Bool
     }
 
@@ -84,18 +108,27 @@ final class InkStream {
     static let colorSpaceName = "RMIc"
     static let statePrefix = "RMIg"
     static let maskPrefix = "RMIx"
+    static let groupPrefix = "RMIf"
 
     private let transform: CGAffineTransform
     private let inverse: CGAffineTransform
-    /// The operators not yet handed to `deflated`, a few kilobytes at most.
+    /// The page's box, which a transparency layer is clipped to; `nil`
+    /// where it is not known, and then the writer takes no layer.
+    private let box: CGRect?
+    /// The operators not yet handed to `deflated`, a few kilobytes at most:
+    /// the page's, or the open group's.
     private var content: [UInt8] = []
-    private let deflated = StreamingFlate()
+    private var deflated = StreamingFlate()
     private var written = 0
     private var states: [String] = []
     private var stateIndex: [String: Int] = [:]
     private var masks: [Mask] = []
     private var maskIndex: [SHA256.Digest: Int] = [:]
+    private var groups: [Group] = []
     private var usesColorSpace = false
+    /// Set where a group's operators could not be deflated: the ink is then
+    /// not to be had at all.
+    private var failed = false
 
     /// The graphics state in effect outside `q`/`Q`, from PDF's initial one:
     /// the page's own drawing is wrapped apart, so the ink starts there.
@@ -109,11 +142,16 @@ final class InkStream {
     private var lineJoin: Int32 = 0
     private var miterLimit = 10.0
 
+    /// The transparency group being written, while one is open.
+    private var group: OpenGroup?
+
     /// A writer for ink drawn under `transform`, the context's transform at
-    /// the moment the ink would have been drawn — or `nil` where that is a
-    /// transform this writer does not take: anything with a turn or a skew,
-    /// or one that is not invertible.
-    init?(transform: CGAffineTransform) {
+    /// the moment the ink would have been drawn, on a page of `box` — or
+    /// `nil` where that is a transform this writer does not take: anything
+    /// with a turn or a skew, or one that is not invertible. Without a box,
+    /// or with one that is not finite, it takes no transparency layer
+    /// (`takesGroups`).
+    init?(transform: CGAffineTransform, box: CGRect? = nil) {
         let parts = [transform.a, transform.d, transform.tx, transform.ty]
         guard transform.b == 0, transform.c == 0, transform.a != 0, transform.d != 0,
               parts.allSatisfy(\.isFinite)
@@ -121,17 +159,45 @@ final class InkStream {
         self.transform = transform
         inverse = transform.inverted()
         guard [inverse.a, inverse.d, inverse.tx, inverse.ty].allSatisfy(\.isFinite) else { return nil }
+        self.box = Self.layerBox(box)
     }
 
-    /// Whether nothing has been written.
-    var isEmpty: Bool { written == 0 && content.isEmpty }
+    /// `box` where a layer can be clipped to it: given, and finite — and
+    /// where a group can be written at all (`groupsAvailable`).
+    static func layerBox(_ box: CGRect?) -> CGRect? {
+        guard groupsAvailable, let box, !box.isNull,
+              [box.minX, box.minY, box.width, box.height].allSatisfy(\.isFinite)
+        else { return nil }
+        return box
+    }
+
+    /// Whether transparency groups can be written: whether the profile they
+    /// blend in is to be had (`PreparedInk.groupProfile`, resolved once a
+    /// process). Where it is not, no writer takes a layer, on any route, and
+    /// the layers are CoreGraphics' as they always were: the page comes out
+    /// the same, more slowly.
+    static var groupsAvailable: Bool { !groupProfileWithheld && PreparedInk.groupProfile != nil }
+
+    /// Set by a test, for the work it does inside `withValue`, to stand for
+    /// a system on which the group profile does not resolve.
+    @TaskLocal static var groupProfileWithheld = false
+
+    /// Whether nothing has been written: a group that could not be
+    /// deflated was.
+    var isEmpty: Bool { written == 0 && content.isEmpty && group == nil && !failed }
+
+    /// Whether the writer writes transparency layers (`beginGroup`): where
+    /// it knows the box of the page they are clipped to.
+    var takesGroups: Bool { box != nil }
 
     /// What has been written, once nothing more is to be: `nil` where
-    /// nothing was, or where it could not be deflated.
+    /// nothing was, or where it could not be deflated. A group still open
+    /// is closed first.
     func finish() -> Ink? {
+        if group != nil { endGroup() }
         flush()
-        guard written > 0, let operators = deflated.finish() else { return nil }
-        return Ink(content: operators, states: states, masks: masks, usesColorSpace: usesColorSpace)
+        guard !failed, written > 0, let operators = deflated.finish() else { return nil }
+        return Ink(content: operators, states: states, masks: masks, groups: groups, usesColorSpace: usesColorSpace)
     }
 
     /// The operators made so far handed to the deflater.
@@ -151,6 +217,7 @@ final class InkStream {
         setState(fill: alpha, stroke: strokeAlpha, blend: darkens ? .darken : .normal)
         devicePath(path)
         put("f\n")
+        if group != nil { addMember(deviceCopy(of: path).boundingBoxOfPath) }
     }
 
     /// The polyline through `points`, stroked: what `move`, `addLine` and
@@ -183,6 +250,16 @@ final class InkStream {
             put(index == 0 ? "m\n" : "l\n")
         }
         put("S\nQ\n")
+        if group != nil {
+            // What CoreGraphics records of a line in a layer: the line's
+            // bounds in device space, grown on every side by its width — by
+            // half the miter limit of it where the joins are mitred and that
+            // is more.
+            let line = CGMutablePath()
+            line.addLines(between: points.map { Self.map(transform, $0) })
+            let grow = width * (join == .miter ? max(miterLimit / 2, 1) : 1) * Double(transform.a)
+            addMember(line.boundingBoxOfPath.insetBy(dx: -grow, dy: -grow))
+        }
     }
 
     /// `mask` painted in an opaque colour at `alpha` through the clip of
@@ -220,14 +297,24 @@ final class InkStream {
         let t = transform
         let x = Double(rectangle.minX), y = Double(rectangle.minY)
         let width = Double(rectangle.width), height = Double(rectangle.height)
+        let matrix = [
+            (Double(t.c) * 0).addingProduct(Double(t.a), width),
+            (Double(t.d) * 0).addingProduct(Double(t.b), width),
+            (Double(t.c) * height).addingProduct(Double(t.a), 0),
+            (Double(t.d) * height).addingProduct(Double(t.b), 0),
+            Double(t.tx).addingProduct(Double(t.a), x).addingProduct(Double(t.c), y),
+            Double(t.ty).addingProduct(Double(t.b), x).addingProduct(Double(t.d), y),
+        ]
         put("q ")
-        number((Double(t.c) * 0).addingProduct(Double(t.a), width))
-        number((Double(t.d) * 0).addingProduct(Double(t.b), width))
-        number((Double(t.c) * height).addingProduct(Double(t.a), 0))
-        number((Double(t.d) * height).addingProduct(Double(t.b), 0))
-        number(Double(t.tx).addingProduct(Double(t.a), x).addingProduct(Double(t.c), y))
-        number(Double(t.ty).addingProduct(Double(t.b), x).addingProduct(Double(t.d), y))
+        for value in matrix { number(value) }
         put("cm\n/\(name) Do\nQ\nQ\n")
+        if group != nil {
+            // What CoreGraphics records of a mask in a layer: the image's
+            // rectangle in device space, within the bounds of the clip's
+            // points — its control points, not the curve's.
+            let image = CGRect(x: matrix[4], y: matrix[5], width: matrix[0], height: matrix[3]).standardized
+            addMember(image.intersection(deviceCopy(of: clip).boundingBox))
+        }
     }
 
     /// A band of a text highlight: `rectangle` filled in an opaque colour,
@@ -247,6 +334,134 @@ final class InkStream {
         put("re f\n")
     }
 
+    // MARK: - Groups
+
+    /// The page's writing set aside while a group is written in its place,
+    /// and what the group has come to so far.
+    private struct OpenGroup {
+        let content: [UInt8]
+        let deflated: StreamingFlate
+        let written: Int
+        let tracked: Tracked
+        let alpha: Double
+        let darkens: Bool
+        /// The union of what CoreGraphics records of each member.
+        var box = CGRect.null
+        var states: Set<Int> = []
+        var masks: Set<Int> = []
+        var usesColorSpace = false
+    }
+
+    /// A transparency layer opened as `PageRenderer.draw` opens one — the
+    /// blend and the alpha given, `beginTransparencyLayer` — and
+    /// written as CoreGraphics writes it: what is drawn until `endGroup`
+    /// goes into a Form of its own, an isolated, non-knockout group blending
+    /// in Generic RGB, clipped inside to the page's box — not its crop box —
+    /// and drawn there as on the page, its alpha and blend mode starting
+    /// from their initial values; `endGroup` paints it. Nothing where the
+    /// writer takes no layer (`takesGroups`).
+    func beginGroup(alpha: Double, darkens: Bool) {
+        guard let box else { return }
+        if group != nil { endGroup() }
+        group = OpenGroup(
+            content: content, deflated: deflated, written: written, tracked: tracked, alpha: alpha, darkens: darkens
+        )
+        content = []
+        deflated = StreamingFlate()
+        written = 0
+        // A group starts from the state where it is painted, less its alpha
+        // and blend mode: the rest is set again, as CoreGraphics sets it.
+        tracked = Tracked(
+            fillColor: nil, strokeColor: nil, fillAlpha: 1, strokeAlpha: 1, blend: .normal,
+            lineWidth: .nan, lineCap: -1, lineJoin: -1, miterLimit: .nan
+        )
+        put("q\n")
+        number(Double(box.minX))
+        number(Double(box.minY))
+        number(Double(box.width))
+        number(Double(box.height))
+        put("re\nW n\n")
+    }
+
+    /// The open group closed and painted, as `endTransparencyLayer` paints
+    /// a layer: the Form inside `q`/`Q` under the layer's alpha and blend
+    /// mode, which end at its `Q` — left set after it, CoreGraphics'
+    /// renderer takes a later `ca 1` for set already, and paints the opaque
+    /// ink after the group at the group's alpha.
+    ///
+    /// Its box is the union of what CoreGraphics records of each member
+    /// (`fill`, `stroke`, `mask`), printed as CoreGraphics prints it; a group
+    /// whose box misses the page's — off the page, or erased away — is not
+    /// written at all, as CoreGraphics writes no such layer.
+    func endGroup() {
+        guard let open = group else { return }
+        put("Q\n")
+        flush()
+        let operators = deflated.finish()
+        content = open.content
+        deflated = open.deflated
+        written = open.written
+        tracked = open.tracked
+        group = nil
+        guard let operators else {
+            failed = true
+            return
+        }
+        guard let box, open.box.intersects(box) else { return }
+        let index = groups.count
+        groups.append(Group(
+            content: operators,
+            box: [open.box.minX, open.box.minY, open.box.maxX, open.box.maxY].map { QuartzNumber.text(Double($0)) },
+            states: open.states.sorted(), masks: open.masks.sorted(), usesColorSpace: open.usesColorSpace
+        ))
+        put("q\n")
+        let outside = (fillAlpha, blend)
+        setState(fill: open.alpha, stroke: strokeAlpha, blend: open.darkens ? .darken : .normal)
+        fillAlpha = outside.0
+        blend = outside.1
+        put("/\(Self.groupPrefix)\(index) Do\nQ\n")
+    }
+
+    /// A member's rectangle added to the open group's box.
+    private func addMember(_ rectangle: CGRect) {
+        guard let box = group?.box else { return }
+        group?.box = box.union(rectangle)
+    }
+
+    /// The graphics state tracked outside `q`/`Q`, as one value: set aside
+    /// while a group is written.
+    private struct Tracked {
+        let fillColor: (Double, Double, Double)?
+        let strokeColor: (Double, Double, Double)?
+        let fillAlpha: Double
+        let strokeAlpha: Double
+        let blend: Blend
+        let lineWidth: Double
+        let lineCap: Int32
+        let lineJoin: Int32
+        let miterLimit: Double
+    }
+
+    private var tracked: Tracked {
+        get {
+            Tracked(
+                fillColor: fillColor, strokeColor: strokeColor, fillAlpha: fillAlpha, strokeAlpha: strokeAlpha,
+                blend: blend, lineWidth: lineWidth, lineCap: lineCap, lineJoin: lineJoin, miterLimit: miterLimit
+            )
+        }
+        set {
+            fillColor = newValue.fillColor
+            strokeColor = newValue.strokeColor
+            fillAlpha = newValue.fillAlpha
+            strokeAlpha = newValue.strokeAlpha
+            blend = newValue.blend
+            lineWidth = newValue.lineWidth
+            lineCap = newValue.lineCap
+            lineJoin = newValue.lineJoin
+            miterLimit = newValue.miterLimit
+        }
+    }
+
     // MARK: - State
 
     /// The blend modes the ink is painted with, as a graphics state names
@@ -260,6 +475,7 @@ final class InkStream {
     private func setFillColor(_ red: Double, _ green: Double, _ blue: Double) {
         if let fillColor, fillColor == (red, green, blue) { return }
         usesColorSpace = true
+        group?.usesColorSpace = true
         put("/\(Self.colorSpaceName) cs ")
         number(red)
         number(green)
@@ -271,6 +487,7 @@ final class InkStream {
     private func setStrokeColor(_ red: Double, _ green: Double, _ blue: Double) {
         if let strokeColor, strokeColor == (red, green, blue) { return }
         usesColorSpace = true
+        group?.usesColorSpace = true
         put("/\(Self.colorSpaceName) CS ")
         number(red)
         number(green)
@@ -305,6 +522,7 @@ final class InkStream {
             states.append(entries)
             stateIndex[entries] = index
         }
+        group?.states.insert(index)
         put("/\(Self.statePrefix)\(index) gs\n")
     }
 
@@ -345,6 +563,7 @@ final class InkStream {
             masks.append(Mask(digest: digest, width: bits.width, height: bits.height, deflated: deflated))
             maskIndex[digest] = index
         }
+        group?.masks.insert(index)
         return "\(Self.maskPrefix)\(index)"
     }
 
@@ -357,6 +576,34 @@ final class InkStream {
             x: (Double(t.c) * y).addingProduct(Double(t.a), x) + Double(t.tx),
             y: (Double(t.d) * y).addingProduct(Double(t.b), x) + Double(t.ty)
         )
+    }
+
+    /// `path`, a user-space path, in device space as CoreGraphics keeps it:
+    /// a quadratic segment as it is.
+    private func deviceCopy(of path: CGPath) -> CGPath {
+        let device = CGMutablePath()
+        path.applyWithBlock { pointer in
+            let element = pointer.pointee
+            let points = element.points
+            switch element.type {
+            case .moveToPoint:
+                device.move(to: Self.map(transform, points[0]))
+            case .addLineToPoint:
+                device.addLine(to: Self.map(transform, points[0]))
+            case .addQuadCurveToPoint:
+                device.addQuadCurve(to: Self.map(transform, points[1]), control: Self.map(transform, points[0]))
+            case .addCurveToPoint:
+                device.addCurve(
+                    to: Self.map(transform, points[2]), control1: Self.map(transform, points[0]),
+                    control2: Self.map(transform, points[1])
+                )
+            case .closeSubpath:
+                device.closeSubpath()
+            @unknown default:
+                break
+            }
+        }
+        return device
     }
 
     /// `path`, a user-space path, written in device space.

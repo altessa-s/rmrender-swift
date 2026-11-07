@@ -472,11 +472,15 @@ public struct AnnotatedPDFRenderer: Sendable {
         let ink: PreparedInk?
 
         /// The marks on a sheet of `size`, under the transform `drawPage`
-        /// draws them under.
+        /// draws them under, on the page of the box it gives them.
         init(_ marks: RMPage, sheet size: CGSize) {
             let units = AnnotationGeometry.units(of: size)
             let geometry = marks.text.map { TextGeometry($0, pageSize: units) }
-            let written = PageRenderer.writtenInk(of: marks, pageSize: units, geometry: geometry) {
+            let bounds = PageRenderer.contentBounds(
+                of: marks, pageSize: units, edge: AnnotatedPDFRenderer.markEdge, geometry: geometry
+            )
+            let box = AnnotationGeometry.box(bounds, on: CGRect(origin: .zero, size: size))
+            let written = PageRenderer.writtenInk(of: marks, pageSize: units, geometry: geometry, box: box) {
                 $0.scaleBy(x: Calibration.pointsPerUnit, y: Calibration.pointsPerUnit)
             }
             self.marks = marks
@@ -1054,7 +1058,9 @@ public struct AnnotatedPDFRenderer: Sendable {
     ) throws -> NativeShares {
         let place = nativePlacement(drawingBox)
         let written = writesInk
-            ? PageRenderer.writtenInk(of: marks, pageSize: units, geometry: geometry, highlightsAlone: true, place: place)
+            ? PageRenderer.writtenInk(
+                of: marks, pageSize: units, geometry: geometry, highlightsAlone: true, box: mediaBox, place: place
+            )
             : (split: Int.max, highlights: false, ink: nil)
         func draw(_ context: CGContext, masks: InkMaskLedger?) {
             place(context)

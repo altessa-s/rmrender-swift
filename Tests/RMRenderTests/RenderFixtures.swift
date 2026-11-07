@@ -223,6 +223,56 @@ func highlightBlock(rectangles: [HighlightRect], color: UInt32, argb: UInt32? = 
     return block.bytes
 }
 
+/// A piece of a shader stroke the eraser cut, as a `0x05` block to append to
+/// a page: on the root layer, after the item `left`, its colour written out
+/// in full and its source (`tag 9`) after it — what tells the pieces of one
+/// stroke, drawn in one transparency layer, from strokes that merely cross.
+func shaderPieceBlock(
+    points: [StrokeSample], argb: UInt32, item: UInt64, left: UInt64, source: UInt64
+) -> [UInt8] {
+    var pointBytes = FixtureWriter()
+    for point in points {
+        pointBytes.append(float: point.x)
+        pointBytes.append(float: point.y)
+        pointBytes.append(uint16: point.speed)
+        pointBytes.append(uint16: point.width)
+        pointBytes.append(point.direction)
+        pointBytes.append(point.pressure)
+    }
+    var value = FixtureWriter()
+    value.append(0x03)                                    // value type: stroke
+    value.appendTag(index: 1, type: 0x4)
+    value.append(uint32: UInt32(PenTool.shader.rawValue))
+    value.appendTag(index: 2, type: 0x4)
+    value.append(uint32: UInt32(PenColor.highlight.rawValue))
+    value.appendTag(index: 3, type: 0x8)
+    value.append(double: 1)
+    value.appendTag(index: 4, type: 0x4)
+    value.append(float: 0)
+    value.appendBlock(index: 5, pointBytes.bytes)
+    value.appendID(index: 6, (author: 0, counter: 0))     // timestamp
+    value.appendID(index: 7, (author: 0, counter: 0))     // move
+    value.appendTag(index: 8, type: 0x4)
+    value.append(uint32: argb)
+    value.appendID(index: 9, (author: 2, counter: source))
+    var payload = FixtureWriter()
+    payload.appendID(index: 1, (author: 0, counter: 11))  // parent: the root layer
+    payload.appendID(index: 2, (author: 2, counter: item))
+    payload.appendID(index: 3, (author: left == 0 ? 0 : 2, counter: left))
+    payload.appendID(index: 4, (author: 0, counter: 0))   // right
+    payload.appendTag(index: 5, type: 0x4)
+    payload.append(uint32: 0)                             // deleted length
+    payload.appendBlock(index: 6, value.bytes)
+    var block = FixtureWriter()
+    block.append(uint32: UInt32(payload.bytes.count))
+    block.append(0)                                       // reserved zero
+    block.append(2)                                       // min_version
+    block.append(2)                                       // current_version
+    block.append(0x05)                                    // SceneLineItem
+    block.append(contentsOf: payload.bytes)
+    return block.bytes
+}
+
 /// One sample of a stroke as the file carries it.
 ///
 /// The tablet stores no curves at all: it samples the pen fast enough that the

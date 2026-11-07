@@ -57,6 +57,10 @@ struct InkForm: Sendable {
     static let deflatedProfile: Data? = (CGColorSpace(name: CGColorSpace.sRGB)?.copyICCData() as Data?)
         .map(PDFWriter.flate)
 
+    /// The profile the ink's transparency groups blend in, deflated, the
+    /// same way (`PreparedInk.groupProfile`).
+    static let deflatedGroupProfile: Data? = PreparedInk.groupProfile.map(PDFWriter.flate)
+
     /// The content stream an overlay draws its native Forms with: CoreGraphics'
     /// share where there is one, then the ink where there is any.
     static func content(native: Bool, ink: Bool) -> Data {
