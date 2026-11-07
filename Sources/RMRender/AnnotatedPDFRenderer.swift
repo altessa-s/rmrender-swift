@@ -149,6 +149,15 @@ public struct AnnotatedPDFRenderer: Sendable {
     /// makes the whole document impossible — the original missing or not
     /// opening, the output not writable — still throws, and so does a
     /// cancelled render.
+    ///
+    /// That is `.blank` of `unfetchedPages`. By default (`.placeholder`)
+    /// such a page goes out as the original's page with "Rendering error"
+    /// over the middle of it — written into the overlay as a native Form
+    /// where the overlay is taken, drawn onto the page where the document is
+    /// redrawn — and a page added on the tablet as a plain sheet with the
+    /// same label; `onUnfetched` is told either way. `.strict` fails the
+    /// render with `PageFetchError`, naming the page, and leaves no output.
+    /// Marks that arrived and would not parse go out as they always did.
     public func renderPDF(
         documentID: String,
         index: DocumentFiles,
@@ -162,6 +171,7 @@ public struct AnnotatedPDFRenderer: Sendable {
         refuseCertified: Bool = false,
         author: String? = nil,
         maximumPages: Int? = nil,
+        unfetchedPages: UnfetchedPagePolicy = .placeholder,
         onProgress: @escaping @Sendable (_ completed: Int64, _ total: Int64) -> Void = { _, _ in },
         // Second, after `onProgress`, and of two numbers: see
         // `NotebookRenderer.renderPDF`. A trailing closure still finds
@@ -240,7 +250,7 @@ public struct AnnotatedPDFRenderer: Sendable {
             owner: documentID,
             onUnsupported: onUnsupported,
             onUnreadable: onUnreadable,
-            losesUnfetchedPages: true,
+            unfetchedPages: unfetchedPages,
             keep: MarkSummary.init
         )
         let total = originalBytes + Int64(pages.count)
@@ -266,8 +276,14 @@ public struct AnnotatedPDFRenderer: Sendable {
         // drawing — a cache emptied in between, a connection dropped.
         let missed = PageLedger()
         let marks: @Sendable (Int) async throws -> RMPage? = { [self] position in
-            try await self.marks(of: pages[position], at: position, owner: documentID, missed: missed)
+            try await self.marks(
+                of: pages[position], at: position, owner: documentID, missed: missed, unfetchedPages: unfetchedPages
+            )
         }
+        // The pages drawn with the label: those whose marks did not arrive
+        // for the measuring, and — found as the drawing comes to them —
+        // those whose marks did not arrive for the drawing.
+        let placeholders = unfetchedPages == .placeholder ? unfetched : []
         do {
             try await RenderWork.detachedWaiting {
                 // The cheap way first: append the marks to the original
@@ -277,6 +293,7 @@ public struct AnnotatedPDFRenderer: Sendable {
                 // that are already there.
                 if allowOverlay, try await overlay(
                     order: order, pages: pages, original: source, certified: certified, images: images,
+                    placeholders: placeholders, missedArePlaceholders: unfetchedPages == .placeholder,
                     to: output, marks: marks
                 ) {
                     onProgress(total, total)
@@ -298,7 +315,9 @@ public struct AnnotatedPDFRenderer: Sendable {
                 // what the document that goes out lacks.
                 missed.clear()
                 try await Self.redraw(
-                    pages, original: source, images: images, author: author, to: output, marks: marks
+                    pages, original: source, images: images, author: author,
+                    placeholders: placeholders, missedArePlaceholders: unfetchedPages == .placeholder,
+                    to: output, marks: marks
                 ) { done in
                     onProgress(originalBytes + Int64(done), total)
                 }
@@ -316,7 +335,8 @@ public struct AnnotatedPDFRenderer: Sendable {
             RMRenderLog.pageError(
                 """
                 annotated: \(documentID) carries marks on \(lost.count) pages \
-                whose bytes did not arrive — the pages go out without them
+                whose bytes did not arrive — the pages go out without them\
+                \(unfetchedPages == .placeholder ? ", labelled" : "")
                 """
             )
             onUnfetched(lost.count)
@@ -356,11 +376,17 @@ public struct AnnotatedPDFRenderer: Sendable {
     /// asked of `marks` when the page comes up — a few pages ahead, so the
     /// parsing goes on beside the drawing — and let go once it is drawn.
     /// `onPageDrawn` is handed the number of pages finished, once per page.
+    ///
+    /// The pages of `placeholders`, and with `missedArePlaceholders` those
+    /// whose marks do not arrive now, are drawn with the label of
+    /// `UnfetchedPlaceholder` over them.
     private static func redraw(
         _ pages: [Sheet<MarkSummary>],
         original: URL,
         images: [String: CGImage],
         author: String?,
+        placeholders: Set<Int>,
+        missedArePlaceholders: Bool,
         to output: URL,
         marks: @escaping @Sendable (Int) async throws -> RMPage?,
         onPageDrawn: (Int) -> Void
@@ -388,12 +414,14 @@ public struct AnnotatedPDFRenderer: Sendable {
         let update = InkUpdate()
         try await RenderWork.boundedConcurrentForEach(
             Array(pages.indices), limit: RenderWork.inkConcurrency
-        ) { position -> PreparedMarks? in
+        ) { position -> (marks: PreparedMarks?, placeholder: Bool) in
             // A page with no marks has nothing to fetch; one whose marks did
-            // not arrive comes back as `nil` too, and is drawn without them.
-            guard pages[position].marks != nil, let marks = try await marks(position) else { return nil }
-            return PreparedMarks(marks, sheet: pages[position].sheet)
-        } consume: { done, prepared in
+            // not arrive comes back as `nil` too, and is drawn without them
+            // — or with the label over it.
+            guard pages[position].marks != nil else { return (nil, placeholders.contains(position)) }
+            guard let marks = try await marks(position) else { return (nil, missedArePlaceholders) }
+            return (PreparedMarks(marks, sheet: pages[position].sheet), false)
+        } consume: { done, drawn in
             // The drawing itself does not suspend, so it is not interruptible
             // on its own: without asking, a redraw of a five-hundred-page book
             // runs to the end after the user has already dismissed it. The
@@ -401,6 +429,7 @@ public struct AnnotatedPDFRenderer: Sendable {
             // the question is asked of the right task.
             try Task.checkCancellation()
             let page = pages[done]
+            let prepared = drawn.marks
             drawPage(
                 source: originalPage(page.redir, in: document),
                 marks: prepared?.marks,
@@ -409,7 +438,8 @@ public struct AnnotatedPDFRenderer: Sendable {
                 images: drawing,
                 navigation: { navigation.draw(page: done, in: $0) },
                 inkSplit: prepared?.split,
-                masks: update.masks
+                masks: update.masks,
+                placeholder: drawn.placeholder
             )
             if let ink = prepared?.ink { try update.append(ink, page: done) }
             onPageDrawn(done + 1)
@@ -479,7 +509,9 @@ public struct AnnotatedPDFRenderer: Sendable {
     /// live source of documents.
     ///
     /// `inkSplit` and `masks` are `PageRenderer.draw`'s: the redraw writes a
-    /// page's ink apart and draws the rest here.
+    /// page's ink apart and draws the rest here. `placeholder` puts the
+    /// label of a page whose marks did not arrive over the middle of the
+    /// sheet (`UnfetchedPlaceholder`).
     static func drawPage(
         source: CGPDFPage?,
         marks: RMPage?,
@@ -488,7 +520,8 @@ public struct AnnotatedPDFRenderer: Sendable {
         images: PageRenderer.PageImages = PageRenderer.PageImages(),
         navigation: ((CGContext) -> Void)? = nil,
         inkSplit: Int? = nil,
-        masks: InkMaskLedger? = nil
+        masks: InkMaskLedger? = nil,
+        placeholder: Bool = false
     ) {
         let sheet = CGRect(origin: .zero, size: size)
         // The drawing happens in `.rm` units: the sheet becomes a page of the
@@ -540,6 +573,7 @@ public struct AnnotatedPDFRenderer: Sendable {
             )
             context.restoreGState()
         }
+        if placeholder { UnfetchedPlaceholder.draw(on: sheet, in: context) }
         navigation?(context)
         context.endPDFPage()
     }
@@ -635,9 +669,12 @@ public struct AnnotatedPDFRenderer: Sendable {
     ///
     /// Bytes that do not arrive at all — a cache emptied since the measuring,
     /// a connection dropped — are the page's loss and no more: `nil`, with
-    /// the page put down in `missed` for the tally `renderPDF` reports.
+    /// the page put down in `missed` for the tally `renderPDF` reports —
+    /// unless `unfetchedPages` is `.strict`, when they are the render's
+    /// `PageFetchError`.
     private func marks(
-        of sheet: Sheet<MarkSummary>, at position: Int, owner: String, missed: PageLedger
+        of sheet: Sheet<MarkSummary>, at position: Int, owner: String, missed: PageLedger,
+        unfetchedPages: UnfetchedPagePolicy
     ) async throws -> RMPage? {
         guard sheet.marks != nil, let entry = sheet.entry else {
             throw RenderError.malformedPage("page \(position) was measured without marks")
@@ -649,6 +686,9 @@ public struct AnnotatedPDFRenderer: Sendable {
             RMRenderLog.pageError(
                 "annotated: marks on page \(position) did not arrive to be drawn: \(String(describing: error))"
             )
+            if unfetchedPages == .strict {
+                throw PageFetchError(page: position, pageID: entry.fileBaseName, underlying: error)
+            }
             missed.insert(position)
             return nil
         }
@@ -673,12 +713,18 @@ public struct AnnotatedPDFRenderer: Sendable {
     /// A `certified` original is refused as soon as there is something to
     /// append: an incremental update would break its certification. With
     /// nothing to append it is copied as it stands, certification and all.
+    ///
+    /// The pages of `placeholders` are written as well — the label as the
+    /// page's native Form, over the original — and so, with
+    /// `missedArePlaceholders`, is a page whose marks do not arrive now.
     private func overlay(
         order: [PageOrder.Page],
         pages: [Sheet<MarkSummary>],
         original: URL,
         certified: Bool,
         images: [String: CGImage],
+        placeholders: Set<Int>,
+        missedArePlaceholders: Bool,
         to output: URL,
         marks: @escaping @Sendable (Int) async throws -> RMPage?
     ) async throws -> Bool {
@@ -700,7 +746,7 @@ public struct AnnotatedPDFRenderer: Sendable {
         // costs nothing and the drawing below can go straight to the file.
         var marked: [Int] = []
         for (position, sheet) in pages.enumerated() {
-            guard let marks = sheet.marks, marks.hasContent else { continue }
+            guard sheet.marks?.hasContent == true || placeholders.contains(position) else { continue }
             let original = originalPages[position]
             guard original.mediaBox != nil, original.rotation.isMultiple(of: 90) else { return false }
             marked.append(position)
@@ -741,15 +787,18 @@ public struct AnnotatedPDFRenderer: Sendable {
                 do {
                     // Marks that did not arrive leave the page as the original
                     // has it: an overlay that draws nothing, since the page
-                    // was promised one before its marks were asked for.
-                    let pageMarks = try await marks(position) ?? RMPage(strokes: [], skippedBlocks: 0)
+                    // was promised one before its marks were asked for — or,
+                    // under `.placeholder`, the label.
+                    let fetched = placeholders.contains(position) ? nil : try await marks(position)
+                    let placeholder = placeholders.contains(position) || (fetched == nil && missedArePlaceholders)
+                    let pageMarks = fetched ?? RMPage(strokes: [], skippedBlocks: 0)
                     // The drawing does not suspend, and a book is minutes of
                     // it: the question is asked once a page, as the redraw
                     // asks it.
                     try Task.checkCancellation()
                     return try Self.overlay(
                         pageMarks, sheet: sheets[position], on: originalPages[position], at: position,
-                        images: drawing
+                        images: drawing, placeholder: placeholder
                     )
                 } catch {
                     throw DrawingFailed(underlying: error)
@@ -775,19 +824,25 @@ public struct AnnotatedPDFRenderer: Sendable {
     /// The marks of one page as the overlay writes them, in the frame of the
     /// original's page; `overlay(order:…)` has already seen that the page has
     /// marks, a media box, and a rotation by a right angle.
+    ///
+    /// A `placeholder` is the label of a page whose marks did not arrive,
+    /// written as the page's native Form: it is text, which the overlay's
+    /// own operators do not set.
     private static func overlay(
         _ marks: RMPage,
         sheet: CGSize,
         on original: PDFFile.Page,
         at position: Int,
-        images: PageRenderer.PageImages
+        images: PageRenderer.PageImages,
+        placeholder: Bool = false
     ) throws -> PDFOverlayWriter.Overlay {
         guard let box = original.mediaBox else {
             throw PDFReadError.malformed("an overlay for page \(position), which has no box")
         }
         let rotated = !original.rotation.isMultiple(of: 360)
         let drawingBox = rotated ? CGRect(origin: .zero, size: sheet) : box
-        let built = marks.text == nil && marks.images.isEmpty ? MarkContentStream.build(marks, mediaBox: drawingBox) : nil
+        let built = !placeholder && marks.text == nil && marks.images.isEmpty
+            ? MarkContentStream.build(marks, mediaBox: drawingBox) : nil
         // Measured once, for the box and for the drawing alike, with the typed
         // text laid out once for both.
         let units = AnnotationGeometry.units(of: drawingBox.size)
@@ -798,6 +853,9 @@ public struct AnnotatedPDFRenderer: Sendable {
         var content: Data
         if let built {
             content = built.content
+        } else if placeholder {
+            native = try UnfetchedPlaceholder.form(drawingBox: drawingBox, mediaBox: grown)
+            content = Data("q /RMNative Do Q\n".utf8)
         } else {
             native = try Self.nativeMarks(
                 marks, drawingBox: drawingBox, mediaBox: grown, units: units, bounds: bounds, geometry: geometry,
@@ -933,10 +991,12 @@ public struct AnnotatedPDFRenderer: Sendable {
     /// that what it does not keep is let go there rather than held until
     /// every page has been read.
     ///
-    /// `losesUnfetchedPages` makes marks whose bytes do not arrive the loss
-    /// of their own page — no marks, as for marks that do not parse — and
-    /// answers their positions as `unfetched`; without it the first such
-    /// failure is the whole call's, as it always was.
+    /// `unfetchedPages` other than `.strict` makes marks whose bytes do not
+    /// arrive the loss of their own page — no marks, as for marks that do
+    /// not parse — and answers their positions as `unfetched`; `.strict`
+    /// turns the first such failure into the call's `PageFetchError`, and
+    /// without a policy it is the whole call's as it stands, as it always
+    /// was.
     private func sheets<Marks: Sendable>(
         order: [PageOrder.Page],
         index: DocumentFiles,
@@ -944,7 +1004,7 @@ public struct AnnotatedPDFRenderer: Sendable {
         owner: String,
         onUnsupported: @escaping @Sendable (_ pages: Int) -> Void = { _ in },
         onUnreadable: @escaping @Sendable (_ pages: Int) -> Void = { _ in },
-        losesUnfetchedPages: Bool = false,
+        unfetchedPages: UnfetchedPagePolicy? = nil,
         keep: @escaping @Sendable (RMPage) -> Marks
     ) async throws -> (sheets: [Sheet<Marks>], unfetched: Set<Int>) {
         // A record per page, found once. Searching the index for every page
@@ -969,6 +1029,7 @@ public struct AnnotatedPDFRenderer: Sendable {
         let jobs: [(position: Int, entry: DocumentFile)] = order.enumerated().compactMap { position, page in
             entryOfPage[page.id].map { (position, $0) }
         }
+        let losesUnfetchedPages = unfetchedPages != nil
         // The generations of the marks we could not read. The original page
         // still goes out under them, so the loss is invisible on the sheet —
         // which is exactly why it has to be visible somewhere else.
@@ -991,7 +1052,10 @@ public struct AnnotatedPDFRenderer: Sendable {
                 RMRenderLog.pageError(
                     "annotated: marks on page \(job.position) did not arrive: \(String(describing: error))"
                 )
-                return (nil, .unfetched)
+                if unfetchedPages == .strict {
+                    throw PageFetchError(page: job.position, pageID: job.entry.fileBaseName, underlying: error)
+                }
+                return (nil, .unfetched(error))
             }
             // One unreadable page must not cost the whole document:
             // the original still goes out, only without its marks.

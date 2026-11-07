@@ -146,6 +146,42 @@ public enum PageRenderer {
         let geometry = page.text.map { TextGeometry($0, pageSize: pageSize) }
         let bounds = contentBounds(of: page, pageSize: pageSize, edge: .uncut, geometry: geometry)
         let sheet = grownSheet(from: bounds, floor: pageSize, scale: 1)
+        let context = try whiteBitmap(sheet: sheet, scale: scale, grayscale: grayscale)
+        context.saveGState()
+        context.scaleBy(x: scale, y: scale)
+        // The same placement the PDF page uses to put a grown page's ink on
+        // its sheet: centred sideways, pressed to the top. `scale: 1` here —
+        // the device-pixel density already went into `context.scaleBy`
+        // above, and this transform only has to place `.rm` units on a sheet
+        // stated in the same units.
+        context.concatenate(placement(of: bounds, on: sheet, scale: 1))
+        draw(
+            page, in: context, pageSize: pageSize, bounds: bounds, images: images, inkOnly: inkOnly, geometry: geometry
+        )
+        context.restoreGState()
+        guard let image = context.makeImage() else {
+            throw RenderError.bitmapContextUnavailable
+        }
+        return image
+    }
+
+    /// The bitmap of a page whose bytes did not arrive, under
+    /// `UnfetchedPagePolicy.placeholder`: a white sheet of the size a page
+    /// with nothing on it is drawn at, "Rendering error" in the middle.
+    static func placeholderImage(pageSize: CGSize, scale: CGFloat, grayscale: Bool) throws -> CGImage {
+        let blank = RMPage(strokes: [], skippedBlocks: 0)
+        let bounds = contentBounds(of: blank, pageSize: pageSize, edge: .uncut, geometry: nil)
+        let sheet = grownSheet(from: bounds, floor: pageSize, scale: 1)
+        let context = try whiteBitmap(sheet: sheet, scale: scale, grayscale: grayscale)
+        UnfetchedPlaceholder.draw(on: CGRect(x: 0, y: 0, width: context.width, height: context.height), in: context)
+        guard let image = context.makeImage() else {
+            throw RenderError.bitmapContextUnavailable
+        }
+        return image
+    }
+
+    /// A white bitmap for a sheet of `sheet` units at `scale` pixels a unit.
+    private static func whiteBitmap(sheet: CGSize, scale: CGFloat, grayscale: Bool) throws -> CGContext {
         // Weighed as floating point before a single `Int(_:)`: the sheet
         // follows the ink, the ink is the file's, and a stroke at y = 1e30
         // makes a height no `Int` holds — a trap, not a failure. A `scale`
@@ -181,22 +217,7 @@ public enum PageRenderer {
             context.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
         }
         context.fill(CGRect(x: 0, y: 0, width: width, height: height))
-        context.saveGState()
-        context.scaleBy(x: scale, y: scale)
-        // The same placement the PDF page uses to put a grown page's ink on
-        // its sheet: centred sideways, pressed to the top. `scale: 1` here —
-        // the device-pixel density already went into `context.scaleBy`
-        // above, and this transform only has to place `.rm` units on a sheet
-        // stated in the same units.
-        context.concatenate(placement(of: bounds, on: sheet, scale: 1))
-        draw(
-            page, in: context, pageSize: pageSize, bounds: bounds, images: images, inkOnly: inkOnly, geometry: geometry
-        )
-        context.restoreGState()
-        guard let image = context.makeImage() else {
-            throw RenderError.bitmapContextUnavailable
-        }
-        return image
+        return context
     }
 
     /// The pages as a PDF written straight to `url`.
@@ -342,6 +363,20 @@ public enum PageRenderer {
             context.restoreGState()
             context.endPDFPage()
             if let ink = prepared.ink { try update.append(ink, page: drawn) }
+            drawn += 1
+        }
+
+        /// A page whose bytes did not arrive, under
+        /// `UnfetchedPagePolicy.placeholder`: a plain sheet of the size a page
+        /// with nothing on it is drawn at — no template, so that it cannot be
+        /// taken for a page nobody wrote on — and "Rendering error" in the
+        /// middle. It has no ink to append, and takes its number all the same.
+        func drawPlaceholder() {
+            let sheet = sheets.prepare(RMPage(strokes: [], skippedBlocks: 0)).sheet
+            let box = CGRect(origin: .zero, size: sheet)
+            context.beginPDFPage(pageInfo(mediaBox: box))
+            UnfetchedPlaceholder.draw(on: box, in: context)
+            context.endPDFPage()
             drawn += 1
         }
 

@@ -21,8 +21,8 @@ enum RenderWork {
         case unsupported(version: Int)
         /// Bytes that arrived and did not parse.
         case unreadable
-        /// Bytes that never arrived.
-        case unfetched
+        /// Bytes that never arrived, and what the fetch failed with.
+        case unfetched(any Error)
     }
 
     /// How many pages are in flight at once: a notebook must not turn into

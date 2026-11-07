@@ -75,6 +75,15 @@ public struct NotebookRenderer: Sendable {
     /// the render still ends it with `CancellationError`, and nothing about a
     /// single page — the PDF context, the file written to — turns into a
     /// lost page instead of an error.
+    ///
+    /// `unfetchedPages` says how such a page is drawn: with "Rendering
+    /// error" on a plain sheet by default, so that it cannot be taken for a
+    /// page nobody wrote on (`UnfetchedPagePolicy.placeholder`); as the
+    /// blank sheet on its template an unreadable page is (`.blank`); or not
+    /// at all, the render failing with `PageFetchError` (`.strict`).
+    /// `onUnfetched` is told under the first two. A page that arrived and
+    /// would not parse is drawn as it always was, whatever this says: that
+    /// is the document's own, and the next try will not mend it.
     public func renderPDF(
         documentID: String,
         index: DocumentFiles,
@@ -82,6 +91,7 @@ public struct NotebookRenderer: Sendable {
         author: String? = nil,
         maximumPages: Int? = nil,
         includesUnlistedPages: Bool = true,
+        unfetchedPages: UnfetchedPagePolicy = .placeholder,
         onProgress: @Sendable (_ completed: Int, _ total: Int) -> Void = { _, _ in },
         onPageCount: @Sendable (_ drawn: Int, _ document: Int) -> Void = { _, _ in },
         onMissingImages: @Sendable (_ pages: Int, _ images: Int) -> Void = { _, _ in },
@@ -94,6 +104,7 @@ public struct NotebookRenderer: Sendable {
             index: index,
             maximumPages: maximumPages,
             includesUnlistedPages: includesUnlistedPages,
+            unfetchedPages: unfetchedPages,
             onProgress: onProgress,
             onPageCount: onPageCount,
             onMissingImages: onMissingImages,
@@ -105,11 +116,15 @@ public struct NotebookRenderer: Sendable {
                 throw RenderError.pdfContextUnavailable
             }
             let unfetched = try await draw(
-                work, documentID: documentID, paper: paper, author: author, into: PDFSink(data: buffer)
+                work, documentID: documentID, paper: paper, author: author, unfetchedPages: unfetchedPages,
+                into: PDFSink(data: buffer)
             )
             return (pdf: buffer as Data, unfetched: unfetched)
         }
-        Self.report(unfetched: work.unfetched.union(drawn.unfetched), of: work, documentID: documentID, to: onUnfetched)
+        Self.report(
+            unfetched: work.unfetched.union(drawn.unfetched), of: work, documentID: documentID,
+            policy: unfetchedPages, to: onUnfetched
+        )
         // The assembly counted as a unit of the work, so somebody has to say it
         // finished. Without this the bar would stop one unit short of its
         // total and stay there, and a caller with a progress bar shows what it
@@ -134,6 +149,7 @@ public struct NotebookRenderer: Sendable {
         author: String? = nil,
         maximumPages: Int? = nil,
         includesUnlistedPages: Bool = true,
+        unfetchedPages: UnfetchedPagePolicy = .placeholder,
         onProgress: @Sendable (_ completed: Int, _ total: Int) -> Void = { _, _ in },
         onPageCount: @Sendable (_ drawn: Int, _ document: Int) -> Void = { _, _ in },
         onMissingImages: @Sendable (_ pages: Int, _ images: Int) -> Void = { _, _ in },
@@ -146,6 +162,7 @@ public struct NotebookRenderer: Sendable {
             index: index,
             maximumPages: maximumPages,
             includesUnlistedPages: includesUnlistedPages,
+            unfetchedPages: unfetchedPages,
             onProgress: onProgress,
             onPageCount: onPageCount,
             onMissingImages: onMissingImages,
@@ -155,7 +172,8 @@ public struct NotebookRenderer: Sendable {
         let unfetched = try await RenderWork.detachedWaiting { [self] in
             do {
                 return try await draw(
-                    work, documentID: documentID, paper: paper, author: author, into: PDFSink(url: output)
+                    work, documentID: documentID, paper: paper, author: author, unfetchedPages: unfetchedPages,
+                    into: PDFSink(url: output)
                 )
             } catch {
                 // A cancelled or failed render leaves a truncated PDF behind,
@@ -165,14 +183,20 @@ public struct NotebookRenderer: Sendable {
                 throw error
             }
         }
-        Self.report(unfetched: work.unfetched.union(unfetched), of: work, documentID: documentID, to: onUnfetched)
+        Self.report(
+            unfetched: work.unfetched.union(unfetched), of: work, documentID: documentID,
+            policy: unfetchedPages, to: onUnfetched
+        )
         onProgress(work.total, work.total)
     }
 
     /// The same document as one bitmap per page — OCR's input.
     ///
     /// Reuses the fetch and parse of `renderPDF`; only the last step differs.
-    /// `scale` is handed straight to `PageRenderer.image`.
+    /// `scale` is handed straight to `PageRenderer.image`. `unfetchedPages`
+    /// is `renderPDF`'s: a placeholder page is a white bitmap of the page's
+    /// size with the label in the middle — which a recogniser reads as text,
+    /// so a caller that indexes what it reads wants `.blank` or `.strict`.
     public func renderImages(
         documentID: String,
         index: DocumentFiles,
@@ -180,6 +204,7 @@ public struct NotebookRenderer: Sendable {
         grayscale: Bool = false,
         maximumPages: Int? = nil,
         includesUnlistedPages: Bool = true,
+        unfetchedPages: UnfetchedPagePolicy = .placeholder,
         onProgress: @Sendable (_ completed: Int, _ total: Int) -> Void = { _, _ in },
         onPageCount: @Sendable (_ drawn: Int, _ document: Int) -> Void = { _, _ in },
         onMissingImages: @Sendable (_ pages: Int, _ images: Int) -> Void = { _, _ in },
@@ -192,6 +217,7 @@ public struct NotebookRenderer: Sendable {
             index: index,
             maximumPages: maximumPages,
             includesUnlistedPages: includesUnlistedPages,
+            unfetchedPages: unfetchedPages,
             onProgress: onProgress,
             onPageCount: onPageCount,
             onMissingImages: onMissingImages,
@@ -199,7 +225,7 @@ public struct NotebookRenderer: Sendable {
             onUnsupported: onUnsupported,
             onUnreadable: onUnreadable
         )
-        let images = try await renderImages(work, scale: scale, grayscale: grayscale)
+        let images = try await renderImages(work, scale: scale, grayscale: grayscale, unfetchedPages: unfetchedPages)
         onProgress(work.total, work.total)
         return images
     }
@@ -207,24 +233,47 @@ public struct NotebookRenderer: Sendable {
     /// The bitmaps of a notebook already parsed. `grayscale` draws 8-bit
     /// grey rather than RGBA — a quarter of the memory for a reader of ink
     /// that sees no colour anyway.
+    ///
+    /// `unfetchedPages` is applied here, to the pages of
+    /// `ParsedNotebook.unfetched`: the parse keeps them as the blank sheets
+    /// they were, and the drawing decides what they look like — the label
+    /// (`.placeholder`), the blank sheet (`.blank`), or `PageFetchError` for
+    /// the first of them (`.strict`).
     public func renderImages(
-        _ parsed: ParsedNotebook, scale: CGFloat = 1, grayscale: Bool = false
+        _ parsed: ParsedNotebook,
+        scale: CGFloat = 1,
+        grayscale: Bool = false,
+        unfetchedPages: UnfetchedPagePolicy = .placeholder
     ) async throws -> [CGImage] {
-        try await renderImages(parsed, scale: scale, grayscale: grayscale, pages: nil)
+        try await renderImages(parsed, scale: scale, grayscale: grayscale, pages: nil, unfetchedPages: unfetchedPages)
     }
 
     /// The pages of a window alone, in order — for a reader that takes a
     /// notebook a handful of pages at a time and holds no more than that.
     /// The parse is the caller's already, so a window costs its own pages
     /// and nothing else.
+    /// `unfetchedPages` acts on the pages of the window alone.
     public func renderImages(
-        _ parsed: ParsedNotebook, scale: CGFloat = 1, grayscale: Bool = false, pages window: Range<Int>?
+        _ parsed: ParsedNotebook,
+        scale: CGFloat = 1,
+        grayscale: Bool = false,
+        pages window: Range<Int>?,
+        unfetchedPages: UnfetchedPagePolicy = .placeholder
     ) async throws -> [CGImage] {
         let wanted = window.map { $0.clamped(to: 0..<parsed.pages.count) } ?? 0..<parsed.pages.count
+        if unfetchedPages == .strict, let first = wanted.first(where: parsed.unfetched.contains) {
+            throw parsed.fetchError(at: first)
+        }
         let images = PageRenderer.PageImages(decoded: parsed.images)
+        let placeholders = unfetchedPages == .placeholder ? parsed.unfetched : []
         return try await RenderWork.detached {
             try wanted.map { index in
-                try PageRenderer.image(
+                if placeholders.contains(index) {
+                    return try PageRenderer.placeholderImage(
+                        pageSize: parsed.pageSize, scale: scale, grayscale: grayscale
+                    )
+                }
+                return try PageRenderer.image(
                     page: parsed.pages[index],
                     pageSize: parsed.pageSize,
                     scale: scale,
@@ -242,14 +291,20 @@ public struct NotebookRenderer: Sendable {
     /// document's once; the drawing, the costly part, is paid only for the
     /// pages asked for, since only a page with both strokes and typed text
     /// needs a second bitmap.
+    ///
+    /// `unfetchedPages` is `renderPDF`'s, short of the label: a page whose
+    /// bytes did not arrive has no handwriting to show, and the label is not
+    /// handwriting, so `.placeholder` draws it as `.blank` does — empty.
+    /// `.strict` fails the call with `PageFetchError`.
     public func renderInkImages(
         documentID: String,
         index: DocumentFiles,
         scale: CGFloat = 1,
-        pages wanted: Set<Int>
+        pages wanted: Set<Int>,
+        unfetchedPages: UnfetchedPagePolicy = .placeholder
     ) async throws -> [Int: CGImage] {
         guard !wanted.isEmpty else { return [:] }
-        let work = try await parsed(documentID: documentID, index: index)
+        let work = try await parsed(documentID: documentID, index: index, unfetchedPages: unfetchedPages)
         return try await renderInkImages(work, scale: scale, pages: wanted)
     }
 
@@ -318,11 +373,18 @@ public struct NotebookRenderer: Sendable {
     /// told it, beside the number that will be drawn, before a page is
     /// fetched. A document with no page at all is told `(1, 0)`: one blank
     /// sheet is drawn for it, and it has none.
+    ///
+    /// A page whose bytes did not arrive stands in `pages` as a blank sheet
+    /// on its template, and in `unfetched`, under `.placeholder` and `.blank`
+    /// alike: the parse draws nothing, and the drawing that follows
+    /// (`renderImages(_:…)`) is handed the policy that decides what it looks
+    /// like. `.strict` fails the parse with `PageFetchError` instead.
     public func parsed(
         documentID: String,
         index: DocumentFiles,
         maximumPages: Int? = nil,
         includesUnlistedPages: Bool = true,
+        unfetchedPages: UnfetchedPagePolicy = .placeholder,
         onProgress: @Sendable (_ completed: Int, _ total: Int) -> Void = { _, _ in },
         onPageCount: @Sendable (_ drawn: Int, _ document: Int) -> Void = { _, _ in },
         onMissingImages: @Sendable (_ pages: Int, _ images: Int) -> Void = { _, _ in },
@@ -335,19 +397,23 @@ public struct NotebookRenderer: Sendable {
             index: index,
             maximumPages: maximumPages,
             includesUnlistedPages: includesUnlistedPages,
+            unfetchedPages: unfetchedPages,
             onProgress: onProgress,
             onPageCount: onPageCount,
             onMissingImages: onMissingImages,
             onUnsupported: onUnsupported,
             onUnreadable: onUnreadable
         ) { $0 }
-        Self.report(unfetched: work.unfetched, of: work, documentID: documentID, to: onUnfetched)
+        Self.report(
+            unfetched: work.unfetched, of: work, documentID: documentID, policy: unfetchedPages, to: onUnfetched
+        )
         return ParsedNotebook(
             pages: work.pages,
             pageSize: work.pageSize,
             assets: work.assets,
             unreadable: work.unreadable,
             unfetched: work.unfetched,
+            fetchFailures: work.fetchFailures,
             pageIDs: work.pageIDs,
             documentPageCount: work.documentPageCount,
             total: work.total,
@@ -367,6 +433,7 @@ public struct NotebookRenderer: Sendable {
         index: DocumentFiles,
         maximumPages: Int?,
         includesUnlistedPages: Bool,
+        unfetchedPages: UnfetchedPagePolicy,
         onProgress: @Sendable (_ completed: Int, _ total: Int) -> Void,
         onPageCount: @Sendable (_ drawn: Int, _ document: Int) -> Void,
         onMissingImages: @Sendable (_ pages: Int, _ images: Int) -> Void,
@@ -378,6 +445,7 @@ public struct NotebookRenderer: Sendable {
             index: index,
             maximumPages: maximumPages,
             includesUnlistedPages: includesUnlistedPages,
+            unfetchedPages: unfetchedPages,
             onProgress: onProgress,
             onPageCount: onPageCount,
             onMissingImages: onMissingImages,
@@ -393,6 +461,9 @@ public struct NotebookRenderer: Sendable {
         /// Did not parse, or is of an older generation: a blank sheet that
         /// counts a block lost, as the walk made it.
         case unread(template: String?)
+        /// Its bytes did not arrive for the walk: drawn as `unread` is, or
+        /// as the placeholder (`UnfetchedPagePolicy`).
+        case unfetched(template: String?)
         /// A page file, parsed when it is wanted.
         case file(DocumentFile, template: String?)
     }
@@ -412,6 +483,8 @@ public struct NotebookRenderer: Sendable {
         let unreadable: Set<Int>
         /// Those of `unreadable` whose bytes did not arrive.
         let unfetched: Set<Int>
+        /// What the fetch of each of `unfetched` failed with.
+        let fetchFailures: [Int: any Error]
         let pageIDs: [String?]
         let documentPageCount: Int
         let total: Int
@@ -426,21 +499,27 @@ public struct NotebookRenderer: Sendable {
     /// Bytes that arrived for the walk and not now — a cache emptied in
     /// between, a connection dropped — are the one exception: the page is
     /// drawn as the walk draws a page whose bytes never came, and `unfetched`
-    /// says so, for the tally the caller is told once the drawing is done.
+    /// says so, for the tally the caller is told once the drawing is done —
+    /// or, under `.strict`, the render fails with `PageFetchError`.
     private func page(
-        _ source: PageSource, documentID: String, position: Int
+        _ source: PageSource, documentID: String, position: Int, unfetchedPages: UnfetchedPagePolicy
     ) async throws -> (page: RMPage, unfetched: Bool) {
         switch source {
         case .blank(let template):
             return (RMPage(strokes: [], skippedBlocks: 0).with(templateName: template), false)
         case .unread(let template):
             return (RMPage(strokes: [], skippedBlocks: 1).with(templateName: template), false)
+        case .unfetched(let template):
+            return (RMPage(strokes: [], skippedBlocks: 1).with(templateName: template), true)
         case .file(let entry, let template):
             let data: Data
             do {
                 data = try await blobs.data(hash: entry.hash, name: entry.name, owner: documentID)
             } catch let error where !RenderWork.isCancellation(error) {
                 RMRenderLog.pageError("render: page \(position) did not arrive to be drawn: \(String(describing: error))")
+                if unfetchedPages == .strict {
+                    throw PageFetchError(page: position, pageID: entry.fileBaseName, underlying: error)
+                }
                 return (RMPage(strokes: [], skippedBlocks: 1).with(templateName: template), true)
             }
             do {
@@ -461,12 +540,14 @@ public struct NotebookRenderer: Sendable {
     /// A page's ink is written where it is parsed, beside the drawing
     /// (`PageRenderer.PDFPages`): that is most of what a written page costs,
     /// and it needs nothing of the document. The drawing takes the pages in
-    /// their order and draws the rest of each.
+    /// their order and draws the rest of each — or, for a page whose bytes
+    /// did not arrive under `.placeholder`, the label on a plain sheet.
     private func draw(
         _ work: Walk<Void>,
         documentID: String,
         paper: PaperSize,
         author: String?,
+        unfetchedPages: UnfetchedPagePolicy,
         into sink: PDFSink
     ) async throws -> Set<Int> {
         let output = try PageRenderer.PDFPages(
@@ -477,8 +558,12 @@ public struct NotebookRenderer: Sendable {
         let sources = work.sources
         var unfetched: Set<Int> = []
         try await RenderWork.boundedConcurrentForEach(Array(sources.indices), limit: RenderWork.inkConcurrency) { [self] position in
-            let drawn = try await page(sources[position], documentID: documentID, position: position)
-            return (prepared: sheets.prepare(drawn.page), unfetched: drawn.unfetched)
+            let drawn = try await page(
+                sources[position], documentID: documentID, position: position, unfetchedPages: unfetchedPages
+            )
+            // A placeholder has no page to prepare: `nil` stands for it.
+            let placeholder = drawn.unfetched && unfetchedPages == .placeholder
+            return (prepared: placeholder ? nil : sheets.prepare(drawn.page), unfetched: drawn.unfetched)
         } consume: { position, drawn in
             // A caller may cancel a render it does not need, and drawing is
             // the long part of it. Asked between pages: a page is a bounded
@@ -486,26 +571,31 @@ public struct NotebookRenderer: Sendable {
             // to reason about.
             try Task.checkCancellation()
             if drawn.unfetched { unfetched.insert(position) }
-            try output.draw(drawn.prepared, images: images)
+            if let prepared = drawn.prepared {
+                try output.draw(prepared, images: images)
+            } else {
+                output.drawPlaceholder()
+            }
         }
         try output.close()
         return unfetched
     }
 
     /// The pages whose bytes did not arrive, told to the caller once and
-    /// said in the log — the sheets they became look like pages nobody
-    /// wrote on.
+    /// said in the log — under `.blank` the sheets they became look like
+    /// pages nobody wrote on.
     private static func report<Kept>(
         unfetched: Set<Int>,
         of work: Walk<Kept>,
         documentID: String,
+        policy: UnfetchedPagePolicy,
         to onUnfetched: @Sendable (_ pages: Int) -> Void
     ) {
         guard !unfetched.isEmpty else { return }
         RMRenderLog.pageError(
             """
             render: \(documentID) has \(unfetched.count) of \(work.sources.count) pages \
-            whose bytes did not arrive — they are served blank
+            whose bytes did not arrive — they are served \(policy == .blank ? "blank" : "as placeholders")
             """
         )
         onUnfetched(unfetched.count)
@@ -522,6 +612,7 @@ public struct NotebookRenderer: Sendable {
         index: DocumentFiles,
         maximumPages: Int?,
         includesUnlistedPages: Bool,
+        unfetchedPages: UnfetchedPagePolicy,
         onProgress: @Sendable (_ completed: Int, _ total: Int) -> Void,
         onPageCount: @Sendable (_ drawn: Int, _ document: Int) -> Void,
         onMissingImages: @Sendable (_ pages: Int, _ images: Int) -> Void,
@@ -562,6 +653,7 @@ public struct NotebookRenderer: Sendable {
                 images: [:],
                 unreadable: [],
                 unfetched: [],
+                fetchFailures: [:],
                 pageIDs: [nil],
                 documentPageCount: 0,
                 total: 1
@@ -636,6 +728,8 @@ public struct NotebookRenderer: Sendable {
                 // the same blank sheet on its template, and travels back
                 // marked as one that did not arrive — `onUnfetched`. A
                 // cancelled render is the one failure that is not a page's.
+                // Under `.strict` it is the render's after all, and the
+                // first page to fail is the one named.
                 let data: Data
                 do {
                     data = try await blobs.data(
@@ -645,8 +739,11 @@ public struct NotebookRenderer: Sendable {
                     RMRenderLog.pageError(
                         "render: page \(job.position) did not arrive: \(String(describing: error))"
                     )
+                    if unfetchedPages == .strict {
+                        throw PageFetchError(page: job.position, pageID: job.entry.fileBaseName, underlying: error)
+                    }
                     let blank = RMPage(strokes: [], skippedBlocks: 1)
-                    return (Measured(blank.with(templateName: job.template), keep), .unfetched)
+                    return (Measured(blank.with(templateName: job.template), keep), .unfetched(error))
                 }
                 // One unreadable page must not cancel the whole document:
                 // an empty one takes its place — but with a template, so
@@ -683,16 +780,20 @@ public struct NotebookRenderer: Sendable {
             }
         )
         var unfetched: Set<Int> = []
+        var fetchFailures: [Int: any Error] = [:]
         for (job, result) in zip(jobs, parsed) {
             slots[job.position] = result.page
             guard let loss = result.loss else { continue }
+            unreadPositions.insert(job.position)
+            sources[job.position] = .unread(template: job.template)
             switch loss {
             case .unsupported(let version): oldVersions.append(version)
             case .unreadable: unreadable += 1
-            case .unfetched: unfetched.insert(job.position)
+            case .unfetched(let error):
+                unfetched.insert(job.position)
+                fetchFailures[job.position] = error
+                sources[job.position] = .unfetched(template: job.template)
             }
-            unreadPositions.insert(job.position)
-            sources[job.position] = .unread(template: job.template)
         }
         let pages = slots.compactMap { $0 }
 
@@ -770,6 +871,7 @@ public struct NotebookRenderer: Sendable {
             images: images,
             unreadable: unreadPositions,
             unfetched: unfetched,
+            fetchFailures: fetchFailures,
             pageIDs: layout.pages.map { $0.entry?.fileBaseName },
             documentPageCount: layout.documentPageCount,
             total: total
