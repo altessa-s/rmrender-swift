@@ -18,8 +18,10 @@ import Foundation
 /// cut of each face, and the update writes it once.
 ///
 /// The ink after the last thing only CoreGraphics draws is written apart
-/// (`InkStream`) and appended to the run's document, page by page, as it is
-/// to a page drawn alone (`AnnotatedPDFRenderer.nativeMarks`).
+/// (`InkStream`) and goes into the update as a Form of its own (`InkForm`),
+/// as a page drawn alone's does; only its masks are drawn through the run's
+/// record of them. A page CoreGraphics has nothing of to draw is not a page
+/// of the run at all.
 ///
 /// One thing a document shares that a page drawn alone does not: CoreGraphics
 /// keys an image on its bytes, and a grain mask drawn with the bytes of one
@@ -41,7 +43,8 @@ final class NativeBatch {
         let url: URL
         let sink: PDFSink
         let context: CGContext
-        let update: InkUpdate
+        /// The masks of the run, CoreGraphics' and the written ink's alike.
+        let masks: InkMaskLedger
     }
 
     private var drawing: Drawing?
@@ -53,9 +56,10 @@ final class NativeBatch {
     }
 
     /// A page of `mediaBox` drawn by `draw` — from a fresh graphics state,
-    /// in the coordinates a PDF of that box alone would give it — with `ink`
-    /// appended after it; the page's number in the run's document, counting
-    /// from nought, or `nil` where the page has to be drawn alone (see above).
+    /// in the coordinates a PDF of that box alone would give it — and `ink`
+    /// after it: the page's number in the run's document, counting from
+    /// nought, and its ink as a Form; or `nil` where the page has to be
+    /// drawn alone (see above).
     ///
     /// `draw` is handed the ledger of the run's masks, to draw through as a
     /// page drawn alone draws through its own.
@@ -63,9 +67,9 @@ final class NativeBatch {
         mediaBox: CGRect,
         ink: PreparedInk?,
         draw: (CGContext, InkMaskLedger) -> Void
-    ) throws -> Int? {
+    ) throws -> (number: Int, ink: InkForm?)? {
         let drawing = try opened(mediaBox)
-        let masks = drawing.update.masks
+        let masks = drawing.masks
         let resized = masks.resized
         drawing.context.beginPDFPage(Self.pageInfo(mediaBox: mediaBox))
         draw(drawing.context, masks)
@@ -73,19 +77,16 @@ final class NativeBatch {
         let number = count
         count += 1
         guard masks.resized == resized, !(ink.map { masks.wouldResize($0.masks) } ?? false) else { return nil }
-        if let ink { try drawing.update.append(ink, page: number) }
-        return number
+        return (number, ink.map { InkForm($0, box: mediaBox, masks: masks) })
     }
 
-    /// The run's document finished — its ink appended — and handed on as
-    /// the file it is in, which is the caller's from here; `nil` for a run
-    /// that drew no page.
+    /// The run's document finished and handed on as the file it is in,
+    /// which is the caller's from here; `nil` for a run that drew no page.
     func finish() throws -> URL? {
         guard let drawing else { return nil }
         self.drawing = nil
         do {
             drawing.context.closePDF()
-            try drawing.update.finish(into: drawing.sink)
             try drawing.sink.close()
         } catch {
             try? FileManager.default.removeItem(at: drawing.url)
@@ -107,7 +108,7 @@ final class NativeBatch {
             try? FileManager.default.removeItem(at: url)
             throw RenderError.pdfContextUnavailable
         }
-        let drawing = Drawing(url: url, sink: sink, context: context, update: InkUpdate())
+        let drawing = Drawing(url: url, sink: sink, context: context, masks: InkMaskLedger())
         self.drawing = drawing
         return drawing
     }

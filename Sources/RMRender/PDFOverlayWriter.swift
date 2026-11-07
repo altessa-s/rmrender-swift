@@ -328,6 +328,8 @@ public struct PDFOverlayWriter: Sendable {
         public let box: CGRect?
         /// A one-page PDF imported as the RMNative Form in this overlay.
         public let formPDF: Data?
+        /// The page's written ink, imported as the `InkForm.name` Form.
+        let ink: InkForm?
 
         public init(
             pageIndex: Int,
@@ -337,12 +339,28 @@ public struct PDFOverlayWriter: Sendable {
             box: CGRect? = nil,
             formPDF: Data? = nil
         ) {
+            self.init(
+                pageIndex: pageIndex, content: content, states: states, images: images, box: box, formPDF: formPDF,
+                ink: nil
+            )
+        }
+
+        init(
+            pageIndex: Int,
+            content: Data,
+            states: [GraphicsState],
+            images: [ImageMask] = [],
+            box: CGRect? = nil,
+            formPDF: Data? = nil,
+            ink: InkForm?
+        ) {
             self.pageIndex = pageIndex
             self.content = content
             self.states = states
             self.images = images
             self.box = box
             self.formPDF = formPDF
+            self.ink = ink
         }
     }
 
@@ -812,6 +830,10 @@ public struct PDFOverlayWriter: Sendable {
                 let form = emit(native: native)
                 scopedObjects["RMNative"] = .reference(number: form, generation: 0)
             }
+            if let ink = prepared.ink {
+                let form = emit(native: ink)
+                scopedObjects[InkForm.name] = .reference(number: form, generation: 0)
+            }
 
             scoped["ExtGState"] = .dictionary(scopedStates)
             scoped["XObject"] = .dictionary(scopedObjects)
@@ -932,6 +954,9 @@ public struct PDFOverlayWriter: Sendable {
         let stencils: [(name: String, object: PDFObject)]
         let box: CGRect?
         let native: Native?
+        /// The page's written ink as a Form and the objects it names, made
+        /// as a native drawing's are and shared the same way (`inkForm`).
+        let ink: Native?
         /// The overlay's operators, deflated.
         let content: Data
     }
@@ -989,8 +1014,77 @@ public struct PDFOverlayWriter: Sendable {
             stencils: stencils,
             box: overlay.box,
             native: native,
+            ink: try overlay.ink.map(inkForm),
             content: PDFWriter.flate(overlay.content)
         )
+    }
+
+    /// A page's written ink as a Form and the objects it names, numbered
+    /// from nought as a native drawing's are: the profile and the colour
+    /// space where the ink is coloured, then its graphics states, then its
+    /// masks — each after what it refers to — and the Form that names them.
+    ///
+    /// Every object is the one `InkUpdate` writes for the same ink, and the
+    /// content is the ink's own stream, deflated as it was written: nothing
+    /// is inflated or deflated again.
+    private func inkForm(_ form: InkForm) throws -> PreparedPage.Native {
+        func reference(_ number: Int) -> PDFObject { .reference(number: number, generation: 0) }
+        var objects: [(number: Int, object: PDFObject)] = []
+        func add(_ object: PDFObject) -> Int {
+            objects.append((number: objects.count, object: object))
+            return objects.count - 1
+        }
+        var resources: [String: PDFObject] = [:]
+        if form.ink.usesColorSpace {
+            guard let profile = InkForm.deflatedProfile else { throw RenderError.pdfContextUnavailable }
+            let icc = add(stream(
+                ["N": .integer(3), "Alternate": .name("DeviceRGB"), "Filter": .name("FlateDecode")], profile
+            ))
+            let space = add(.array([.name("ICCBased"), reference(icc)]))
+            resources["ColorSpace"] = .dictionary([InkStream.colorSpaceName: reference(space)])
+        }
+        var states: [String: PDFObject] = [:]
+        for (index, entries) in form.ink.states.enumerated() {
+            var dictionary: [String: PDFObject] = ["Type": .name("ExtGState")]
+            // `/ca 0.5`, `/BM /Darken`: a key and its value, as `InkStream`
+            // says them.
+            let tokens = entries.split(separator: " ")
+            for pair in stride(from: 0, to: tokens.count - 1, by: 2) where tokens[pair].hasPrefix("/") {
+                let value = tokens[pair + 1]
+                guard value.hasPrefix("/") || Double(value) != nil else {
+                    throw PDFReadError.malformed("an ink state of \(entries)")
+                }
+                dictionary[String(tokens[pair].dropFirst())] = value.hasPrefix("/")
+                    ? .name(String(value.dropFirst())) : .real(Double(value) ?? 0)
+            }
+            states["\(InkStream.statePrefix)\(index)"] = reference(add(.dictionary(dictionary)))
+        }
+        if !states.isEmpty { resources["ExtGState"] = .dictionary(states) }
+        var masks: [String: PDFObject] = [:]
+        for (index, (mask, size)) in zip(form.ink.masks, form.sizes).enumerated() {
+            let image = stream(
+                [
+                    "Type": .name("XObject"), "Subtype": .name("Image"),
+                    "Width": .integer(size.width), "Height": .integer(size.height),
+                    "ImageMask": .boolean(true), "BitsPerComponent": .integer(1), "Filter": .name("FlateDecode"),
+                ],
+                mask.deflated.reduce(into: Data()) { $0.append($1) }
+            )
+            masks["\(InkStream.maskPrefix)\(index)"] = reference(add(image))
+        }
+        if !masks.isEmpty { resources["XObject"] = .dictionary(masks) }
+        let content = stream(
+            [
+                "Type": .name("XObject"), "Subtype": .name("Form"), "BBox": rectangle(form.box),
+                "Resources": .dictionary(resources), "Filter": .name("FlateDecode"),
+            ],
+            form.ink.content.reduce(into: Data()) { $0.append($1) }
+        )
+        var fingerprints = [SHA256.Digest?](repeating: nil, count: objects.count)
+        for object in objects {
+            fingerprints[object.number] = Self.fingerprint(object.object, known: fingerprints)
+        }
+        return PreparedPage.Native(objects: objects, form: content, fingerprints: fingerprints)
     }
 
     /// A one-page PDF as a Form and the objects it needs, numbered from
@@ -1045,6 +1139,12 @@ public struct PDFOverlayWriter: Sendable {
             }
             return copied
         }
+        // Decoded and deflated again, not taken as it stands: CoreGraphics
+        // deflates a page loosely, and a book of typed text came out 2.8%
+        // larger for its streams copied whole. What CoreGraphics draws of a
+        // page is its text and its pictures' placing, a few kilobytes; the
+        // ink, which is the bulk of a page of handwriting, is a Form of its
+        // own and is not touched here (`InkForm`).
         var content = Data()
         func appendContent(_ value: PDFObject?, depth: Int = 0) throws {
             guard depth < 128 else { throw PDFReadError.malformed("overlay content depth") }

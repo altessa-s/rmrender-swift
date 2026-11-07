@@ -128,15 +128,10 @@ private func redraw(_ marks: RMPage, writesInk: Bool) throws -> Data {
     return data as Data
 }
 
-/// The native form an overlay puts a page of marks in.
+/// A page of marks as an overlay writes it natively, onto a blank page.
 private func overlay(_ marks: RMPage, writesInk: Bool) throws -> Data {
     let drawing = CGRect(origin: .zero, size: sheet)
-    let units = AnnotationGeometry.units(of: sheet)
-    let bounds = PageRenderer.contentBounds(of: marks, pageSize: units, edge: AnnotatedPDFRenderer.markEdge, geometry: nil)
-    return try AnnotatedPDFRenderer.nativeMarks(
-        marks, drawingBox: drawing, mediaBox: AnnotationGeometry.box(bounds, on: drawing), units: units, bounds: bounds,
-        geometry: nil, images: PageRenderer.PageImages(), writesInk: writesInk
-    )
+    return try InkTesting.overlaid([InkTesting.nativeOverlay(marks, sheet: drawing, writesInk: writesInk)], sheet: drawing)
 }
 
 @Test("A stroke an eraser took away whole paints nothing, whichever way the page is painted")
