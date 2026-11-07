@@ -29,6 +29,22 @@ enum RenderWork {
     /// fifty parallel connections.
     static let pageConcurrency = 8
 
+    /// How many runs of an overlay's typed pages — units of more than one
+    /// page, drawn into one PDF each (`NativeBatch`) — are in the window at
+    /// once; each counts against `pageConcurrency` too, and pages alone keep
+    /// the whole of it.
+    ///
+    /// A run is the heavy unit: a context and its ink drawn for up to 32
+    /// pages, held until the run is handed over. With all eight of the
+    /// window allowed to be runs, a thousand pages of typed text peaked at
+    /// 91–95 MB; at four, 71–73 MB in the same 2.7 s, and a thousand pages
+    /// set in letters of their own went from 102 to 81 MB for 2.7 → 4.0 s,
+    /// still no slower than drawing every page alone. At three or fewer
+    /// every book of text was slower, up to four times at one, for another
+    /// 5–8 MB a run. A book without typed text has no runs, and is drawn as
+    /// it was.
+    static let runConcurrency = 4
+
     /// How many pages a drawing that writes their ink (`InkStream`) keeps
     /// in flight: one a core, and never fewer than `pageConcurrency`.
     ///
@@ -112,28 +128,62 @@ enum RenderWork {
         _ transform: @escaping @Sendable (Job) async throws -> Out,
         consume: (_ position: Int, _ value: Out) throws -> Void
     ) async throws {
+        try await boundedConcurrentForEach(
+            jobs, limit: limit, heavy: [], heavyLimit: limit, transform, consume: consume
+        )
+    }
+
+    /// The same, with a second, narrower bound on the jobs `heavy` marks —
+    /// one flag a job, by position; a job past its end is not heavy — as
+    /// holding more than the rest: at most `heavyLimit` of them are in the
+    /// window at once, running or waiting their turn, and each counts
+    /// against `limit` as well.
+    ///
+    /// Jobs still start in the order they were given: a heavy job that
+    /// finds its bound reached waits for a heavy one to be consumed, and the
+    /// jobs after it wait with it. So what is held stays a window over the
+    /// list, and the answers reach `consume` in the same order as ever.
+    static func boundedConcurrentForEach<Job: Sendable, Out: Sendable>(
+        _ jobs: [Job],
+        limit: Int,
+        heavy: [Bool],
+        heavyLimit: Int,
+        _ transform: @escaping @Sendable (Job) async throws -> Out,
+        consume: (_ position: Int, _ value: Out) throws -> Void
+    ) async throws {
+        let limit = max(1, limit), heavyLimit = max(1, heavyLimit)
+        let heavy = jobs.indices.map { heavy.indices.contains($0) && heavy[$0] }
         try await withThrowingTaskGroup(of: (position: Int, value: Out).self) { group in
             var next = 0
-            func addNext() {
-                guard next < jobs.count else { return }
-                let position = next
-                let job = jobs[position]
-                next += 1
-                group.addTask { (position, try await transform(job)) }
+            var inFlight = 0
+            var heavyInFlight = 0
+            func fill() {
+                while next < jobs.count, inFlight < limit, !heavy[next] || heavyInFlight < heavyLimit {
+                    let position = next
+                    let job = jobs[position]
+                    next += 1
+                    inFlight += 1
+                    if heavy[position] { heavyInFlight += 1 }
+                    group.addTask { (position, try await transform(job)) }
+                }
             }
-            for _ in 0..<max(1, limit) { addNext() }
+            fill()
 
             var waiting: [Int: Out] = [:]
             for position in jobs.indices {
                 while waiting[position] == nil {
                     // Every position below `next` is running or waiting, and
-                    // this one is below it, so the group cannot run dry here.
+                    // this one is below it: the window stops short only while
+                    // something before it is in flight, and the oldest of that
+                    // is this one. So the group cannot run dry here.
                     guard let finished = try await group.next() else { return }
                     waiting[finished.position] = finished.value
                 }
                 guard let value = waiting.removeValue(forKey: position) else { continue }
                 try consume(position, value)
-                addNext()
+                inFlight -= 1
+                if heavy[position] { heavyInFlight -= 1 }
+                fill()
             }
         }
     }

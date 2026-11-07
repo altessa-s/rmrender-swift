@@ -471,18 +471,20 @@ public struct PDFOverlayWriter: Sendable {
 
     /// The same, with the pages made a run at a time: `units` are runs of
     /// page indices, in order, and `batch` is asked for the overlays of each
-    /// run — up to `limit` runs at once — and hands back one overlay per
+    /// unit — up to `limit` units at once — and hands back one overlay per
     /// page of it, in its order. The pages are appended in the order of the
     /// runs, as they would be from `units` flattened.
     ///
     /// What a run is for: the pages of one share one PDF of native drawings
     /// (`OverlayBatch.drawing`), read once for all of them, so that what
     /// they have in common — a typeface above all — is one object in that
-    /// PDF and is written once. A run counts against `limit` as one, whatever
-    /// its length, so what is held is at most `limit` runs; the caller keeps
-    /// them short. Everything else is `writeConcurrently(…overlay:)`'s: a
-    /// failure anywhere ends the run, cancels what is still being made and
-    /// leaves `output` as it was.
+    /// PDF and is written once. A unit counts against `limit` as one,
+    /// whatever its length; a unit of more than one page — a run — counts
+    /// against `runLimit` as well (`RenderWork.runConcurrency`), so what is
+    /// held is at most `runLimit` runs and the rest of the window in pages
+    /// alone; the caller keeps the runs short. Everything else is
+    /// `writeConcurrently(…overlay:)`'s: a failure anywhere ends the write,
+    /// cancels what is still being made and leaves `output` as it was.
     func writeConcurrently(
         file: PDFFile,
         pages: [PDFFile.Page],
@@ -490,6 +492,7 @@ public struct PDFOverlayWriter: Sendable {
         units: [[Int]],
         to output: URL,
         limit: Int = RenderWork.pageConcurrency,
+        runLimit: Int = RenderWork.runConcurrency,
         batch make: @escaping @Sendable (_ pageIndices: [Int]) async throws -> OverlayBatch
     ) async throws {
         let revision = try Revision(
@@ -497,7 +500,9 @@ public struct PDFOverlayWriter: Sendable {
             output: output
         )
         do {
-            try await RenderWork.boundedConcurrentForEach(units, limit: limit) { unit in
+            try await RenderWork.boundedConcurrentForEach(
+                units, limit: limit, heavy: units.map { $0.count > 1 }, heavyLimit: runLimit
+            ) { unit in
                 let batch = try await make(unit)
                 guard batch.overlays.count == unit.count else {
                     batch.discard()

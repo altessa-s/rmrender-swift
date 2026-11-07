@@ -374,6 +374,127 @@ func runsHoldTheWindow() async throws {
     #expect(try PDFFile(url: output).pages().count == 12)
 }
 
+/// What a bounded walk held at most: jobs started and not yet consumed, all
+/// of them and the heavy ones, measured as each job starts — and what it
+/// held while the first job, the slow one, was still in the window.
+private final class WindowLedger: Sendable {
+    private struct Counts {
+        var held = 0, heavyHeld = 0, mostHeld = 0, mostHeavy = 0, mostBeforeFirst = 0
+        var firstConsumed = false
+    }
+    private let counts = Mutex(Counts())
+
+    func started(heavy: Bool) {
+        counts.withLock {
+            $0.held += 1
+            if heavy { $0.heavyHeld += 1 }
+            $0.mostHeld = max($0.mostHeld, $0.held)
+            $0.mostHeavy = max($0.mostHeavy, $0.heavyHeld)
+            if !$0.firstConsumed { $0.mostBeforeFirst = max($0.mostBeforeFirst, $0.held) }
+        }
+    }
+
+    func consumed(heavy: Bool) {
+        counts.withLock {
+            $0.held -= 1
+            if heavy { $0.heavyHeld -= 1 }
+            $0.firstConsumed = true
+        }
+    }
+
+    var most: Walked {
+        counts.withLock { Walked(held: $0.mostHeld, heavy: $0.mostHeavy, beforeFirst: $0.mostBeforeFirst, order: []) }
+    }
+}
+
+/// What `walk` saw: the most held in all, of the heavy jobs, and before the
+/// first job was handed over; and the order the answers were consumed in.
+private struct Walked {
+    let held: Int
+    let heavy: Int
+    let beforeFirst: Int
+    let order: [Int]
+}
+
+/// `jobs` walked with a window of `limit` and `heavyLimit` for the heavy
+/// ones, the first job slow so that the window fills behind it; what the
+/// walk held at most and the order it consumed the answers in.
+private func walk(_ jobs: [Bool], limit: Int, heavyLimit: Int) async throws -> Walked {
+    let ledger = WindowLedger()
+    var order: [Int] = []
+    try await RenderWork.boundedConcurrentForEach(
+        Array(jobs.indices), limit: limit, heavy: jobs, heavyLimit: heavyLimit
+    ) { index in
+        ledger.started(heavy: jobs[index])
+        try await Task.sleep(for: .milliseconds(index == 0 ? 150 : 2))
+        return index
+    } consume: { _, index in
+        order.append(index)
+        ledger.consumed(heavy: jobs[index])
+    }
+    let most = ledger.most
+    return Walked(held: most.held, heavy: most.heavy, beforeFirst: most.beforeFirst, order: order)
+}
+
+@Test("A run counts against the run limit and the window; a page alone against the window only")
+func runsCountAgainstBothLimits() async throws {
+    // Runs only: the run limit is what holds them.
+    let runs = try await walk(Array(repeating: true, count: 12), limit: 8, heavyLimit: 2)
+    #expect(runs.heavy == 2)
+    #expect(runs.held == 2)
+    #expect(runs.order == Array(0..<12))
+
+    // Pages alone only: the run limit has nothing to say, and the window fills.
+    let pages = try await walk(Array(repeating: false, count: 12), limit: 8, heavyLimit: 1)
+    #expect(pages.held == 8)
+    #expect(pages.heavy == 0)
+    #expect(pages.order == Array(0..<12))
+
+    // Mixed: two runs fill the run limit, and the pages alone behind them
+    // still go on until the window is full — the runs count against it too.
+    let mixed = try await walk([true, true, false, false, false, false, false, false, false, false], limit: 5, heavyLimit: 2)
+    #expect(mixed.heavy == 2)
+    #expect(mixed.held == 5)
+    #expect(mixed.order == Array(0..<10))
+
+    // A run that finds the run limit reached waits, and so does what comes
+    // after it: the window stays a window over the list. Until the first
+    // run is handed over, only the two runs are in it.
+    let blocked = try await walk([true, true, true, false, false, false], limit: 8, heavyLimit: 2)
+    #expect(blocked.heavy == 2)
+    #expect(blocked.beforeFirst == 2)
+    #expect(blocked.order == Array(0..<6))
+}
+
+@Test("The overlay writer holds no more runs than its run limit, and the same file comes out")
+func writerHoldsTheRunLimit() async throws {
+    let folder = try temporaryFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let original = try plainOriginal(pages: 16, in: folder)
+    let units = [[0, 1], [2], [3, 4], [5, 6], [7], [8, 9], [10], [11, 12], [13, 14, 15]]
+    let sequential = folder.appending(path: "sequential.pdf"), limited = folder.appending(path: "limited.pdf")
+    try PDFOverlayWriter().write(original: original.url, overlays: units.flatMap { $0 }.map(plainOverlay), to: sequential)
+    // The first run is slow: with a run limit of two, no other run may begin
+    // before it has been handed over — but pages alone may.
+    let firstDone = Mutex(false)
+    let early = Mutex((runs: 0, pages: 0))
+    try await PDFOverlayWriter().writeConcurrently(
+        file: original.file, pages: original.pages, original: original.url, units: units, to: limited,
+        limit: 8, runLimit: 2
+    ) { unit in
+        if unit == [0, 1] {
+            try await Task.sleep(for: .milliseconds(200))
+            firstDone.withLock { $0 = true }
+        } else if !firstDone.withLock({ $0 }) {
+            early.withLock { unit.count > 1 ? ($0.runs += 1) : ($0.pages += 1) }
+        }
+        return PDFOverlayWriter.OverlayBatch(overlays: unit.map(plainOverlay))
+    }
+    #expect(early.withLock { $0.runs } == 1)
+    #expect(early.withLock { $0.pages } == 1)
+    #expect(try Data(contentsOf: limited) == Data(contentsOf: sequential))
+}
+
 // MARK: - The same in every process
 
 /// Where `writeBatchesForAnotherProcess` writes: set only in a process
