@@ -266,6 +266,15 @@ attachments are missing (`NotebookRenderer` has the same callback).
 `PageRenderer`, which is handed its attachments, draws the same hole and logs
 it.
 
+A page whose bytes **do not arrive** — `PageBlobs` failing with anything other
+than a cancellation — costs that page alone: it is drawn as a page that does
+not parse is (a blank sheet on its template in a notebook, the original page
+without its marks in an annotated document), the export goes on, and
+`onUnfetched` reports how many pages were lost that way, separately from
+`onUnreadable`. A caller that keeps what it is handed may prefer to fail and
+retry instead. Cancelling a render still ends it, and a missing or unopenable
+original is still an error.
+
 A page with a `/UserUnit` other than 1 is refused with
 `RenderError.unsupportedFormat`.
 

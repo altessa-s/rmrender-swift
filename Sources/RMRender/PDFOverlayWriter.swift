@@ -544,6 +544,11 @@ public struct PDFOverlayWriter: Sendable {
                 .appendingPathComponent(".rmrender-\(UUID().uuidString).pdf")
             let handle: FileHandle
             do {
+                // File to file, never through memory: `copyItem` is
+                // `copyfile(3)`, a clone on APFS and a copy in chunks
+                // elsewhere. Read into `Data` and written back, the original
+                // would be in the process twice over — once mapped, once
+                // dirty — on exactly the book this is all for.
                 try FileManager.default.copyItem(at: original, to: temporary)
                 handle = try FileHandle(forWritingTo: temporary)
             } catch {
