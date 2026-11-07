@@ -309,18 +309,20 @@ CoreGraphics prints every coordinate of a page through `vsnprintf`, which
 takes the C library's global locale lock, and deflates each page on the
 thread that draws it — most of what exporting a written page costs, and the
 reason pages drawn side by side do not draw faster. So a PDF's **ink** — the
-fills, lines, pencil grain and erased outlines after the last thing only
-CoreGraphics draws on the page (a picture, a shader layer) — is written by the
-package itself, on the tasks that parse the pages, while CoreGraphics draws the
-rest one page at a time: templates, typed text, pictures, the original page of
-an annotated PDF. The written ink is appended as an incremental update over
+fills, lines, pencil grain and erased outlines after the last picture on the
+page, and the transparency layers the pieces of an erased shader stroke are
+drawn in — is written by the package itself, on the tasks that parse the pages,
+while CoreGraphics draws the rest one page at a time: templates, typed text,
+pictures, the original page of an annotated PDF. The written ink is appended as an incremental update over
 CoreGraphics' document once it is closed, each page's own drawing wrapped so
 that the ink starts from the initial graphics state.
 
 The writer emits the operators CoreGraphics would, with the same numbers
 computed by the same floating-point steps and printed the way CoreGraphics
 prints them, in the same sRGB colour space and with the same graphics states
-and image masks, so a page paints exactly what CoreGraphics drawing all of it
+and image masks — a layer as the transparency group CoreGraphics makes of it,
+blending in Generic RGB, its box CoreGraphics' to the digit — so a page paints
+exactly what CoreGraphics drawing all of it
 paints; the tests hold the two against each other pixel for pixel. It applies
 to notebook exports, redrawn annotated PDFs, and the native pages of an
 annotated PDF's overlay. The bytes do not depend on how many pages were

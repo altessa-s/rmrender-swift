@@ -1072,7 +1072,26 @@ public struct PDFOverlayWriter: Sendable {
             )
             masks["\(InkStream.maskPrefix)\(index)"] = reference(add(image))
         }
-        if !masks.isEmpty { resources["XObject"] = .dictionary(masks) }
+        // The transparency groups after all they name, each a Form of its
+        // own blending in the space CoreGraphics' layers blend in.
+        var objectNames = masks
+        if !form.ink.groups.isEmpty {
+            guard let profile = InkForm.deflatedGroupProfile else { throw RenderError.pdfContextUnavailable }
+            let icc = add(stream(
+                ["N": .integer(3), "Alternate": .name("DeviceRGB"), "Filter": .name("FlateDecode")], profile
+            ))
+            let space = reference(add(.array([.name("ICCBased"), reference(icc)])))
+            let named = (resources["ColorSpace"]?.dictionaryValue ?? [:]).merging(states) { first, _ in first }
+                .merging(masks) { first, _ in first }
+            for (index, group) in form.ink.groups.enumerated() {
+                let operators = group.content.reduce(into: Data()) { $0.append($1) }
+                let dictionary = PreparedInk.groupDictionary(group, length: operators.count, space: space) {
+                    named[$0] ?? .null
+                }
+                objectNames["\(InkStream.groupPrefix)\(index)"] = reference(add(stream(dictionary, operators)))
+            }
+        }
+        if !objectNames.isEmpty { resources["XObject"] = .dictionary(objectNames) }
         let content = stream(
             [
                 "Type": .name("XObject"), "Subtype": .name("Form"), "BBox": rectangle(form.box),

@@ -251,9 +251,12 @@ struct Marks {
     /// and a marker over it, `blankText` a text block of the lines given, as
     /// the tablet writes on a page nobody typed on, `highlights` that many
     /// highlights of a few bands each, as the marker leaves over a PDF's text.
+    /// `shaderPieces` makes every shader stroke the piece of one an eraser
+    /// cut, followed by up to two more of the same source — the strokes
+    /// drawn in one transparency layer.
     mutating func page(
         strokes count: Int, tools: [PenTool] = allTools, pictures: Bool = false, text: Bool = false,
-        blankText: [String]? = nil, template: String? = nil, highlights bands: Int = 0
+        blankText: [String]? = nil, template: String? = nil, highlights bands: Int = 0, shaderPieces: Bool = false
     ) -> RMPage {
         let colors: [PenColor] = [.black, .gray, .blue, .red, .yellow, .green]
         var strokes: [Stroke] = []
@@ -261,9 +264,24 @@ struct Marks {
             let tool = tools[below(tools.count)]
             let points = self.points(count: 3 + below(30), x: uniform(-650, 500), y: uniform(50, 1800))
             let argb: UInt32? = index.isMultiple(of: 4) ? UInt32(below(256)) << 24 | UInt32(random.next() & 0xFF_FFFF) : nil
-            strokes.append(
-                Stroke(tool: tool, color: colors[below(colors.count)], thicknessScale: uniform(0.5, 3), points: points, argb: argb)
+            let stroke = Stroke(
+                tool: tool, color: colors[below(colors.count)], thicknessScale: uniform(0.5, 3), points: points, argb: argb
             )
+            guard shaderPieces, tool == .shader else {
+                strokes.append(stroke)
+                continue
+            }
+            let source = SceneItemID(author: 2, counter: UInt64(index + 1))
+            for piece in 0...below(3) {
+                let start = stroke.points[0]
+                strokes.append(Stroke(
+                    tool: .shader, color: stroke.color, thicknessScale: stroke.thicknessScale,
+                    points: piece == 0 ? points : self.points(
+                        count: 3 + below(12), x: Double(start.x) + uniform(-60, 120), y: Double(start.y) + uniform(-40, 40)
+                    ),
+                    argb: stroke.argb, sourceId: source
+                ))
+            }
         }
         var images: [PageImage] = []
         if pictures {
@@ -502,8 +520,9 @@ private let notebookPageSize = CGSize(width: 1404, height: 1872)
 
 /// Random notebook pages: strokes of every tool on templates, pictures on
 /// some, highlights on others — what the writer leaves to CoreGraphics and
-/// what it takes. A highlighted page of every other three carries no shader,
-/// whose cut pieces only CoreGraphics draws, so that its bands are written.
+/// what it takes —, every shader the pieces an eraser left of one, drawn in
+/// a transparency layer. A highlighted page of every other three carries no
+/// shader.
 private func randomNotebook(seed: UInt64, pages: Int) -> (pages: [RMPage], assets: [String: Data]) {
     // The fixtures' templates, the source every test that draws one installs:
     // tests run side by side, and one that drew the bundled set would draw
@@ -515,7 +534,7 @@ private func randomNotebook(seed: UInt64, pages: Int) -> (pages: [RMPage], asset
         marks.page(
             strokes: 20 + marks.below(40), tools: index % 6 == 2 ? Marks.allTools.filter { $0 != .shader } : Marks.allTools,
             pictures: index % 4 == 3, text: index % 3 == 1, template: templates[index % templates.count],
-            highlights: index % 3 == 2 ? 3 : 0
+            highlights: index % 3 == 2 ? 3 : 0, shaderPieces: true
         )
     }
     return (notebook, ["picture.png": testPicture()])
@@ -548,9 +567,11 @@ func notebookPagesPaintAsCoreGraphicsDoes() throws {
     let notebook = randomNotebook(seed: 0xB00C, pages: 12)
     let written = try PageRenderer.pdf(pages: notebook.pages, pageSize: notebookPageSize, assets: notebook.assets)
     let native = try InkTesting.allCoreGraphics(pages: notebook.pages, pageSize: notebookPageSize, assets: notebook.assets)
-    // Ink was written apart, and is not where CoreGraphics put the rest.
+    // Ink was written apart, and is not where CoreGraphics put the rest; so
+    // are the layers of the erased shader strokes.
     #expect(try PDFFile(bytes: written).pages().count == notebook.pages.count)
     #expect(String(decoding: try InkTesting.content(of: written, page: 1), as: UTF8.self).contains("/RMIc"))
+    #expect(String(decoding: written, as: UTF8.self).contains("/S /Transparency"))
     for number in 1...notebook.pages.count {
         for scale in [1.0, 2.5] {
             #expect(try InkTesting.differingPixels(native, written, page: number, scale: scale) == 0, "page \(number) at \(scale)")
@@ -558,6 +579,43 @@ func notebookPagesPaintAsCoreGraphicsDoes() throws {
     }
     // A reader that is not CoreGraphics opens it as well.
     #expect(PDFDocument(data: written)?.pageCount == notebook.pages.count)
+}
+
+@Test("Without the group profile, layers are CoreGraphics' again and every page paints as it did")
+func layersFallBackWithoutTheGroupProfile() throws {
+    try InkStream.$groupProfileWithheld.withValue(true) {
+        #expect(!InkStream.groupsAvailable)
+        let notebook = randomNotebook(seed: 0xFA11, pages: 6)
+        let written = try PageRenderer.pdf(pages: notebook.pages, pageSize: notebookPageSize, assets: notebook.assets)
+        let native = try InkTesting.allCoreGraphics(
+            pages: notebook.pages, pageSize: notebookPageSize, assets: notebook.assets
+        )
+        let text = String(decoding: written, as: UTF8.self)
+        // No group of ours; CoreGraphics' own layers, as many as it draws
+        // drawing it all.
+        #expect(!text.contains("/RMIf"))
+        #expect(text.contains("/S /Transparency"))
+        #expect(
+            text.components(separatedBy: "/S /Transparency").count
+                == String(decoding: native, as: UTF8.self).components(separatedBy: "/S /Transparency").count
+        )
+        for number in 1...notebook.pages.count {
+            #expect(try InkTesting.differingPixels(native, written, page: number, scale: 1.5) == 0, "page \(number)")
+        }
+
+        // An overlay's native page the same way.
+        var marks = Marks(random: SplitMix64(seed: 0xFA12))
+        let sheet = CGRect(origin: .zero, size: CGSize(width: 612, height: 792))
+        let page = marks.page(strokes: 30, text: true, shaderPieces: true)
+        let overlays = try [true, false].map { writesInk in
+            try InkTesting.nativeOverlay(page, sheet: sheet, writesInk: writesInk)
+        }
+        let overlaid = try overlays.map { try InkTesting.overlaid([$0], sheet: sheet) }
+        #expect(!String(decoding: overlaid[0], as: UTF8.self).contains("/RMIf"))
+        #expect(try InkTesting.differingPixels(overlaid[1], overlaid[0], page: 1, scale: 1.5) == 0)
+    }
+    // Outside it, the groups are written.
+    #expect(InkStream.groupsAvailable)
 }
 
 @Test("Pages prepared side by side make the file pages prepared one by one make")
@@ -580,8 +638,8 @@ func preparedSideBySideIsTheSameFile() async throws {
 
 /// The `.rm` of a page of random marks of every tool, typed text on some,
 /// a picture on others and highlights on every other one, as the tablet
-/// writes one. Every fourth page carries no shader, so that its highlights
-/// are written with its ink.
+/// writes one; on three pages of four, the pieces erasers left of shader
+/// strokes. Every fourth page carries no shader.
 private func randomMarks(_ marks: inout Marks, index: Int) throws -> Data {
     let tools: [PenTool] = [
         .paintbrush2, .mechanicalPencil2, .pencil2, .ballpoint2, .marker2, .fineliner2, .highlighter2,
@@ -616,6 +674,28 @@ private func randomMarks(_ marks: inout Marks, index: Int) throws -> Data {
             column: .init(.medium), paragraphs: paragraphs, strokes: strokes, images: images
         )
     )
+    if !index.isMultiple(of: 4) {
+        // Shader strokes an eraser cut, their pieces one transparency layer
+        // each source.
+        var item: UInt64 = 0
+        for source in 0..<(1 + marks.below(3)) {
+            let argb = 0x4000_0000 | UInt32(marks.below(0xFF_FFFF))
+            var x = marks.uniform(-600, 300), y = marks.uniform(100, 1700)
+            for _ in 0...marks.below(3) {
+                let points = (0..<(4 + marks.below(10))).map { _ in
+                    x += marks.uniform(4, 30)
+                    y += marks.uniform(-6, 6)
+                    return StrokeSample(x: Float(x), y: Float(y), width: 88, pressure: UInt8(150 + marks.below(100)))
+                }
+                item += 1
+                page.append(contentsOf: shaderPieceBlock(
+                    points: points, argb: argb, item: 7000 + item, left: item == 1 ? 0 : 7000 + item - 1,
+                    source: UInt64(9000 + source)
+                ))
+                x += marks.uniform(10, 60)
+            }
+        }
+    }
     if index.isMultiple(of: 2) {
         for band in 0..<3 {
             let top = marks.uniform(100, 1600)
@@ -705,6 +785,8 @@ func redrawnPagesPaintAsCoreGraphicsDoes() async throws {
     context.closePDF()
     let native = reference as Data
     #expect(String(decoding: try InkTesting.content(of: written, page: 1), as: UTF8.self).contains("/RMIc"))
+    // The layers of the erased shader strokes, written with the ink.
+    #expect(String(decoding: written, as: UTF8.self).contains("/RMIf0"))
     // Highlights among them, written with the ink of the pages that let them.
     #expect(writtenHighlights >= 2)
     for page in 1...pages {
@@ -734,8 +816,9 @@ func overlayNativePagesPaintAsCoreGraphicsDoes() throws {
     let sheet = CGRect(origin: .zero, size: CGSize(width: 612, height: 792))
     var written: [PDFOverlayWriter.Overlay] = [], native: [PDFOverlayWriter.Overlay] = []
     for index in 0..<pages {
-        // Typed text on every page, so that every overlay is a native one.
-        let page = marks.page(strokes: 30, pictures: index.isMultiple(of: 2), text: true)
+        // Typed text on every page, so that every overlay is a native one;
+        // erased shader strokes, whose layers are written with the ink.
+        let page = marks.page(strokes: 30, pictures: index.isMultiple(of: 2), text: true, shaderPieces: true)
         for writesInk in [true, false] {
             let overlay = try InkTesting.nativeOverlay(page, index: index, sheet: sheet, images: images, writesInk: writesInk)
             if writesInk { written.append(overlay) } else { native.append(overlay) }
@@ -746,6 +829,7 @@ func overlayNativePagesPaintAsCoreGraphicsDoes() throws {
     try PDFOverlayWriter().write(original: original, overlays: native, to: nativeURL)
     let writtenPDF = try Data(contentsOf: writtenURL), nativePDF = try Data(contentsOf: nativeURL)
     #expect(String(decoding: writtenPDF, as: UTF8.self).contains("/RMIc"))
+    #expect(String(decoding: writtenPDF, as: UTF8.self).contains("/RMIf"))
     for page in 1...pages {
         #expect(try InkTesting.differingPixels(nativePDF, writtenPDF, page: page, scale: 1.5) == 0, "page \(page)")
     }
