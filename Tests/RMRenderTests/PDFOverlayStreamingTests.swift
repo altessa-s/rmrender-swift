@@ -291,6 +291,12 @@ func aLongBookIsStreamed() throws {
 /// are objects of their own — a font, its descriptor and file, an image —
 /// which the overlay copies over and numbers afresh.
 private func nativeDrawing(_ seed: Int) throws -> Data {
+    try nativeDrawing(text: "page \(seed)", picture: seed)
+}
+
+/// The same with the text and the picture chosen apart: two drawings that
+/// share one of them share its objects in the overlay.
+private func nativeDrawing(text line: String, picture seed: Int, at origin: CGPoint = CGPoint(x: 20, y: 250)) throws -> Data {
     let data = NSMutableData()
     var box = CGRect(x: 0, y: 0, width: 200, height: 300)
     let consumer = try #require(CGDataConsumer(data: data))
@@ -298,10 +304,10 @@ private func nativeDrawing(_ seed: Int) throws -> Data {
     context.beginPDFPage(nil)
     let font = CTFontCreateWithName("Helvetica" as CFString, 14, nil)
     let text = NSAttributedString(
-        string: "page \(seed)",
+        string: line,
         attributes: [NSAttributedString.Key(kCTFontAttributeName as String): font]
     )
-    context.textPosition = CGPoint(x: 20, y: 250)
+    context.textPosition = origin
     CTLineDraw(CTLineCreateWithAttributedString(text), context)
     let pixels = (0..<64).map { UInt8(truncatingIfNeeded: $0 &* 37 &+ seed) }
     let provider = try #require(CGDataProvider(data: Data(pixels) as CFData))
@@ -344,8 +350,11 @@ private func mixedOverlays(pages: [Int]) throws -> [Int: PDFOverlayWriter.Overla
                 box: CGRect(x: -10, y: -20, width: 230, height: 340)
             )
         case 2:
+            // The text of its own page, a picture one of three: some of
+            // the drawings' objects are shared, some are not.
             overlays[page] = PDFOverlayWriter.Overlay(
-                pageIndex: page, content: Data("q /RMNative Do Q\n".utf8), states: [], formPDF: try nativeDrawing(page)
+                pageIndex: page, content: Data("q /RMNative Do Q\n".utf8), states: [],
+                formPDF: try nativeDrawing(text: "page \(page)", picture: page % 3)
             )
         default:
             overlays[page] = line(page, y: 20 + page)
@@ -496,6 +505,193 @@ func crossReferencePadding() {
             #expect(String(decoding: padded, as: UTF8.self) == String(format: "%0*ld", width, value), "\(value)")
         }
     }
+}
+
+// MARK: - What the native drawings share
+
+/// Every pixel of one page (counted from one), drawn by CoreGraphics at
+/// twice its size.
+private func pixels(_ url: URL, page: Int) throws -> Data {
+    let provider = try #require(CGDataProvider(url: url as CFURL))
+    let document = try #require(CGPDFDocument(provider))
+    let pdfPage = try #require(document.page(at: page))
+    let box = pdfPage.getBoxRect(.mediaBox)
+    let width = Int(box.width) * 2, height = Int(box.height) * 2
+    let context = try #require(
+        CGContext(
+            data: nil, width: width, height: height, bitsPerComponent: 8,
+            bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        )
+    )
+    context.setFillColor(gray: 1, alpha: 1)
+    context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+    context.scaleBy(x: 2, y: 2)
+    context.translateBy(x: -box.minX, y: -box.minY)
+    context.drawPDFPage(pdfPage)
+    return Data(bytes: try #require(context.data), count: width * height * 4)
+}
+
+/// The references among the resources of the native drawing of `page`, by
+/// kind and name: which objects that page's drawing uses.
+private func nativeResources(of file: PDFFile, page: Int) throws -> [String: PDFObject] {
+    let native = try form("RMNative", of: file, page: page, inside: "RMOverlay")
+    let resources = try #require(try file.resolve(native.dictionary["Resources"]).dictionaryValue)
+    var references: [String: PDFObject] = [:]
+    for kind in ["Font", "XObject", "ColorSpace"] {
+        for (name, value) in try file.resolve(resources[kind]).dictionaryValue ?? [:] {
+            references["\(kind)/\(name)"] = value
+        }
+    }
+    return references
+}
+
+@Test("A picture and a typeface drawn on many pages are written once, and every page draws as it did")
+func nativeObjectsAreShared() async throws {
+    let original = try blankDocument(pages: 6)
+    let output = original.deletingPathExtension().appendingPathExtension("shared.pdf")
+    defer { try? FileManager.default.removeItem(at: original.deletingLastPathComponent()) }
+    // Four pages with the same words and picture in different places, a
+    // fifth with words and a picture of its own, a sixth with a line.
+    var overlays: [PDFOverlayWriter.Overlay] = []
+    for page in 0..<4 {
+        overlays.append(PDFOverlayWriter.Overlay(
+            pageIndex: page, content: Data("q /RMNative Do Q\n".utf8), states: [],
+            formPDF: try nativeDrawing(text: "the same words", picture: 1, at: CGPoint(x: 20, y: 200 + 10 * page))
+        ))
+    }
+    overlays.append(PDFOverlayWriter.Overlay(
+        pageIndex: 4, content: Data("q /RMNative Do Q\n".utf8), states: [],
+        formPDF: try nativeDrawing(text: "quite other text", picture: 2)
+    ))
+    overlays.append(line(5))
+    try PDFOverlayWriter().write(original: original, overlays: overlays, to: output)
+
+    let file = try PDFFile(url: output)
+    #expect(try file.pages().count == 6)
+    #expect(PDFDocument(url: output)?.pageCount == 6)
+    let first = try nativeResources(of: file, page: 0)
+    #expect(first.keys.contains { $0.hasPrefix("Font/") })
+    #expect(first.keys.contains { $0.hasPrefix("XObject/") })
+    for page in 1..<4 {
+        #expect(try nativeResources(of: file, page: page) == first, "page \(page)")
+    }
+    let other = try nativeResources(of: file, page: 4)
+    let pictures = { (resources: [String: PDFObject]) in resources.filter { $0.key.hasPrefix("XObject/") }.values }
+    #expect(Set(pictures(other).map { "\($0)" }).isDisjoint(with: pictures(first).map { "\($0)" }))
+
+    // In the update itself, one picture and one typeface for the four pages
+    // and one each for the fifth: nothing written twice.
+    let update = try Data(contentsOf: output).dropFirst(try Data(contentsOf: original).count)
+    let count = { (needle: String) in
+        var found = 0
+        var start = update.startIndex
+        while let range = update.range(of: Data(needle.utf8), in: start..<update.endIndex) {
+            found += 1
+            start = range.upperBound
+        }
+        return found
+    }
+    #expect(count("/Subtype /Image") == 2)
+    #expect(count("/Type /FontDescriptor") == 2)
+
+    // Each page drawn as it is when it is the only one in its update, and
+    // so has nothing to share: to the pixel.
+    for overlay in overlays {
+        let alone = original.deletingPathExtension().appendingPathExtension("alone\(overlay.pageIndex).pdf")
+        try PDFOverlayWriter().write(original: original, overlays: [overlay], to: alone)
+        let page = overlay.pageIndex + 1
+        #expect(try pixels(output, page: page) == (try pixels(alone, page: page)), "page \(page)")
+        #expect(try pixels(output, page: page) != (try pixels(original, page: page)), "page \(page)")
+    }
+}
+
+@Test("A fingerprint is what an object says, whatever its number, and none for a cycle")
+func nativeFingerprints() throws {
+    let program = PDFObject.stream(dictionary: ["Length": .integer(3)], data: Data("abc".utf8))
+    func descriptor(_ file: Int) -> PDFObject {
+        .dictionary(["Type": .name("FontDescriptor"), "FontFile2": .reference(number: file, generation: 0)])
+    }
+    // The program numbered first, then numbered second.
+    let early = try #require(PDFOverlayWriter.fingerprint(program, known: [nil, nil]))
+    let late = try #require(PDFOverlayWriter.fingerprint(program, known: [nil, nil]))
+    #expect(early == late)
+    let one = PDFOverlayWriter.fingerprint(descriptor(0), known: [early, nil])
+    let two = PDFOverlayWriter.fingerprint(descriptor(1), known: [nil, late])
+    #expect(one != nil)
+    #expect(one == two)
+    // Another program: another descriptor.
+    let otherProgram = PDFObject.stream(dictionary: ["Length": .integer(3)], data: Data("abd".utf8))
+    let other = try #require(PDFOverlayWriter.fingerprint(otherProgram, known: [nil, nil]))
+    #expect(PDFOverlayWriter.fingerprint(descriptor(0), known: [other, nil]) != one)
+    // Neither the dictionary nor the stream's bytes taken for the other.
+    #expect(PDFOverlayWriter.fingerprint(.dictionary(["Length": .integer(3)]), known: []) != early)
+    // A reference to what has no fingerprint yet — a cycle — gives none.
+    #expect(PDFOverlayWriter.fingerprint(descriptor(1), known: [nil, nil]) == nil)
+    #expect(PDFOverlayWriter.fingerprint(descriptor(7), known: [nil, nil]) == nil)
+    // A layer is the object itself, and is never taken for another.
+    let layer = PDFObject.dictionary(["Type": .name("OCG"), "Name": .string(Data("(Ink)".utf8))])
+    #expect(PDFOverlayWriter.fingerprint(layer, known: []) == nil)
+    let marked = PDFObject.dictionary(["OC": .dictionary(["Type": .name("OCMD"), "P": .name("AnyOn")])])
+    #expect(PDFOverlayWriter.fingerprint(marked, known: []) == nil)
+}
+
+/// A one-page PDF written by hand whose resources refer back to themselves:
+/// a Form naming itself among its own XObjects, which CoreGraphics never
+/// writes and a file may.
+private func cyclicDrawing() -> Data {
+    let content = "q /X1 Do Q"
+    let drawing = "0 g 60 200 80 40 re f"
+    let bodies = [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] /Resources << /XObject << /X1 5 0 R >> >> /Contents 4 0 R >>",
+        "<< /Length \(content.utf8.count) >>\nstream\n\(content)\nendstream",
+        """
+        << /Type /XObject /Subtype /Form /BBox [0 0 200 300] /Resources << /XObject << /Me 5 0 R >> >> \
+        /Length \(drawing.utf8.count) >>\nstream\n\(drawing)\nendstream
+        """,
+    ]
+    var pdf = "%PDF-1.4\n"
+    var offsets: [Int] = []
+    for (index, body) in bodies.enumerated() {
+        offsets.append(pdf.utf8.count)
+        pdf += "\(index + 1) 0 obj\n\(body)\nendobj\n"
+    }
+    let table = pdf.utf8.count
+    pdf += "xref\n0 \(bodies.count + 1)\n0000000000 65535 f \n"
+    for offset in offsets { pdf += String(format: "%010d 00000 n \n", offset) }
+    pdf += "trailer\n<< /Size \(bodies.count + 1) /Root 1 0 R >>\nstartxref\n\(table)\n%%EOF\n"
+    return Data(pdf.utf8)
+}
+
+@Test("An object that refers back to itself is written on every page that has it, and draws")
+func cyclicNativeObjectsAreNotShared() throws {
+    let original = try blankDocument(pages: 3)
+    let output = original.deletingPathExtension().appendingPathExtension("cyclic.pdf")
+    defer { try? FileManager.default.removeItem(at: original.deletingLastPathComponent()) }
+    let overlays = (0..<2).map {
+        PDFOverlayWriter.Overlay(pageIndex: $0, content: Data("q /RMNative Do Q\n".utf8), states: [], formPDF: cyclicDrawing())
+    } + [line(2)]
+    try PDFOverlayWriter().write(original: original, overlays: overlays, to: output)
+
+    let file = try PDFFile(url: output)
+    #expect(try file.pages().count == 3)
+    #expect(PDFDocument(url: output)?.pageCount == 3)
+    var forms: [PDFObject] = []
+    for page in 0..<2 {
+        let reference = try #require(try nativeResources(of: file, page: page)["XObject/X1"])
+        forms.append(reference)
+        // Still itself: the Form names its own number.
+        guard case .stream(let dictionary, _) = try file.resolve(reference) else {
+            Issue.record("no Form on page \(page)")
+            continue
+        }
+        let own = try file.resolve(dictionary["Resources"]).dictionaryValue?["XObject"]
+        #expect(try file.resolve(own).dictionaryValue?["Me"] == reference)
+        #expect(try darkPixels(output, page: page + 1) > (try darkPixels(original, page: page + 1)) + 2000)
+    }
+    #expect(forms[0] != forms[1])
 }
 
 // MARK: - The same file from every process
