@@ -268,6 +268,8 @@ public struct NotebookRenderer: Sendable {
         let placeholders = unfetchedPages == .placeholder ? parsed.unfetched : []
         return try await RenderWork.detached {
             try wanted.map { index in
+                // Asked between pages, as the PDF's drawing asks it.
+                try Task.checkCancellation()
                 if placeholders.contains(index) {
                     return try PageRenderer.placeholderImage(
                         pageSize: parsed.pageSize, scale: scale, grayscale: grayscale
@@ -319,6 +321,7 @@ public struct NotebookRenderer: Sendable {
             // this notebook does not have as one past the end, and a
             // subscript below zero is a trap rather than a missing image.
             for index in wanted.sorted() where parsed.pages.indices.contains(index) {
+                try Task.checkCancellation()
                 images[index] = try PageRenderer.image(
                     page: parsed.pages[index], pageSize: parsed.pageSize, scale: scale,
                     images: PageRenderer.PageImages(decoded: parsed.images), inkOnly: true, grayscale: false
@@ -524,6 +527,8 @@ public struct NotebookRenderer: Sendable {
             }
             do {
                 return (try await parse(data).with(templateName: template), false)
+            } catch let error as CancellationError {
+                throw error
             } catch {
                 throw RenderError.malformedPage(
                     "page \(position) parsed when measured and not when drawn: \(String(describing: error))"
@@ -757,6 +762,10 @@ public struct NotebookRenderer: Sendable {
                 do {
                     let page = try await parse(data)
                     return (Measured(page.with(templateName: job.template), keep), nil)
+                } catch let error as CancellationError {
+                    // Not a page that would not parse: the render was given
+                    // up on, and the walk ends here rather than reading on.
+                    throw error
                 } catch ParseError.unsupportedVersion(let version) {
                     let blank = RMPage(strokes: [], skippedBlocks: 1)
                     return (Measured(blank.with(templateName: job.template), keep), .unsupported(version: version))

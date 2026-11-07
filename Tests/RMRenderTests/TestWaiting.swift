@@ -30,10 +30,21 @@ actor Gate {
     private var arrivals = 0
     private var waitingToPass: [CheckedContinuation<Void, Never>] = []
     private var waitingForArrival: [CheckedContinuation<Void, Never>] = []
+    /// Comers waved through before the gate starts stopping anybody — for
+    /// work that passes the same place more than once, held at a later pass.
+    private var toWaveThrough: Int
+
+    init(wavingThrough count: Int = 0) {
+        toWaveThrough = count
+    }
 
     /// Called from the code under test: stop here until the gate opens, and let
     /// the test know something is standing at it.
     func stopHere() async {
+        if toWaveThrough > 0 {
+            toWaveThrough -= 1
+            return
+        }
         arrivals += 1
         for watcher in waitingForArrival { watcher.resume() }
         waitingForArrival = []

@@ -68,9 +68,17 @@ enum RenderWork {
     /// cancelled would run to its last page regardless, and the caller would
     /// stay parked until it did. `cancel()` only raises the flag; the work
     /// has to ask, which `PageRenderer.pdf` does between pages.
+    ///
+    /// A caller cancelled already is answered `CancellationError` and the
+    /// work is never started. The handler alone does not cover it: it is
+    /// installed after the task exists, and a task that exists may run.
+    /// On a loaded machine the caller's thread can be put aside for the
+    /// moment between the two, and a short drawing finishes inside that
+    /// moment, unasked — a render cancelled before it began came back whole.
     static func detached<T: Sendable>(
         _ body: @escaping @Sendable () throws -> T
     ) async throws -> T {
+        try Task.checkCancellation()
         let work = Task.detached(priority: .userInitiated, operation: body)
         return try await withTaskCancellationHandler {
             try await work.value
@@ -82,10 +90,12 @@ enum RenderWork {
     /// The same for work that waits on something as it goes — a drawing that
     /// fetches and parses its next pages while it draws this one. Named apart
     /// rather than overloaded: a closure that does not wait would fit either,
-    /// and which one it took would be the compiler's guess.
+    /// and which one it took would be the compiler's guess. A caller
+    /// cancelled already is refused the same way.
     static func detachedWaiting<T: Sendable>(
         _ body: @escaping @Sendable () async throws -> T
     ) async throws -> T {
+        try Task.checkCancellation()
         let work = Task.detached(priority: .userInitiated, operation: body)
         return try await withTaskCancellationHandler {
             try await work.value

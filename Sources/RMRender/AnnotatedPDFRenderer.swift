@@ -709,6 +709,8 @@ public struct AnnotatedPDFRenderer: Sendable {
         }
         do {
             return try await parse(data)
+        } catch let error as CancellationError {
+            throw error
         } catch {
             throw RenderError.malformedPage(
                 "the marks on page \(position) parsed when measured and not when drawn: \(String(describing: error))"
@@ -1245,6 +1247,9 @@ public struct AnnotatedPDFRenderer: Sendable {
             do {
                 let page = try await parse(data)
                 return ((keep(page), page.paperSize, page.skippedBlocks), nil)
+            } catch let error as CancellationError {
+                // A render given up on, not marks that would not parse.
+                throw error
             } catch ParseError.unsupportedVersion(let version) {
                 return (nil, .unsupported(version: version))
             } catch {
