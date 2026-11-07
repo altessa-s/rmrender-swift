@@ -184,8 +184,8 @@ final class InkStream {
 
     /// `mask` painted in an opaque colour at `alpha` through the clip of
     /// `clip`, into `rectangle`: what `addPath`, `clip` and
-    /// `draw(_:in:)` of an image mask paint — the mask whole where `clip`
-    /// is empty, as there.
+    /// `draw(_:in:)` of an image mask paint. Nothing where `clip` has no
+    /// elements, as `StrokePaint.draw` paints nothing there.
     func mask(
         _ bits: StrokeGrainMask.Bits,
         in rectangle: CGRect,
@@ -196,15 +196,14 @@ final class InkStream {
         alpha: Double,
         darkens: Bool
     ) {
+        // A contour of nothing — one an eraser took away entirely — paints
+        // nothing. `W n` wants a path, and without one the whole mask would
+        // be drawn; nor is the mask named, so it does not go into the file.
+        guard !clip.isEmpty else { return }
         let name = maskName(bits)
         put("q\n")
-        // An empty clip is no clip: CoreGraphics clips to nothing only where
-        // there is a path, and draws the whole mask of a contour an eraser
-        // took away entirely.
-        if !clip.isEmpty {
-            devicePath(clip)
-            put("W n\n")
-        }
+        devicePath(clip)
+        put("W n\n")
         put("/Perceptual ri\n")
         // Inside `q`: the colour and the state end at its `Q`, so what is
         // tracked outside it stays as it was.

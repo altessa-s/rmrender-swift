@@ -828,6 +828,10 @@ public enum PageRenderer {
                 context.setFillColor(red: red, green: green, blue: blue, alpha: 1)
                 context.addPath(path)
                 context.fillPath(using: .winding)
+            case .mask(let clip, _, _) where clip.isEmpty:
+                // A contour of nothing: nothing to paint. Clipping to it
+                // would clip nothing away and draw the whole mask.
+                break
             case .mask(let clip, let bits, let rectangle):
                 context.setFillColor(red: red, green: green, blue: blue, alpha: 1)
                 if let mask = StrokeGrainMask.image(of: masks?.drawn(bits) ?? bits) {
@@ -923,6 +927,14 @@ public enum PageRenderer {
                 ? strokedOutline(of: stroke, pageSize: pageSize)
                 : outline(of: stroke, pageSize: pageSize)
             for eraser in erasers { shape = shape.subtracting(eraser) }
+            // Erased entirely — or a contour of nothing to begin with: the
+            // stroke paints nothing. It must not go on as a clip: CoreGraphics
+            // clips to nothing only where there is a path, and a pencil
+            // stroke an eraser took away whole came out as the full rectangle
+            // of its grain. A contour of no area still has its elements, and
+            // clips to nothing as it should, so only a path of none is left
+            // out here.
+            if shape.isEmpty { return nil }
             let grain = stroke.grain
             if grain != .solid,
                let box = StrokeGrainMask.box(of: stroke),
