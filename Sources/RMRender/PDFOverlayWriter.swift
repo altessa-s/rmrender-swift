@@ -4,6 +4,7 @@
 
 import Compression
 import CoreGraphics
+import CryptoKit
 import Foundation
 
 /// Writing PDF objects back out.
@@ -510,6 +511,11 @@ public struct PDFOverlayWriter: Sendable {
         private var openState = 0
         private var closeState = 0
         private var stateObjects: [StateAppearance: Int] = [:]
+        /// The native drawings' objects already in the update, by what
+        /// they say (`PreparedPage.Native.fingerprints`): the number each
+        /// was written under, and not its bytes, so that what is held grows
+        /// by a few dozen bytes an object whatever the size of the object.
+        private var sharedObjects: [SHA256.Digest: Int] = [:]
 
         /// What can be refused from what is known up front is refused here,
         /// before anything is written — see `write(file:…overlay:)`.
@@ -634,6 +640,46 @@ public struct PDFOverlayWriter: Sendable {
             return number
         }
 
+        /// A native drawing's objects and its Form written out, and the
+        /// number of the Form.
+        ///
+        /// An object some page before this one already wrote — the same
+        /// bytes, referring to the same things — is not written again: the
+        /// page refers to the one in the file. CoreGraphics draws every page
+        /// into a PDF of its own and puts into each everything that page
+        /// uses, so a picture on fifty pages came out fifty times over, and
+        /// so did the colour profiles, and a typeface wherever two pages set
+        /// the same letters in it. What is shared is only what the drawing
+        /// refers to — pictures, typefaces, profiles — never the page or the
+        /// Form that draws it; such a resource is read for what it says, not
+        /// for which object it is, so two that say the same thing can be one
+        /// (the exception, a layer, is never shared — see `fingerprint`).
+        ///
+        /// The rest are numbered from here, as they would have been
+        /// numbered had the PDF been read now: the numbers after the last
+        /// one made, in the order the reading reached the objects, and the
+        /// Form the one after those. Which objects are shared depends only
+        /// on the pages before, appended in the order of `pageIndices`, so
+        /// the numbers are the same however the pages were made.
+        private func emit(native: PreparedPage.Native) -> Int {
+            var numbers = [Int](repeating: 0, count: native.objects.count)
+            var fresh = [Bool](repeating: false, count: native.objects.count)
+            for (local, fingerprint) in native.fingerprints.enumerated() {
+                if let fingerprint, let number = sharedObjects[fingerprint] {
+                    numbers[local] = number
+                    continue
+                }
+                numbers[local] = nextNumber
+                nextNumber += 1
+                fresh[local] = true
+                if let fingerprint { sharedObjects[fingerprint] = numbers[local] }
+            }
+            for object in native.objects where fresh[object.number] {
+                _ = emit(PDFOverlayWriter.renumbered(object.object, to: numbers), number: numbers[object.number])
+            }
+            return emit(PDFOverlayWriter.renumbered(native.form, to: numbers))
+        }
+
         /// The overlay of the next page of `pageIndices`, written out.
         func append(_ overlay: Overlay) throws {
             try append(try writer.prepare(overlay))
@@ -698,16 +744,7 @@ public struct PDFOverlayWriter: Sendable {
             scopedStates.merge(states) { _, added in added }
             scopedObjects.merge(stencils) { _, added in added }
             if let native = prepared.native {
-                // Numbered from here, as they would have been numbered had
-                // the PDF been read now: the objects take the numbers after
-                // the last one made, in the order the reading reached them,
-                // and the Form the one after those.
-                let base = nextNumber
-                nextNumber += native.objects.count
-                for object in native.objects {
-                    _ = emit(PDFOverlayWriter.renumbered(object.object, from: base), number: base + object.number)
-                }
-                let form = emit(PDFOverlayWriter.renumbered(native.form, from: base))
+                let form = emit(native: native)
                 scopedObjects["RMNative"] = .reference(number: form, generation: 0)
             }
 
@@ -818,6 +855,10 @@ public struct PDFOverlayWriter: Sendable {
         struct Native: Sendable {
             let objects: [(number: Int, object: PDFObject)]
             let form: PDFObject
+            /// What each object says, by its number: see `fingerprint`.
+            /// Worked out here, beside the reading, so that the update is
+            /// left only looking them up.
+            let fingerprints: [SHA256.Digest?]
         }
 
         let pageIndex: Int
@@ -930,22 +971,86 @@ public struct PDFOverlayWriter: Sendable {
             "Resources": try copy(source.resolve(first.resources)),
             "Filter": .name("FlateDecode"),
         ], PDFWriter.flate(content))
-        return PreparedPage.Native(objects: objects, form: form)
+        // In the order they are listed: an object comes after everything it
+        // refers to, so what it refers to has its fingerprint already.
+        var fingerprints = [SHA256.Digest?](repeating: nil, count: objects.count)
+        for object in objects {
+            fingerprints[object.number] = Self.fingerprint(object.object, known: fingerprints)
+        }
+        return PreparedPage.Native(objects: objects, form: form, fingerprints: fingerprints)
     }
 
-    /// `object` with every reference in it moved up by `base`: a prepared
-    /// native drawing's numbers turned into the update's. Every reference in
-    /// such an object is one `native` made, so all of them move.
-    private static func renumbered(_ object: PDFObject, from base: Int) -> PDFObject {
+    /// What a native drawing's object says, down to what it refers to: the
+    /// SHA-256 of its bytes as `PDFWriter` writes them, with every reference
+    /// written as the fingerprint of the object it names rather than as its
+    /// number. Two objects of two drawings with one fingerprint say the same
+    /// thing, and so do all the objects they refer to.
+    ///
+    /// `nil` for an object that refers to one with no fingerprint: one not
+    /// listed before it, which only a cycle makes. `nil` too for a layer
+    /// (`/OCG`, `/OCMD`): a layer is the object itself — two alike are two
+    /// layers a reader shows and hides apart — and CoreGraphics draws none,
+    /// but a caller's drawing may carry them. Such an object is written on
+    /// every page that has it, as it always was, and so is all that refers
+    /// to it.
+    static func fingerprint(_ object: PDFObject, known: [SHA256.Digest?]) -> SHA256.Digest? {
+        var unshareable = false
+        func resolved(_ value: PDFObject) -> PDFObject {
+            switch value {
+            case .dictionary(let entries) where ["OCG", "OCMD"].contains(entries["Type"]?.nameValue):
+                unshareable = true
+                return .null
+            case .reference(let number, _):
+                guard known.indices.contains(number), let digest = known[number] else {
+                    unshareable = true
+                    return .null
+                }
+                // An `R` and the digest's 32 bytes: no string, name, number
+                // or keyword the writer makes begins with an `R`, and the
+                // digest is always as long, so this reads as nothing else.
+                return .string(Data("R".utf8) + Data(digest))
+            case .array(let items):
+                return .array(items.map(resolved))
+            case .dictionary(let entries):
+                return .dictionary(entries.mapValues(resolved))
+            case .stream:
+                // Only ever an object of its own, never inside another; one
+                // that is would carry its numbers into the bytes unturned.
+                unshareable = true
+                return .null
+            default:
+                return value
+            }
+        }
+        var hasher = SHA256()
+        if case .stream(let dictionary, let data) = object {
+            let text = PDFWriter.bytes(of: resolved(.dictionary(dictionary)))
+            guard !unshareable else { return nil }
+            // The bytes hashed as they are, not copied in after the text: a
+            // picture's stream is megabytes.
+            hasher.update(data: Data("S".utf8) + text)
+            hasher.update(data: data)
+        } else {
+            let text = PDFWriter.bytes(of: resolved(object))
+            guard !unshareable else { return nil }
+            hasher.update(data: Data("O".utf8) + text)
+        }
+        return hasher.finalize()
+    }
+
+    /// `object` with every reference in it turned from a prepared native
+    /// drawing's number into the update's: `numbers[n]` for `n`. Every
+    /// reference in such an object is one `native` made, so all of them move.
+    private static func renumbered(_ object: PDFObject, to numbers: [Int]) -> PDFObject {
         switch object {
         case .reference(let number, let generation):
-            return .reference(number: base + number, generation: generation)
+            return .reference(number: numbers[number], generation: generation)
         case .array(let items):
-            return .array(items.map { renumbered($0, from: base) })
+            return .array(items.map { renumbered($0, to: numbers) })
         case .dictionary(let entries):
-            return .dictionary(entries.mapValues { renumbered($0, from: base) })
+            return .dictionary(entries.mapValues { renumbered($0, to: numbers) })
         case .stream(let dictionary, let data):
-            return .stream(dictionary: dictionary.mapValues { renumbered($0, from: base) }, data: data)
+            return .stream(dictionary: dictionary.mapValues { renumbered($0, to: numbers) }, data: data)
         default:
             return object
         }
