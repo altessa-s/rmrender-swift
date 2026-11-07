@@ -79,9 +79,18 @@ public struct AnnotatedPDFRenderer: Sendable {
     /// downloaded again on every render — for example, 112 MB take 33.8 s of
     /// download against a second of drawing.
     private let blobs: any PageBlobs
+    /// How many pages of the document one run of native Forms spans
+    /// (`overlayUnits`): `Self.nativeRunPages`, unless a test asks for
+    /// another — one, to draw every native Form alone, as a PDF of its own.
+    private let nativeRunPages: Int
 
     public init(blobs: any PageBlobs) {
+        self.init(blobs: blobs, nativeRunPages: Self.nativeRunPages)
+    }
+
+    init(blobs: any PageBlobs, nativeRunPages: Int) {
         self.blobs = blobs
+        self.nativeRunPages = max(nativeRunPages, 1)
     }
 
     /// The document's pages, each the original page with its marks over it,
@@ -652,12 +661,18 @@ public struct AnnotatedPDFRenderer: Sendable {
         /// merely opened carries an empty `.rm` and nothing to write.
         let hasContent: Bool
         let imageFiles: [String]
+        /// Whether they set any typed text: what decides which pages share a
+        /// native drawing (`overlayUnits`). A text block of nothing but
+        /// blank lines — the tablet writes one on pages nobody typed on —
+        /// sets no letter, embeds no face, and does not count.
+        let setsType: Bool
 
         init(_ marks: RMPage) {
             rootDocumentVisible = marks.rootDocumentVisible
             hasContent = !marks.strokes.isEmpty || !marks.highlights.isEmpty || !marks.images.isEmpty
                 || marks.text != nil
             imageFiles = marks.images.map(\.file)
+            setsType = marks.text?.lines.contains { $0.contains { !$0.isWhitespace } } ?? false
         }
     }
 
@@ -772,33 +787,55 @@ public struct AnnotatedPDFRenderer: Sendable {
         // operators — and a PDF of every page carrying text or a picture — at
         // once, which is what an extension is killed for. The drawing and the
         // deflating are most of the time and need nothing of the update, so
-        // the pages in the window do them side by side, each into a context
+        // the units in the window do them side by side, each into a context
         // of its own (`PDFOverlayWriter.writeConcurrently`); the file is the
-        // one a page at a time gives. A failure of the drawing itself, or of
-        // fetching what it draws, is not the overlay declining, and it is
-        // carried past the fallback below as what it is.
+        // one the same units made one after another give. A failure of the
+        // drawing itself, or of fetching what it draws, is not the overlay
+        // declining, and it is carried past the fallback below as what it is.
+        //
+        // A unit is a page, or a run of pages whose marks are drawn as native
+        // Forms (`overlayUnits`): a run is drawn into one PDF, a page after
+        // another, so that the typefaces it sets are embedded once a run
+        // rather than once a page (`NativeBatch`). The rest go a page at a
+        // time, as they always did.
         struct DrawingFailed: Error { let underlying: any Error }
         let drawing = PageRenderer.PageImages(decoded: images)
         let sheets = pages.map(\.sheet)
+        let units = Self.overlayUnits(marked, runPages: nativeRunPages) { position in
+            placeholders.contains(position) || pages[position].marks?.setsType == true
+        }
         do {
             try await PDFOverlayWriter().writeConcurrently(
-                file: file, pages: originalPages, original: original, pageIndices: marked, to: output
-            ) { position in
+                file: file, pages: originalPages, original: original, units: units, to: output
+            ) { unit in
                 do {
-                    // Marks that did not arrive leave the page as the original
-                    // has it: an overlay that draws nothing, since the page
-                    // was promised one before its marks were asked for — or,
-                    // under `.placeholder`, the label.
-                    let fetched = placeholders.contains(position) ? nil : try await marks(position)
-                    let placeholder = placeholders.contains(position) || (fetched == nil && missedArePlaceholders)
-                    let pageMarks = fetched ?? RMPage(strokes: [], skippedBlocks: 0)
-                    // The drawing does not suspend, and a book is minutes of
-                    // it: the question is asked once a page, as the redraw
-                    // asks it.
-                    try Task.checkCancellation()
-                    return try Self.overlay(
-                        pageMarks, sheet: sheets[position], on: originalPages[position], at: position,
-                        images: drawing, placeholder: placeholder
+                    // A page alone is drawn as it always was, into a PDF of
+                    // its own held in memory: only a run has a document to
+                    // share.
+                    let batch = unit.count > 1 ? NativeBatch() : nil
+                    var overlays: [PDFOverlayWriter.Overlay] = []
+                    var drawingPages: [Int?] = []
+                    for position in unit {
+                        // Marks that did not arrive leave the page as the
+                        // original has it: an overlay that draws nothing,
+                        // since the page was promised one before its marks
+                        // were asked for — or, under `.placeholder`, the label.
+                        let fetched = placeholders.contains(position) ? nil : try await marks(position)
+                        let placeholder = placeholders.contains(position) || (fetched == nil && missedArePlaceholders)
+                        let pageMarks = fetched ?? RMPage(strokes: [], skippedBlocks: 0)
+                        // The drawing does not suspend, and a book is minutes
+                        // of it: the question is asked once a page, as the
+                        // redraw asks it.
+                        try Task.checkCancellation()
+                        let made = try Self.overlay(
+                            pageMarks, sheet: sheets[position], on: originalPages[position], at: position,
+                            images: drawing, placeholder: placeholder, batch: batch
+                        )
+                        overlays.append(made.overlay)
+                        drawingPages.append(made.drawingPage)
+                    }
+                    return PDFOverlayWriter.OverlayBatch(
+                        overlays: overlays, drawingPages: drawingPages, drawing: try batch?.finish()
                     )
                 } catch {
                     throw DrawingFailed(underlying: error)
@@ -828,14 +865,20 @@ public struct AnnotatedPDFRenderer: Sendable {
     /// A `placeholder` is the label of a page whose marks did not arrive,
     /// written as the page's native Form: it is text, which the overlay's
     /// own operators do not set.
+    ///
+    /// The native Form is drawn as a page of `batch`'s PDF, shared with the
+    /// other pages of the run, and `drawingPage` says which; a page without a
+    /// batch, or one the batch refuses (`NativeBatch.page`), carries a PDF of
+    /// its own, as `formPDF`.
     private static func overlay(
         _ marks: RMPage,
         sheet: CGSize,
         on original: PDFFile.Page,
         at position: Int,
         images: PageRenderer.PageImages,
-        placeholder: Bool = false
-    ) throws -> PDFOverlayWriter.Overlay {
+        placeholder: Bool = false,
+        batch: NativeBatch?
+    ) throws -> (overlay: PDFOverlayWriter.Overlay, drawingPage: Int?) {
         guard let box = original.mediaBox else {
             throw PDFReadError.malformed("an overlay for page \(position), which has no box")
         }
@@ -850,17 +893,32 @@ public struct AnnotatedPDFRenderer: Sendable {
         let bounds = PageRenderer.contentBounds(of: marks, pageSize: units, edge: Self.markEdge, geometry: geometry)
         var grown = AnnotationGeometry.box(bounds, on: drawingBox)
         var native: Data?
+        var drawingPage: Int?
         var content: Data
         if let built {
             content = built.content
         } else if placeholder {
-            native = try UnfetchedPlaceholder.form(drawingBox: drawingBox, mediaBox: grown)
+            drawingPage = try batch?.page(mediaBox: grown, ink: nil) { context, _ in
+                UnfetchedPlaceholder.draw(on: drawingBox, in: context)
+            }
+            if drawingPage == nil { native = try UnfetchedPlaceholder.form(drawingBox: drawingBox, mediaBox: grown) }
             content = Data("q /RMNative Do Q\n".utf8)
         } else {
-            native = try Self.nativeMarks(
-                marks, drawingBox: drawingBox, mediaBox: grown, units: units, bounds: bounds, geometry: geometry,
-                images: images
-            )
+            if let batch {
+                drawingPage = try Self.nativeMarks(
+                    marks, drawingBox: drawingBox, mediaBox: grown, units: units, bounds: bounds, geometry: geometry,
+                    images: images, into: batch
+                )
+                if drawingPage == nil {
+                    RMRenderLog.pageDebug("annotated: page \(position) drawn alone — a mask it shares would change size")
+                }
+            }
+            if drawingPage == nil {
+                native = try Self.nativeMarks(
+                    marks, drawingBox: drawingBox, mediaBox: grown, units: units, bounds: bounds, geometry: geometry,
+                    images: images
+                )
+            }
             content = Data("q /RMNative Do Q\n".utf8)
         }
         if rotated {
@@ -879,7 +937,7 @@ public struct AnnotatedPDFRenderer: Sendable {
             [grown.minX, grown.minY, grown.maxX, grown.maxY],
             [box.minX, box.minY, box.maxX, box.maxY]
         ).allSatisfy { abs($0 - $1) < 1e-8 }
-        return PDFOverlayWriter.Overlay(
+        let overlay = PDFOverlayWriter.Overlay(
             pageIndex: position,
             content: content,
             states: built?.states ?? [],
@@ -887,6 +945,69 @@ public struct AnnotatedPDFRenderer: Sendable {
             box: unchangedBox ? nil : grown,
             formPDF: native
         )
+        return (overlay, drawingPage)
+    }
+
+    /// How many pages of the document one run of native Forms spans
+    /// (`overlayUnits`).
+    ///
+    /// Each run embeds every face it sets once, cut to the letters of its
+    /// pages, so a longer run writes fewer copies of each face — and draws
+    /// its pages one after another, in one context, so it is also the unit
+    /// the drawing is shared out across cores in, and what a unit in flight
+    /// holds. Measured over a book of a thousand pages of typed text, each
+    /// page in letters of its own: a page at a time it carried 5,623 font
+    /// programs, 35 MB of a 69 MB file; in runs of 8, 7.6 MB of 38 MB; of
+    /// 16, 3.7 of 33; of 32, 1.6 of 31; of 64, 0.7 of 30 — and every length
+    /// from 8 up wrote it in half the time a page at a time took. Past 32
+    /// the file barely shrinks while each run in flight holds twice the
+    /// pages, and a short book has too few runs to keep the cores busy.
+    static let nativeRunPages = 32
+
+    /// The pages of `marked`, in order, cut into the units the overlay is
+    /// made in: a page alone, or a run whose native Forms are drawn into one
+    /// PDF (`NativeBatch`).
+    ///
+    /// Only pages that set type — `setsType`: typed text, or the label of a
+    /// page whose marks did not arrive — begin and end a run, because a
+    /// typeface is the one thing a run shares that the update did not
+    /// already write once. A page drawn natively for anything else — a
+    /// picture, an eraser, an empty text block — gains nothing from a run
+    /// and would cost one: a run holds its pages until the last of them is
+    /// drawn, and a book of five hundred pages of dense handwriting, each
+    /// with an empty text block, drawn in runs of 32 held four times the
+    /// memory it held a page at a time, for the same file to the byte.
+    ///
+    /// The document is cut into windows of `runPages`, by page index, so
+    /// that where a run begins depends on nothing but the page numbers and
+    /// which pages set type: the same document is cut the same way every
+    /// time. In a window with such pages, the pages from its first to its
+    /// last are one run, the pages between them carried along so that the
+    /// run stays in page order; the pages outside that span, and every page
+    /// of a window without type, are units of their own — so a book without
+    /// typed text is made a page at a time, exactly as it was. `marked` is
+    /// in ascending order.
+    static func overlayUnits(
+        _ marked: [Int], runPages: Int = nativeRunPages, setsType: (Int) -> Bool
+    ) -> [[Int]] {
+        let runPages = max(runPages, 1)
+        var units: [[Int]] = []
+        var start = marked.startIndex
+        while start < marked.endIndex {
+            let window = marked[start] / runPages
+            var end = start
+            while end < marked.endIndex, marked[end] / runPages == window { end += 1 }
+            let pages = marked[start..<end]
+            if let first = pages.firstIndex(where: setsType), let last = pages.lastIndex(where: setsType) {
+                units += pages[..<first].map { [$0] }
+                units.append(Array(pages[first...last]))
+                units += pages[(last + 1)...].map { [$0] }
+            } else {
+                units += pages.map { [$0] }
+            }
+            start = end
+        }
+        return units
     }
 
     /// The marks of an overlay page as a PDF of one page, `mediaBox` its
@@ -908,10 +1029,7 @@ public struct AnnotatedPDFRenderer: Sendable {
         images: PageRenderer.PageImages,
         writesInk: Bool = true
     ) throws -> Data {
-        func place(_ context: CGContext) {
-            context.translateBy(x: drawingBox.minX, y: drawingBox.minY)
-            context.scaleBy(x: Calibration.pointsPerUnit, y: Calibration.pointsPerUnit)
-        }
+        let place = nativePlacement(drawingBox)
         let ink = writesInk
             ? PageRenderer.writtenInk(of: marks, pageSize: units, geometry: geometry, place: place)
             : (split: Int.max, ink: nil)
@@ -934,6 +1052,39 @@ public struct AnnotatedPDFRenderer: Sendable {
         if let written = ink.ink { try update.append(written, page: 0) }
         try update.finish(into: sink)
         return data as Data
+    }
+
+    /// The same drawing as a page of `batch`'s PDF: the page's number in
+    /// it, or `nil` where the batch refuses the page and it has to be drawn
+    /// alone (`NativeBatch.page`).
+    static func nativeMarks(
+        _ marks: RMPage,
+        drawingBox: CGRect,
+        mediaBox: CGRect,
+        units: CGSize,
+        bounds: CGRect,
+        geometry: TextGeometry?,
+        images: PageRenderer.PageImages,
+        into batch: NativeBatch
+    ) throws -> Int? {
+        let place = nativePlacement(drawingBox)
+        let ink = PageRenderer.writtenInk(of: marks, pageSize: units, geometry: geometry, place: place)
+        return try batch.page(mediaBox: mediaBox, ink: ink.ink) { context, masks in
+            place(context)
+            PageRenderer.draw(
+                marks, in: context, pageSize: units, bounds: bounds, images: images, geometry: geometry,
+                inkSplit: ink.split, masks: masks
+            )
+        }
+    }
+
+    /// Where the marks of a native Form stand on its page: the frame of
+    /// `drawingBox`, in `.rm` units.
+    private static func nativePlacement(_ drawingBox: CGRect) -> (CGContext) -> Void {
+        { context in
+            context.translateBy(x: drawingBox.minX, y: drawingBox.minY)
+            context.scaleBy(x: Calibration.pointsPerUnit, y: Calibration.pointsPerUnit)
+        }
     }
 
     /// Where the marker went on every page, in the frame the flattened

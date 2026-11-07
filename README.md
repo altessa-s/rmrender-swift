@@ -242,8 +242,11 @@ of the package's size.
 appended to the original file, so its links, outline and text stay as they
 were. Strokes become PDF operators; typed text, images
 and erased strokes are drawn by the same `PageRenderer` as a fresh export and
-imported as a Form. Quarter-turn page rotations, shifted origins and a
-`CropBox` are kept, and ink that runs past the page grows the box shown.
+imported as a Form. The Forms of pages with typed text are drawn 32 pages of
+the document at a time into one PDF, so a typeface is embedded once for each
+such run rather than once a page, and a picture, profile or typeface that
+several pages carry alike is written into the update once. Quarter-turn page rotations, shifted origins and
+a `CropBox` are kept, and ink that runs past the page grows the box shown.
 
 When the update cannot be made — a page added, removed or reordered on the
 tablet, a hidden source page, or an encrypted file — the document is **drawn

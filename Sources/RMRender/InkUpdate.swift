@@ -22,12 +22,27 @@ import Foundation
 final class InkMaskLedger {
     private var first: [SHA256.Digest: (width: Int, height: Int)] = [:]
 
+    /// How many masks were drawn with dimensions other than their own: the
+    /// bytes had been seen before with others. A drawing that shares one
+    /// document between pages that were each a document of their own
+    /// (`NativeBatch`) asks this to know when sharing changed a page.
+    private(set) var resized = 0
+
     /// The dimensions a mask of `digest` is drawn with: the first ones seen
     /// with its bytes, which are these when it is the first.
     func dimensions(of digest: SHA256.Digest, width: Int, height: Int) -> (width: Int, height: Int) {
-        if let known = first[digest] { return known }
+        if let known = first[digest] {
+            if known != (width, height) { resized += 1 }
+            return known
+        }
         first[digest] = (width, height)
         return (width, height)
+    }
+
+    /// Whether any of `masks` would be drawn with dimensions other than its
+    /// own, were it drawn now — asked without drawing it.
+    func wouldResize(_ masks: [InkStream.Mask]) -> Bool {
+        masks.contains { mask in first[mask.digest].map { $0 != (mask.width, mask.height) } ?? false }
     }
 
     /// The mask CoreGraphics is to draw for `bits`: the same bytes with the

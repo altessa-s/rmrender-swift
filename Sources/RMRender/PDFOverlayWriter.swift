@@ -462,19 +462,79 @@ public struct PDFOverlayWriter: Sendable {
         limit: Int = RenderWork.pageConcurrency,
         overlay make: @escaping @Sendable (_ pageIndex: Int) async throws -> Overlay
     ) async throws {
+        try await writeConcurrently(
+            file: file, pages: pages, original: original, units: pageIndices.map { [$0] }, to: output, limit: limit
+        ) { unit in
+            OverlayBatch(overlays: [try await make(unit[0])])
+        }
+    }
+
+    /// The same, with the pages made a run at a time: `units` are runs of
+    /// page indices, in order, and `batch` is asked for the overlays of each
+    /// run — up to `limit` runs at once — and hands back one overlay per
+    /// page of it, in its order. The pages are appended in the order of the
+    /// runs, as they would be from `units` flattened.
+    ///
+    /// What a run is for: the pages of one share one PDF of native drawings
+    /// (`OverlayBatch.drawing`), read once for all of them, so that what
+    /// they have in common — a typeface above all — is one object in that
+    /// PDF and is written once. A run counts against `limit` as one, whatever
+    /// its length, so what is held is at most `limit` runs; the caller keeps
+    /// them short. Everything else is `writeConcurrently(…overlay:)`'s: a
+    /// failure anywhere ends the run, cancels what is still being made and
+    /// leaves `output` as it was.
+    func writeConcurrently(
+        file: PDFFile,
+        pages: [PDFFile.Page],
+        original: URL,
+        units: [[Int]],
+        to output: URL,
+        limit: Int = RenderWork.pageConcurrency,
+        batch make: @escaping @Sendable (_ pageIndices: [Int]) async throws -> OverlayBatch
+    ) async throws {
         let revision = try Revision(
-            writer: self, file: file, pages: pages, original: original, pageIndices: pageIndices, output: output
+            writer: self, file: file, pages: pages, original: original, pageIndices: units.flatMap { $0 },
+            output: output
         )
         do {
-            try await RenderWork.boundedConcurrentForEach(pageIndices, limit: limit) { pageIndex in
-                try prepare(try await make(pageIndex))
+            try await RenderWork.boundedConcurrentForEach(units, limit: limit) { unit in
+                let batch = try await make(unit)
+                guard batch.overlays.count == unit.count else {
+                    batch.discard()
+                    throw PDFReadError.malformed("\(batch.overlays.count) overlays for a run of \(unit.count) pages")
+                }
+                return try prepare(batch)
             } consume: { _, prepared in
-                try revision.append(prepared)
+                for page in prepared { try revision.append(page) }
             }
             try revision.finish()
         } catch {
             revision.abandon()
             throw error
+        }
+    }
+
+    /// The overlays of a run of pages, and the PDF whose pages are the
+    /// native drawings of some of them.
+    struct OverlayBatch: Sendable {
+        let overlays: [Overlay]
+        /// For each overlay, the page of `drawing` that is its native Form,
+        /// counting from nought; `nil` for an overlay with none, or with its
+        /// own (`Overlay.formPDF`).
+        let drawingPages: [Int?]
+        /// A file the batch owns: removed once it is read (`prepare`), or
+        /// by `discard`.
+        let drawing: URL?
+
+        init(overlays: [Overlay], drawingPages: [Int?]? = nil, drawing: URL? = nil) {
+            self.overlays = overlays
+            self.drawingPages = drawingPages ?? overlays.map { _ in nil }
+            self.drawing = drawing
+        }
+
+        /// The file let go unread.
+        func discard() {
+            if let drawing { try? FileManager.default.removeItem(at: drawing) }
         }
     }
 
@@ -874,6 +934,29 @@ public struct PDFOverlayWriter: Sendable {
     /// `overlay` made ready to append — see `PreparedPage`. Touches nothing
     /// but the overlay, so pages may be prepared side by side.
     func prepare(_ overlay: Overlay) throws -> PreparedPage {
+        try prepare(overlay, native: try overlay.formPDF.map(native))
+    }
+
+    /// The overlays of a run made ready to append, the PDF of their native
+    /// drawings read once for all of them and removed. Each page's native
+    /// drawing comes out as it would from a PDF of that page alone, numbered
+    /// for that page (`native(page:of:)`); what pages of one PDF share are
+    /// the same objects in each, and alike in their fingerprints, so the
+    /// update writes them once.
+    func prepare(_ batch: OverlayBatch) throws -> [PreparedPage] {
+        defer { batch.discard() }
+        let drawing = try batch.drawing.map { try PDFFile(url: $0) }
+        let drawn = try drawing?.pages() ?? []
+        return try zip(batch.overlays, batch.drawingPages).map { overlay, page in
+            guard let page else { return try prepare(overlay) }
+            guard let drawing, drawn.indices.contains(page) else {
+                throw PDFReadError.malformed("overlay PDF has no page \(page)")
+            }
+            return try prepare(overlay, native: try native(page: drawn[page], of: drawing))
+        }
+    }
+
+    private func prepare(_ overlay: Overlay, native: PreparedPage.Native?) throws -> PreparedPage {
         let stencils = overlay.images.map { image in
             (
                 name: image.name,
@@ -900,7 +983,7 @@ public struct PDFOverlayWriter: Sendable {
             states: overlay.states,
             stencils: stencils,
             box: overlay.box,
-            native: try overlay.formPDF.map(native),
+            native: native,
             content: PDFWriter.flate(overlay.content)
         )
     }
@@ -921,6 +1004,12 @@ public struct PDFOverlayWriter: Sendable {
         guard imported.count == 1, let first = imported.first else {
             throw PDFReadError.malformed("overlay PDF must have one page")
         }
+        return try native(page: first, of: source)
+    }
+
+    /// The same for the page `first` of `source`, which may have others:
+    /// only what this page refers to is read, and numbered as above.
+    private func native(page first: PDFFile.Page, of source: PDFFile) throws -> PreparedPage.Native {
         var mapped: [Int: Int] = [:]
         var objects: [(number: Int, object: PDFObject)] = []
         func copy(_ value: PDFObject, depth: Int = 0) throws -> PDFObject {
