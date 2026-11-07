@@ -249,10 +249,11 @@ struct Marks {
     /// A page of `count` strokes of `tools`; `pictures` places images among
     /// the strokes as well, `text` typed text with handwriting anchored to it
     /// and a marker over it, `blankText` a text block of the lines given, as
-    /// the tablet writes on a page nobody typed on.
+    /// the tablet writes on a page nobody typed on, `highlights` that many
+    /// highlights of a few bands each, as the marker leaves over a PDF's text.
     mutating func page(
         strokes count: Int, tools: [PenTool] = allTools, pictures: Bool = false, text: Bool = false,
-        blankText: [String]? = nil, template: String? = nil
+        blankText: [String]? = nil, template: String? = nil, highlights bands: Int = 0
     ) -> RMPage {
         let colors: [PenColor] = [.black, .gray, .blue, .red, .yellow, .green]
         var strokes: [Stroke] = []
@@ -293,6 +294,16 @@ struct Marks {
             highlights.append(Highlight(rectangles: [CGRect(x: -500, y: 280, width: 600, height: 50)], color: .yellow))
         } else if let blankText {
             block = typedText(blankText)
+        }
+        let markers: [PenColor] = [.yellow, .yellow, .green, .pink, .highlighterBlue, .highlighterOrange, .gray]
+        for index in 0..<bands {
+            let top = uniform(0, 1700)
+            let rectangles = (0..<(1 + below(3))).map { line in
+                CGRect(x: uniform(-650, 200), y: top + Double(line) * 53.4, width: uniform(40, 900), height: 44.9)
+            }
+            // The file's own colour on some, as a live page carries one.
+            let argb: UInt32? = index % 3 == 1 ? 0xFF00_0000 | UInt32(random.next() & 0xFF_FFFF) : nil
+            highlights.append(Highlight(rectangles: rectangles, color: markers[below(markers.count)], argb: argb))
         }
         return RMPage(
             strokes: strokes, skippedBlocks: 0, templateName: template, text: block, highlights: highlights, images: images
@@ -490,7 +501,9 @@ func masksTakeTheDimensionsFirstSeen() throws {
 private let notebookPageSize = CGSize(width: 1404, height: 1872)
 
 /// Random notebook pages: strokes of every tool on templates, pictures on
-/// some — what the writer leaves to CoreGraphics and what it takes.
+/// some, highlights on others — what the writer leaves to CoreGraphics and
+/// what it takes. A highlighted page of every other three carries no shader,
+/// whose cut pieces only CoreGraphics draws, so that its bands are written.
 private func randomNotebook(seed: UInt64, pages: Int) -> (pages: [RMPage], assets: [String: Data]) {
     // The fixtures' templates, the source every test that draws one installs:
     // tests run side by side, and one that drew the bundled set would draw
@@ -500,8 +513,9 @@ private func randomNotebook(seed: UInt64, pages: Int) -> (pages: [RMPage], asset
     let templates = [nil, "Fixture Grid", "Fixture Lines", "Fixture Dots", "Fixture Week", "Fixture Sketch Guide"]
     let notebook = (0..<pages).map { index in
         marks.page(
-            strokes: 20 + marks.below(40), pictures: index % 4 == 3, text: index % 3 == 1,
-            template: templates[index % templates.count]
+            strokes: 20 + marks.below(40), tools: index % 6 == 2 ? Marks.allTools.filter { $0 != .shader } : Marks.allTools,
+            pictures: index % 4 == 3, text: index % 3 == 1, template: templates[index % templates.count],
+            highlights: index % 3 == 2 ? 3 : 0
         )
     }
     return (notebook, ["picture.png": testPicture()])
@@ -564,13 +578,15 @@ func preparedSideBySideIsTheSameFile() async throws {
     #expect(InkTesting.normalized(data as Data) == InkTesting.normalized(sequential))
 }
 
-/// The `.rm` of a page of random marks of every tool, typed text on some
-/// and a picture on others, as the tablet writes one.
+/// The `.rm` of a page of random marks of every tool, typed text on some,
+/// a picture on others and highlights on every other one, as the tablet
+/// writes one. Every fourth page carries no shader, so that its highlights
+/// are written with its ink.
 private func randomMarks(_ marks: inout Marks, index: Int) throws -> Data {
     let tools: [PenTool] = [
         .paintbrush2, .mechanicalPencil2, .pencil2, .ballpoint2, .marker2, .fineliner2, .highlighter2,
-        .caligraphy, .shader, .pencil1, .ballpoint1, .eraser,
-    ]
+        .caligraphy, .pencil1, .ballpoint1, .eraser,
+    ] + (index.isMultiple(of: 4) ? [] : [.shader])
     let colors: [PenColor] = [.black, .gray, .blue, .red, .yellow, .green]
     let strokes = (0..<(15 + marks.below(25))).map { _ in
         var x = marks.uniform(-650, 500), y = marks.uniform(50, 1800)
@@ -593,13 +609,26 @@ private func randomMarks(_ marks: inout Marks, index: Int) throws -> Data {
         ? [.init("Typed text the marks are written over", style: 1), .init("and more of it", style: 1)] : []
     let images: [RMPageDraft.Image] = index % 4 == 3
         ? [.init(file: "picture.png", key: (0..<16).map { UInt8($0) }, x: -200, y: 400, width: 300, height: 200)] : []
-    return try RMWriter.page(
+    var page = try RMWriter.page(
         RMPageDraft(
             author: UUID(uuid: (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)),
             sheet: .init(screenWidth: 1404, screenHeight: 1872, canvasWidth: 1404, canvasHeight: 1872),
             column: .init(.medium), paragraphs: paragraphs, strokes: strokes, images: images
         )
     )
+    if index.isMultiple(of: 2) {
+        for band in 0..<3 {
+            let top = marks.uniform(100, 1600)
+            let rectangles = (0..<(1 + marks.below(3))).map { line in
+                HighlightRect(x: marks.uniform(-600, 100), y: top + Double(line) * 53.4, width: marks.uniform(80, 800), height: 44.9)
+            }
+            page.append(contentsOf: highlightBlock(
+                rectangles: rectangles, color: UInt32([3, 4, 5, 9][band]), argb: band == 2 ? 0xFFFB_E84C : nil,
+                item: UInt64(5000 + band)
+            ))
+        }
+    }
+    return page
 }
 
 /// Blobs out of a dictionary, by name.
@@ -660,8 +689,14 @@ func redrawnPagesPaintAsCoreGraphicsDoes() async throws {
     let referenceConsumer = try #require(CGDataConsumer(data: reference as CFMutableData))
     let context = try #require(CGContext(consumer: referenceConsumer, mediaBox: &box, nil))
     let images = PageRenderer.PageImages(bytes: ["picture.png": testPicture()])
+    var writtenHighlights = 0
     for page in 0..<pages {
         let parsed = try RMParser.parsePage(try #require(files["doc/p\(page).rm"]))
+        let units = AnnotationGeometry.units(of: CGSize(width: 612, height: 792))
+        let geometry = parsed.text.map { TextGeometry($0, pageSize: units) }
+        if PageRenderer.writtenInk(of: parsed, pageSize: units, geometry: geometry, place: { _ in }).highlights {
+            writtenHighlights += 1
+        }
         AnnotatedPDFRenderer.drawPage(
             source: document.page(at: page + 1), marks: parsed, sheet: CGSize(width: 612, height: 792), into: context,
             images: images
@@ -670,6 +705,8 @@ func redrawnPagesPaintAsCoreGraphicsDoes() async throws {
     context.closePDF()
     let native = reference as Data
     #expect(String(decoding: try InkTesting.content(of: written, page: 1), as: UTF8.self).contains("/RMIc"))
+    // Highlights among them, written with the ink of the pages that let them.
+    #expect(writtenHighlights >= 2)
     for page in 1...pages {
         #expect(try InkTesting.differingPixels(native, written, page: page, scale: 1.5) == 0, "page \(page)")
     }
@@ -723,7 +760,7 @@ private let inkRunnerCanBeRestarted = CommandLine.arguments.first?.hasSuffix("sw
     && CommandLine.arguments.contains("--test-bundle-path")
 
 private func writeCrossProcessInk(to output: URL) throws {
-    let notebook = randomNotebook(seed: 0xD15C, pages: 6)
+    let notebook = randomNotebook(seed: 0xD15C, pages: 14)
     try PageRenderer.pdf(pages: notebook.pages, pageSize: notebookPageSize, assets: notebook.assets, to: output)
 }
 

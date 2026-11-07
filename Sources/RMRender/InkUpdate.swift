@@ -200,6 +200,10 @@ struct PreparedInk: Sendable {
 /// drawing wrapped in `q`/`Q` and the ink after it, so that the ink starts
 /// from PDF's initial graphics state as it would have on a page of its own.
 ///
+/// A page may also start with a template drawn once for the document and
+/// shared by every page that draws it alike (`share`): a Form ahead of
+/// CoreGraphics' drawing of the page, which then leaves the template out.
+///
 /// Everything is decided by the order the pages are appended in, so the
 /// bytes are the same however the ink was made.
 ///
@@ -209,12 +213,20 @@ final class InkUpdate {
     /// alike; CoreGraphics' half is handed it where it draws.
     let masks = InkMaskLedger()
 
+    /// The name a page's resources give its shared template, apart from
+    /// CoreGraphics' names and the ink's (`InkStream`).
+    static let templateName = "RMIt"
+
     private struct PageRecord {
         let index: Int
-        let content: Int
+        /// The ink's content stream, where the page has ink.
+        let content: Int?
         let states: [Int]
         let masks: [Int]
         let usesColorSpace: Bool
+        /// The shared template the page starts with, by its index in
+        /// `templates`.
+        let template: Int?
     }
 
     private let spool = Spool()
@@ -222,13 +234,42 @@ final class InkUpdate {
     private var stateObjects: [String: Int] = [:]
     private var maskObjects: [SHA256.Digest: Int] = [:]
     private var usesColorSpace = false
+    /// The shared templates, in the order they were first drawn: the Form
+    /// of each and the objects it names, numbered from nought.
+    private var templates: [PDFOverlayWriter.PreparedPage.Native] = []
+
+    /// A template drawn once — CoreGraphics' drawing of it alone on a page,
+    /// as `PDFOverlayWriter.native` reads one — to be shared by the pages
+    /// appended with its index.
+    func share(_ template: PDFOverlayWriter.PreparedPage.Native) -> Int {
+        templates.append(template)
+        return templates.count - 1
+    }
 
     /// The ink of the page at `index` — counted from nought, in the order
     /// CoreGraphics drew the pages — after everything CoreGraphics drew
     /// on it. Pages are appended in their order.
     func append(_ ink: PreparedInk, page index: Int) throws {
+        try append(ink, template: nil, page: index)
+    }
+
+    /// The same for a page that may have no ink, and may start with the
+    /// shared template `template` (`share`), drawn before everything
+    /// CoreGraphics drew on it. A page with neither is left as it is.
+    func append(_ ink: PreparedInk?, template: Int?, page index: Int) throws {
         if let last = pages.last, last.index >= index {
             throw PDFReadError.malformed("ink for page \(index) after page \(last.index)")
+        }
+        if let template, !templates.indices.contains(template) {
+            throw PDFReadError.malformed("page \(index) shares no template \(template)")
+        }
+        guard let ink else {
+            if let template {
+                pages.append(
+                    PageRecord(index: index, content: nil, states: [], masks: [], usesColorSpace: false, template: template)
+                )
+            }
+            return
         }
         let states = try ink.states.map { entries in
             if let known = stateObjects[entries] { return known }
@@ -259,12 +300,16 @@ final class InkUpdate {
         )
         usesColorSpace = usesColorSpace || ink.usesColorSpace
         pages.append(
-            PageRecord(index: index, content: content, states: states, masks: masks, usesColorSpace: ink.usesColorSpace)
+            PageRecord(
+                index: index, content: content, states: states, masks: masks, usesColorSpace: ink.usesColorSpace,
+                template: template
+            )
         )
     }
 
     /// The update appended to the document CoreGraphics finished writing
-    /// into `sink`. Nothing is appended to a document without ink.
+    /// into `sink`. Nothing is appended to a document without ink or a
+    /// shared template.
     func finish(into sink: PDFSink) throws {
         defer { spool.discard() }
         guard !pages.isEmpty else { return }
@@ -321,11 +366,37 @@ final class InkUpdate {
             end()
             if index.isMultiple(of: 64) { try sink.flush() }
         }
+        // The shared templates after the spooled objects: each one's objects,
+        // its Form, and the stream that draws it, `/RMIt Do`.
+        var next = numbers.first + spool.count
+        var invocations: [(form: Int, stream: Int)] = []
+        for template in templates {
+            let renumbering = template.objects.indices.map { next + $0 }
+            next += template.objects.count
+            for object in template.objects {
+                begin(renumbering[object.number])
+                sink.write(PDFWriter.bytes(of: PDFOverlayWriter.renumbered(object.object, to: renumbering)))
+                end()
+            }
+            let form = next, stream = next + 1
+            next += 2
+            begin(form)
+            sink.write(PDFWriter.bytes(of: PDFOverlayWriter.renumbered(template.form, to: renumbering)))
+            end()
+            let text = "/\(Self.templateName) Do\n"
+            begin(stream)
+            sink.write("<< /Length \(text.utf8.count) >>\nstream\n\(text)\nendstream")
+            end()
+            invocations.append((form, stream))
+        }
 
         for record in pages {
             let page = basePages[record.index]
             begin(page.number, generation: base.generations[page.number] ?? 0)
-            sink.write(PDFWriter.bytes(of: .dictionary(try extended(page, record, in: base, numbers: numbers))))
+            let template = record.template.map { invocations[$0] }
+            sink.write(
+                PDFWriter.bytes(of: .dictionary(try extended(page, record, template: template, in: base, numbers: numbers)))
+            )
             end()
         }
         let table = sink.count
@@ -356,17 +427,21 @@ final class InkUpdate {
         let first: Int
     }
 
-    /// The page CoreGraphics wrote, drawing its own content, then the ink.
+    /// The page CoreGraphics wrote: its shared template, where it has one,
+    /// then its own content, then the ink, where it has any.
     private func extended(
-        _ page: PDFFile.Page, _ record: PageRecord, in base: PDFFile, numbers: Numbers
+        _ page: PDFFile.Page, _ record: PageRecord, template: (form: Int, stream: Int)?, in base: PDFFile,
+        numbers: Numbers
     ) throws -> [String: PDFObject] {
         func reference(_ number: Int) -> PDFObject { .reference(number: number, generation: 0) }
         let first = numbers.first
         var dictionary = page.dictionary
-        dictionary["Contents"] = .array(
-            [reference(numbers.open)] + (try Self.contents(of: page.dictionary["Contents"], in: base))
-                + [reference(numbers.close), reference(first + record.content)]
-        )
+        let own = try Self.contents(of: page.dictionary["Contents"], in: base)
+        let drawn = record.content.map { [reference(numbers.open)] + own + [reference(numbers.close), reference(first + $0)] }
+        // The template is drawn first, as CoreGraphics drew it, and a Form
+        // leaves the graphics state as it found it: what CoreGraphics drew
+        // after it starts where it started.
+        dictionary["Contents"] = .array((template.map { [reference($0.stream)] } ?? []) + (drawn ?? own))
         var resources = try base.resolve(page.resources).dictionaryValue ?? [:]
         func add(_ key: String, _ entries: [(name: String, number: Int)]) throws {
             guard !entries.isEmpty else { return }
@@ -383,7 +458,11 @@ final class InkUpdate {
         }
         if record.usesColorSpace, let space = numbers.space { try add("ColorSpace", [(InkStream.colorSpaceName, space)]) }
         try add("ExtGState", record.states.enumerated().map { ("\(InkStream.statePrefix)\($0.offset)", first + $0.element) })
-        try add("XObject", record.masks.enumerated().map { ("\(InkStream.maskPrefix)\($0.offset)", first + $0.element) })
+        try add(
+            "XObject",
+            record.masks.enumerated().map { ("\(InkStream.maskPrefix)\($0.offset)", first + $0.element) }
+                + (template.map { [(Self.templateName, $0.form)] } ?? [])
+        )
         dictionary["Resources"] = .dictionary(resources)
         return dictionary
     }

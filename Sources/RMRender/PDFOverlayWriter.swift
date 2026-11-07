@@ -1097,7 +1097,7 @@ public struct PDFOverlayWriter: Sendable {
     /// out differently each time the same document was written. A copy
     /// already downloaded is invalidated by a file that changes for no
     /// reason.
-    private func native(_ pdf: Data) throws -> PreparedPage.Native {
+    func native(_ pdf: Data) throws -> PreparedPage.Native {
         let source = try PDFFile(bytes: pdf)
         let imported = try source.pages()
         guard imported.count == 1, let first = imported.first else {
@@ -1235,7 +1235,7 @@ public struct PDFOverlayWriter: Sendable {
     /// `object` with every reference in it turned from a prepared native
     /// drawing's number into the update's: `numbers[n]` for `n`. Every
     /// reference in such an object is one `native` made, so all of them move.
-    private static func renumbered(_ object: PDFObject, to numbers: [Int]) -> PDFObject {
+    static func renumbered(_ object: PDFObject, to numbers: [Int]) -> PDFObject {
         switch object {
         case .reference(let number, let generation):
             return .reference(number: numbers[number], generation: generation)

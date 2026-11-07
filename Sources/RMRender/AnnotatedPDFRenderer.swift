@@ -447,6 +447,7 @@ public struct AnnotatedPDFRenderer: Sendable {
                 images: drawing,
                 navigation: { navigation.draw(page: done, in: $0) },
                 inkSplit: prepared?.split,
+                writtenHighlights: prepared?.highlights ?? false,
                 masks: update.masks,
                 placeholder: drawn.placeholder
             )
@@ -466,6 +467,8 @@ public struct AnnotatedPDFRenderer: Sendable {
         let marks: RMPage
         /// Where CoreGraphics' strokes end and the written ink begins.
         let split: Int
+        /// Whether the highlights are written with the ink.
+        let highlights: Bool
         let ink: PreparedInk?
 
         /// The marks on a sheet of `size`, under the transform `drawPage`
@@ -478,6 +481,7 @@ public struct AnnotatedPDFRenderer: Sendable {
             }
             self.marks = marks
             split = written.split
+            highlights = written.highlights
             ink = written.ink
         }
     }
@@ -517,8 +521,8 @@ public struct AnnotatedPDFRenderer: Sendable {
     /// here to get wrong, and from `renderPDF` neither is reachable without a
     /// live source of documents.
     ///
-    /// `inkSplit` and `masks` are `PageRenderer.draw`'s: the redraw writes a
-    /// page's ink apart and draws the rest here. `placeholder` puts the
+    /// `inkSplit`, `writtenHighlights` and `masks` are `PageRenderer.draw`'s:
+    /// the redraw writes a page's ink apart and draws the rest here. `placeholder` puts the
     /// label of a page whose marks did not arrive over the middle of the
     /// sheet (`UnfetchedPlaceholder`).
     static func drawPage(
@@ -529,6 +533,7 @@ public struct AnnotatedPDFRenderer: Sendable {
         images: PageRenderer.PageImages = PageRenderer.PageImages(),
         navigation: ((CGContext) -> Void)? = nil,
         inkSplit: Int? = nil,
+        writtenHighlights: Bool = false,
         masks: InkMaskLedger? = nil,
         placeholder: Bool = false
     ) {
@@ -578,7 +583,7 @@ public struct AnnotatedPDFRenderer: Sendable {
             context.scaleBy(x: Calibration.pointsPerUnit, y: Calibration.pointsPerUnit)
             PageRenderer.draw(
                 marks, in: context, pageSize: units, bounds: bounds, images: images, geometry: geometry,
-                inkSplit: inkSplit, masks: masks
+                inkSplit: inkSplit, writtenHighlights: writtenHighlights, masks: masks
             )
             context.restoreGState()
         }
@@ -1049,16 +1054,16 @@ public struct AnnotatedPDFRenderer: Sendable {
     ) throws -> NativeShares {
         let place = nativePlacement(drawingBox)
         let written = writesInk
-            ? PageRenderer.writtenInk(of: marks, pageSize: units, geometry: geometry, place: place)
-            : (split: Int.max, ink: nil)
+            ? PageRenderer.writtenInk(of: marks, pageSize: units, geometry: geometry, highlightsAlone: true, place: place)
+            : (split: Int.max, highlights: false, ink: nil)
         func draw(_ context: CGContext, masks: InkMaskLedger?) {
             place(context)
             PageRenderer.draw(
                 marks, in: context, pageSize: units, bounds: bounds, images: images, geometry: geometry,
-                inkSplit: written.split, masks: masks
+                inkSplit: written.split, writtenHighlights: written.highlights, masks: masks
             )
         }
-        guard coreGraphicsPaints(marks, split: written.split) else {
+        guard coreGraphicsPaints(marks, split: written.split, writtenHighlights: written.highlights) else {
             // A page of its own as far as its masks go, as it would have been
             // in a PDF of its own: CoreGraphics drew none of them on it.
             return NativeShares(
@@ -1093,7 +1098,8 @@ public struct AnnotatedPDFRenderer: Sendable {
     /// safe way: a share it calls blank paints nothing, and a share that
     /// paints nothing may still be called otherwise, and is then drawn, as
     /// it always was. Blank is a share with no stroke before `split`, no
-    /// picture, no highlight, no template shown, and typed text — if any —
+    /// picture, no highlight — or highlights written with the ink
+    /// (`writtenHighlights`) —, no template shown, and typed text — if any —
     /// of empty lines and no list, whose markers and boxes are drawn on
     /// lines of no text. The tablet writes a text block of one empty line on
     /// every page nobody typed on, and it would otherwise send every page of
@@ -1103,8 +1109,8 @@ public struct AnnotatedPDFRenderer: Sendable {
     /// and a line break, and CoreGraphics writes it into the page — it inks
     /// nothing, but it is text, a typeface embedded for it, and what the
     /// page says is the page's.
-    static func coreGraphicsPaints(_ marks: RMPage, split: Int) -> Bool {
-        guard split == 0, marks.images.isEmpty, marks.highlights.isEmpty else { return true }
+    static func coreGraphicsPaints(_ marks: RMPage, split: Int, writtenHighlights: Bool = false) -> Bool {
+        guard split == 0, marks.images.isEmpty, marks.highlights.isEmpty || writtenHighlights else { return true }
         if marks.backgroundVisible, let name = marks.templateName, TemplateStore.shared.template(named: name) != nil {
             return true
         }
