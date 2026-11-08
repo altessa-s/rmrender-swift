@@ -2,8 +2,8 @@
 // Use of this source code is governed by an MIT-style license that can be
 // found in the LICENSE file.
 
+import CoreGraphics
 import Foundation
-import RMLines
 
 /// The bytes of a document's attachments, by file name, gathered under one
 /// budget.
@@ -27,31 +27,44 @@ import RMLines
 /// drawn, with a hole where the picture stood — and `holes` counts what was
 /// lost, so that a caller can say so.
 enum PageAssets {
-    /// The attachments the drawing can use. One whose bytes do not decode as
-    /// an image — torn, neither PNG nor JPEG, or past
+    /// The attachments the drawing can use, decoded. One whose bytes do not
+    /// decode as an image — torn, neither PNG nor JPEG, or past
     /// `PageRenderer.maximumImagePixels` — is taken out and named in the log,
     /// so that its page is drawn with the same hole a missing one leaves.
-    static func decodable(_ assets: [String: Data], channel: String) -> [String: Data] {
-        var kept = assets
-        for name in assets.keys.sorted() where assets[name].flatMap(PageRenderer.decodeImage) == nil {
-            kept[name] = nil
-            RMRenderLog.pageError(
-                """
-                \(channel): an attachment of \(assets[name]?.count ?? 0) bytes does not \
-                decode as an image — a hole where its image stood
-                """
-            )
+    ///
+    /// The decoded image is what is kept, not the bytes: the check is the
+    /// decode, and the drawing takes the image it made rather than decoding
+    /// the bytes a second time on every page that shows them. A decoded
+    /// image is its header and its bytes until it is drawn — the pixels are
+    /// unpacked there, and not held after — so keeping it costs what keeping
+    /// the bytes did.
+    static func decoded(_ assets: [String: Data], channel: String) -> [String: CGImage] {
+        var kept: [String: CGImage] = [:]
+        for name in assets.keys.sorted() {
+            guard let data = assets[name] else { continue }
+            guard let image = PageRenderer.decodeImage(data) else {
+                RMRenderLog.pageError(
+                    """
+                    \(channel): an attachment of \(data.count) bytes does not \
+                    decode as an image — a hole where its image stood
+                    """
+                )
+                continue
+            }
+            kept[name] = image
         }
         return kept
     }
 
-    /// How many pages name an image that `assets` does not hold, and how many
-    /// distinct attachments those images are.
-    static func holes(in pages: [RMPage], assets: [String: Data]) -> (pages: Int, images: Int) {
+    /// How many pages name an image the drawing does not hold, and how many
+    /// distinct attachments those images are. A page is the files its images
+    /// name (`RMPage.images`), so that a caller can count without keeping
+    /// the pages themselves.
+    static func holes(in pages: [[String]], available: Set<String>) -> (pages: Int, images: Int) {
         var missing: Set<String> = []
         var pagesWithHoles = 0
-        for page in pages {
-            let lost = page.images.map(\.file).filter { assets[$0] == nil }
+        for files in pages {
+            let lost = files.filter { !available.contains($0) }
             guard !lost.isEmpty else { continue }
             pagesWithHoles += 1
             missing.formUnion(lost)
@@ -60,7 +73,7 @@ enum PageAssets {
     }
 
     /// - Parameters:
-    ///   - pages: the parsed pages whose images name the attachments wanted.
+    ///   - wanted: the attachments the pages' images name.
     ///   - index: the document's files, which state each blob's size before
     ///     it is fetched — that is what lets the budget refuse one early.
     ///   - channel: how this caller's lines are spelled in the log, so a
@@ -69,12 +82,11 @@ enum PageAssets {
     ///     way — one straight from the blob store, one through a cache — and
     ///     that difference is the only one between the two.
     static func gather(
-        for pages: [RMPage],
+        _ wanted: Set<String>,
         index: DocumentFiles,
         channel: String,
         fetch: (DocumentFile) async throws -> Data
     ) async -> [String: Data] {
-        let wanted = Set(pages.flatMap { $0.images.map(\.file) })
         guard !wanted.isEmpty else { return [:] }
 
         var assets: [String: Data] = [:]

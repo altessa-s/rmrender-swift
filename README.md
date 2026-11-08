@@ -242,8 +242,11 @@ of the package's size.
 appended to the original file, so its links, outline and text stay as they
 were. Strokes become PDF operators; typed text, images
 and erased strokes are drawn by the same `PageRenderer` as a fresh export and
-imported as a Form. Quarter-turn page rotations, shifted origins and a
-`CropBox` are kept, and ink that runs past the page grows the box shown.
+imported as a Form. The Forms of pages with typed text are drawn 32 pages of
+the document at a time into one PDF, so a typeface is embedded once for each
+such run rather than once a page, and a picture, profile or typeface that
+several pages carry alike is written into the update once. Quarter-turn page rotations, shifted origins and
+a `CropBox` are kept, and ink that runs past the page grows the box shown.
 
 When the update cannot be made — a page added, removed or reordered on the
 tablet, a hidden source page, or an encrypted file — the document is **drawn
@@ -266,6 +269,32 @@ attachments are missing (`NotebookRenderer` has the same callback).
 `PageRenderer`, which is handed its attachments, draws the same hole and logs
 it.
 
+A page whose bytes **do not arrive** — `PageBlobs` failing with anything other
+than a cancellation — is handled as `unfetchedPages:` says, on every document
+renderer (`NotebookRenderer.renderPDF`, `renderImages`, `parsed`,
+`renderInkImages`, and `AnnotatedPDFRenderer.renderPDF`):
+
+| `UnfetchedPagePolicy` | Notebook page | Annotated page | `onUnfetched` |
+|---|---|---|---|
+| `.placeholder` (default) | a plain white sheet of the page's size, "Rendering error" in the middle | the original page, the same label over it | called |
+| `.blank` | a blank sheet on its template, as a page that does not parse | the original page without its marks | called |
+| `.strict` | the render throws `PageFetchError(page:pageID:underlying:)` and writes no output | the same | not called |
+
+The label is dark grey on a light rounded box, sized to the page's width and
+set in Noto Sans, the face typed text is set in. On an annotated document taken
+the incremental way it is written into the update as a native Form, so the
+original's links and outline stay. Bitmaps carry it too — which a text
+recogniser will read, so an OCR caller wants `.blank` or `.strict`; ink-only
+bitmaps (`renderInkImages`) never show it. `parsed` keeps such pages as blank
+sheets in `ParsedNotebook.unfetched` and leaves the look to
+`renderImages(_:unfetchedPages:)`.
+
+`onUnfetched` is told separately from `onUnreadable`: a page that arrived and
+does not parse is drawn as it always was, whatever the policy, because it will
+not parse on the next try either. Cancelling a render still ends it with the
+cancellation, under every policy, and a missing or unopenable original or an
+output that cannot be written is still an error.
+
 A page with a `/UserUnit` other than 1 is refused with
 `RenderError.unsupportedFormat`.
 
@@ -273,6 +302,31 @@ The reader handles cross-reference tables and streams, hybrid files, packed
 objects and indirect stream lengths, with bounded decompression and checks on
 generations, references and byte ranges. Output is written to a temporary file
 and moved into place when complete.
+
+## How the ink is written
+
+CoreGraphics prints every coordinate of a page through `vsnprintf`, which
+takes the C library's global locale lock, and deflates each page on the
+thread that draws it — most of what exporting a written page costs, and the
+reason pages drawn side by side do not draw faster. So a PDF's **ink** — the
+fills, lines, pencil grain and erased outlines after the last picture on the
+page, and the transparency layers the pieces of an erased shader stroke are
+drawn in — is written by the package itself, on the tasks that parse the pages,
+while CoreGraphics draws the rest one page at a time: templates, typed text,
+pictures, the original page of an annotated PDF. The written ink is appended as an incremental update over
+CoreGraphics' document once it is closed, each page's own drawing wrapped so
+that the ink starts from the initial graphics state.
+
+The writer emits the operators CoreGraphics would, with the same numbers
+computed by the same floating-point steps and printed the way CoreGraphics
+prints them, in the same sRGB colour space and with the same graphics states
+and image masks — a layer as the transparency group CoreGraphics makes of it,
+blending in Generic RGB, its box CoreGraphics' to the digit — so a page paints
+exactly what CoreGraphics drawing all of it
+paints; the tests hold the two against each other pixel for pixel. It applies
+to notebook exports, redrawn annotated PDFs, and the native pages of an
+annotated PDF's overlay. The bytes do not depend on how many pages were
+prepared at once.
 
 ## PDF tagging
 

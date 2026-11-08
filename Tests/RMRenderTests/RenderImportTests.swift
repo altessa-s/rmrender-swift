@@ -5,9 +5,11 @@
 import CoreGraphics
 import CryptoKit
 import Foundation
+import PDFKit
 import RMMarks
 import RMLines
 @testable import RMRender
+import Synchronization
 import Testing
 
 // Marks on an imported PDF, a cancelled render, and the two ways out.
@@ -238,6 +240,80 @@ func overlayAndRedrawDrawTheSamePage() async throws {
     #expect(apart < 0.05, "the two routes drew \(overlaid) and \(drawn) — \(Int(apart * 100))% apart")
 }
 
+// A redraw writes a fresh PDF, so the imported document's navigation has to be
+// carried across on purpose: a web link and a link to another page on page one,
+// and an outline entry pointing at page two.
+@Test("Links and the outline survive a redraw")
+func linksAndOutlineSurviveARedraw() async throws {
+    let web = try #require(URL(string: "https://example.com/chapter"))
+    let drawn = NSMutableData()
+    let consumer = try #require(CGDataConsumer(data: drawn))
+    var media = CGRect(x: 0, y: 0, width: 612, height: 792)
+    let context = try #require(CGContext(consumer: consumer, mediaBox: &media, nil))
+    context.beginPDFPage(nil)
+    context.setURL(web as CFURL, for: CGRect(x: 72, y: 700, width: 200, height: 20))
+    context.setDestination("chapter" as CFString, for: CGRect(x: 72, y: 600, width: 200, height: 20))
+    context.endPDFPage()
+    context.beginPDFPage(nil)
+    context.addDestination("chapter" as CFString, at: CGPoint(x: 72, y: 720))
+    context.endPDFPage()
+    let entry: [String: Any] = [
+        kCGPDFOutlineTitle as String: "Chapter",
+        kCGPDFOutlineDestination as String: 2,
+    ]
+    CGPDFContextSetOutline(context, [kCGPDFOutlineChildren as String: [entry]] as CFDictionary)
+    context.closePDF()
+
+    let pdf = drawn as Data
+    #expect(PDFDocument(data: pdf)?.outlineRoot?.numberOfChildren == 1, "the source has no outline")
+    let original = FileManager.default.temporaryDirectory
+        .appending(path: "rmrender-test-\(UUID().uuidString).pdf")
+    try pdf.write(to: original)
+
+    let marks = markedPage()
+    let content = Data(#"""
+    {"formatVersion": 2, "cPages": {"pages": [
+      {"id": "page-0", "redir": {"timestamp": "1:2", "value": 0}},
+      {"id": "page-1", "redir": {"timestamp": "1:3", "value": 1}}
+    ]}}
+    """#.utf8)
+    let fixture = AnnotatedFixture(
+        index: DocumentFiles(files: [
+            DocumentFile(hash: address(pdf), name: "doc-1.pdf", size: Int64(pdf.count)),
+            DocumentFile(hash: address(content), name: "doc-1.content", size: Int64(content.count)),
+            DocumentFile(hash: address(marks), name: "doc-1/page-0.rm", size: Int64(marks.count)),
+        ]),
+        blobs: [address(pdf): pdf, address(content): content, address(marks): marks],
+        original: original
+    )
+    let redrawn = try await annotated(fixture, allowOverlay: false)
+    defer {
+        for url in [original, redrawn] {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+    #expect(try !Data(contentsOf: redrawn).starts(with: pdf), "the redraw was not taken")
+
+    let output = try #require(PDFDocument(url: redrawn))
+    #expect(output.pageCount == 2)
+    let first = try #require(output.page(at: 0))
+    let links = first.annotations.filter { $0.type == "Link" }
+    let urls = links.compactMap { ($0.action as? PDFActionURL)?.url }
+    #expect(urls == [web], "the web link did not survive")
+    let targets = links.compactMap { link -> Int? in
+        guard let page = (link.action as? PDFActionGoTo)?.destination.page ?? link.destination?.page else { return nil }
+        return output.index(for: page)
+    }
+    #expect(targets == [1], "the link to page two did not survive")
+
+    let outline = try #require(output.outlineRoot)
+    #expect(outline.numberOfChildren == 1)
+    let survived = try #require(outline.child(at: 0))
+    #expect(survived.label == "Chapter")
+    let page = try #require(survived.destination?.page)
+    #expect(output.index(for: page) == 1, "the outline entry lost its page")
+}
+
 // Erasing applies to the tablet ink inside the imported overlay Form.
 // The original PDF stays intact, and the visible result must match redraw.
 @Test("A page somebody rubbed out agrees and preserves the original PDF")
@@ -329,34 +405,86 @@ private func notebookDocument(pages count: Int) -> NotebookFixture {
     return NotebookFixture(index: DocumentFiles(files: files), blobs: blobs, lastPage: last)
 }
 
-/// A render held at its last page, cancelled there, and then let go.
+/// Where a render reads its last page, and so where a test can hold it: a
+/// notebook's PDF, and an imported PDF's redraw, read every written page
+/// twice — once to measure the document, and again as the drawing comes to
+/// it.
+enum LastPageRead: Sendable {
+    /// The measuring read. Nothing is drawn yet, and no drawing task exists.
+    case measuring
+    /// The drawing's read. The drawing has begun, in a task of its own, and
+    /// the last page cannot be on the sheet before this read returns.
+    case drawing
+
+    /// The reads of the last page that go by before the one held.
+    var earlier: Int {
+        switch self {
+        case .measuring: 0
+        case .drawing: 1
+        }
+    }
+}
+
+/// Counts the pages a render asks for — every read, the measuring and the
+/// drawing's alike.
+private actor Reads {
+    private(set) var count = 0
+    func add() { count += 1 }
+}
+
+/// What a cancelled render came to: what it ended with, how many page reads
+/// it made, and whether it told the caller of unreadable pages.
+private struct CancelledRender {
+    let thrown: (any Error)?
+    let reads: Int
+    let unreadable: Bool
+}
+
+/// A render held at a read of its last page, cancelled there, and then let go.
 ///
-/// The order is what makes this deterministic rather than lucky: drawing does
-/// not begin until every page has been parsed, and the last page cannot be
-/// handed over until this returns — so the cancel is on record before a single
-/// sheet exists, and every page after it is another chance to notice.
+/// The order is what makes this deterministic rather than lucky: the last
+/// page cannot be handed over until the cancel is on record, and the render
+/// cannot be finished without it. Held at the `.measuring` read, the cancel
+/// is there before any drawing task exists, and no drawing may be begun for
+/// it; held at the `.drawing` read, it has to cross into the detached task
+/// the drawing runs in, and stop it between two pages.
 private func cancelledRender(
     pages: Int,
-    _ body: @escaping @Sendable (NotebookRenderer, DocumentFiles) async throws -> Void
-) async throws -> (any Error)? {
+    at read: LastPageRead,
+    _ body: @escaping @Sendable (NotebookRenderer, DocumentFiles, _ onUnreadable: @escaping @Sendable (Int) -> Void)
+        async throws -> Void
+) async throws -> CancelledRender {
     let fixture = notebookDocument(pages: pages)
-    let gate = Gate()
+    let gate = Gate(wavingThrough: read.earlier)
+    let reads = Reads()
+    let pageHashes = Set(fixture.index.files.filter { $0.fileExtension == "rm" }.map(\.hash))
     let blobs = FixtureBlobs(fixture.blobs) { hash in
+        if pageHashes.contains(hash) { await reads.add() }
         if hash == fixture.lastPage { await gate.stopHere() }
     }
+    let unreadable = Flag()
     let render = Task {
-        try await body(NotebookRenderer(blobs: blobs), fixture.index)
+        try await body(NotebookRenderer(blobs: blobs), fixture.index) { _ in unreadable.raise() }
     }
     await gate.waitForArrival()
     render.cancel()
     await gate.open()
 
+    let thrown: (any Error)?
     do {
         try await render.value
-        return nil
+        thrown = nil
     } catch {
-        return error
+        thrown = error
     }
+    return CancelledRender(thrown: thrown, reads: await reads.count, unreadable: unreadable.isRaised)
+}
+
+/// A flag raised from any task.
+private final class Flag: Sendable {
+    private let state = Mutex(false)
+    func raise() { state.withLock { $0 = true } }
+    var isRaised: Bool { state.withLock { $0 } }
 }
 
 // `RenderWork.detached` puts the drawing in a detached task, and a detached
@@ -364,32 +492,109 @@ private func cancelledRender(
 // forwards it, a render the caller has already given up on would run to its
 // last page and the caller would stay parked until it did. Nothing would say
 // so: the document would come out correct, only far too late.
-@Test("A render the caller has given up on stops instead of drawing to the end")
-func aCancelledRenderStops() async throws {
-    let thrown = try await cancelledRender(pages: 40) { renderer, index in
+@Test(
+    "A render the caller has given up on stops instead of drawing to the end",
+    arguments: [LastPageRead.measuring, .drawing]
+)
+func aCancelledRenderStops(at read: LastPageRead) async throws {
+    let outcome = try await cancelledRender(pages: 40, at: read) { renderer, index, onUnreadable in
+        _ = try await renderer.renderPDF(documentID: "doc-1", index: index, onUnreadable: onUnreadable)
+    }
+
+    #expect(outcome.thrown is CancellationError, "got \(String(describing: outcome.thrown))")
+    // A page whose parse was cut short is not a page that would not parse.
+    #expect(!outcome.unreadable, "a cancelled read was told to the caller as an unreadable page")
+}
+
+// Cancelled while it measures, a render never begins to draw. The drawing is
+// handed to a task of its own, and the handler that forwards the cancel to
+// it is installed only once that task exists — a task that may already be
+// running. On a loaded machine the caller's thread can be put aside in that
+// moment, and a drawing of forty small pages finishes inside it unasked: the
+// render came back whole, and `nil` stood where `CancellationError` belonged.
+// So the drawing must not be begun at all, and the proof is in the reads:
+// every page read once, to be measured, and none read again to be drawn.
+@Test("A render given up on while it measures never begins to draw")
+func aRenderCancelledWhileMeasuringDrawsNothing() async throws {
+    let pages = 40
+    let outcome = try await cancelledRender(pages: pages, at: .measuring) { renderer, index, _ in
         _ = try await renderer.renderPDF(documentID: "doc-1", index: index)
     }
 
-    #expect(thrown is CancellationError, "got \(String(describing: thrown))")
+    #expect(outcome.thrown is CancellationError, "got \(String(describing: outcome.thrown))")
+    #expect(outcome.reads == pages, "the drawing read pages again after the cancel: \(outcome.reads) reads")
 }
 
-@Test("A render that stops leaves no half-written file where the caller asked for one")
-func aCancelledFileRenderLeavesNothing() async throws {
+// The other half of the race above, without the race: work handed off for a
+// caller that is cancelled already is refused before it exists. Whether a task
+// started too early would have finished unasked is the scheduler's business;
+// whether it is started at all is ours.
+@Test("Work handed off for a caller already cancelled is never started")
+func detachedWorkForACancelledCallerNeverStarts() async throws {
+    let started = Flag()
+    let caller = Task { () -> [(any Error)?] in
+        withUnsafeCurrentTask { $0?.cancel() }
+        var thrown: [(any Error)?] = []
+        do {
+            _ = try await RenderWork.detached {
+                started.raise()
+                return 1
+            }
+            thrown.append(nil)
+        } catch {
+            thrown.append(error)
+        }
+        do {
+            _ = try await RenderWork.detachedWaiting {
+                started.raise()
+                return 2
+            }
+            thrown.append(nil)
+        } catch {
+            thrown.append(error)
+        }
+        return thrown
+    }
+
+    for error in await caller.value {
+        #expect(error is CancellationError, "got \(String(describing: error))")
+    }
+    #expect(!started.isRaised, "the work ran for a caller that had already given up")
+}
+
+@Test(
+    "A render that stops leaves no half-written file where the caller asked for one",
+    arguments: [LastPageRead.measuring, .drawing]
+)
+func aCancelledFileRenderLeavesNothing(at read: LastPageRead) async throws {
     let output = FileManager.default.temporaryDirectory
         .appending(path: "rmrender-test-\(UUID().uuidString).pdf")
     defer { try? FileManager.default.removeItem(at: output) }
 
-    let thrown = try await cancelledRender(pages: 40) { renderer, index in
-        try await renderer.renderPDF(documentID: "doc-1", index: index, to: output)
+    let outcome = try await cancelledRender(pages: 40, at: read) { renderer, index, onUnreadable in
+        try await renderer.renderPDF(documentID: "doc-1", index: index, to: output, onUnreadable: onUnreadable)
     }
 
-    #expect(thrown is CancellationError, "got \(String(describing: thrown))")
+    #expect(outcome.thrown is CancellationError, "got \(String(describing: outcome.thrown))")
+    #expect(!outcome.unreadable, "a cancelled read was told to the caller as an unreadable page")
     // A truncated PDF at the path the caller asked for is worse than nothing:
     // it opens, and it is wrong.
     #expect(
         !FileManager.default.fileExists(atPath: output.path),
         "a stopped render left a file behind"
     )
+}
+
+// The bitmaps read each page once — `parsed` keeps them — so the measuring
+// read is the only one there is to hold.
+@Test("A notebook's bitmaps given up on stop as its PDF does")
+func aCancelledImageRenderStops() async throws {
+    let outcome = try await cancelledRender(pages: 40, at: .measuring) { renderer, index, onUnreadable in
+        _ = try await renderer.renderImages(documentID: "doc-1", index: index, onUnreadable: onUnreadable)
+    }
+
+    #expect(outcome.thrown is CancellationError, "got \(String(describing: outcome.thrown))")
+    #expect(!outcome.unreadable, "a cancelled read was told to the caller as an unreadable page")
 }
 
 /// An imported PDF of `count` pages with marks on every one, and the address
@@ -428,9 +633,14 @@ private func annotatedDocument(pages count: Int) throws -> (fixture: AnnotatedFi
 // The same promise from the other renderer. The redraw of an imported PDF makes
 // its context and then asks about cancellation page by page, and a
 // `CancellationError` before `closePDF` must not leave a half-written file
-// where the caller asked for the whole one.
-@Test("A stopped redraw of an imported PDF leaves no half-written file either")
-func aCancelledAnnotatedRenderLeavesNothing() async throws {
+// where the caller asked for the whole one. Held at either read of the last
+// page's marks: the measuring one, before any drawing exists, and the
+// drawing's, with the redraw under way in a task of its own.
+@Test(
+    "A stopped redraw of an imported PDF leaves no half-written file either",
+    arguments: [LastPageRead.measuring, .drawing]
+)
+func aCancelledAnnotatedRenderLeavesNothing(at read: LastPageRead) async throws {
     let (fixture, lastPage) = try annotatedDocument(pages: 40)
     let output = FileManager.default.temporaryDirectory
         .appending(path: "rmrender-test-\(UUID().uuidString).pdf")
@@ -439,7 +649,7 @@ func aCancelledAnnotatedRenderLeavesNothing() async throws {
         try? FileManager.default.removeItem(at: output)
     }
 
-    let gate = Gate()
+    let gate = Gate(wavingThrough: read.earlier)
     let blobs = FixtureBlobs(fixture.blobs) { hash in
         if hash == lastPage { await gate.stopHere() }
     }

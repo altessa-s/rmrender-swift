@@ -207,10 +207,25 @@ public struct PDFFile: Sendable {
     /// bounds work rather than the stack.
     private static let lengthHopLimit = 8
 
+    /// The file at `url`, mapped: its pages are read in as the reader comes
+    /// to them and are the file's own, clean, so the system takes them back
+    /// under pressure rather than counting them against the process. A book
+    /// of three hundred megabytes costs about what its cross-reference does.
+    ///
+    /// Always mapped, not "mapped if safe": the hint leaves the choice to
+    /// Foundation, which reads the whole file into memory wherever it judges
+    /// a mapping unsafe — and that is the very book an extension is killed
+    /// for. The mapping lives as long as `bytes` or any slice of it does,
+    /// which is as long as the `PDFFile` and the objects read out of it.
+    /// What a mapping cannot survive is the file shrinking under it, and the
+    /// renderers read only files that are theirs or the cache's for the
+    /// length of the render.
     public init(url: URL) throws {
-        try self.init(bytes: try Data(contentsOf: url, options: .mappedIfSafe))
+        try self.init(bytes: try Data(contentsOf: url, options: .alwaysMapped))
     }
 
+    /// Bytes already in hand, read where they lie — nothing is mapped or
+    /// copied. For a file on disk, `init(url:)`.
     public init(bytes: Data) throws {
         guard bytes.starts(with: Array("%PDF-".utf8)) else { throw PDFReadError.notAPDF }
         self.bytes = bytes
