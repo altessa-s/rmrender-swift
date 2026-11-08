@@ -25,6 +25,9 @@ enum FetchFailure: Sendable {
     /// Every fetch fails.
     case always
     /// The first fetch — the measuring — succeeds, every later one fails.
+    /// A render keeps the bytes it measured (`PageSpool`) and fetches no
+    /// page again, so this is a render without a spool (`spooling`) — the
+    /// one where the drawing asks for the bytes a second time.
     case afterFirst
     /// The fetch answers `CancellationError` without anybody cancelling.
     case cancellation
@@ -32,6 +35,12 @@ enum FetchFailure: Sendable {
     /// transport does — with an error of its own rather than
     /// `CancellationError`.
     case hangUntilCancelled
+}
+
+extension FetchFailure {
+    /// The spool a render under this failure keeps its pages in: none for
+    /// `.afterFirst`, whose second fetch is the point.
+    var spooling: PageSpool.Configuration? { self == .afterFirst ? nil : .standard }
 }
 
 struct Unreachable: Error {}
@@ -209,7 +218,7 @@ private func annotated(tearing torn: Int? = nil) throws -> [(name: String, bytes
 func notebookPDFLosesOnlyTheUnfetchedPage(_ failure: FetchFailure) async throws {
     let (index, store) = document(notebook())
     let tallies = Tallies()
-    let renderer = NotebookRenderer(blobs: FlakyBlobs(blobs: store, failures: ["doc/p\(lost).rm": failure]))
+    let renderer = NotebookRenderer(blobs: FlakyBlobs(blobs: store, failures: ["doc/p\(lost).rm": failure]), spooling: failure.spooling)
     let pdf = try await renderer.renderPDF(
         documentID: "doc", index: index, unfetchedPages: .blank,
         onUnfetched: { tallies.note("unfetched", $0) },
@@ -228,7 +237,7 @@ func notebookPDFLosesOnlyTheUnfetchedPage(_ failure: FetchFailure) async throws 
     let output = temporaryPDF()
     defer { try? FileManager.default.removeItem(at: output) }
     let fileTallies = Tallies()
-    try await NotebookRenderer(blobs: FlakyBlobs(blobs: store, failures: ["doc/p\(lost).rm": failure])).renderPDF(
+    try await NotebookRenderer(blobs: FlakyBlobs(blobs: store, failures: ["doc/p\(lost).rm": failure]), spooling: failure.spooling).renderPDF(
         documentID: "doc", index: index, to: output, unfetchedPages: .blank,
         onUnfetched: { fileTallies.note("unfetched", $0) }
     )
@@ -272,7 +281,10 @@ func annotatedLosesOnlyTheUnfetchedMarks(_ failure: FetchFailure, overlay: Bool)
         try? FileManager.default.removeItem(at: output)
         try? FileManager.default.removeItem(at: reference)
     }
-    try await AnnotatedPDFRenderer(blobs: FlakyBlobs(blobs: store, failures: ["doc/p\(lost).rm": failure])).renderPDF(
+    try await AnnotatedPDFRenderer(
+        blobs: FlakyBlobs(blobs: store, failures: ["doc/p\(lost).rm": failure]), nativeRunPages: AnnotatedPDFRenderer.nativeRunPages,
+        spooling: failure.spooling
+    ).renderPDF(
         documentID: "doc", index: index, to: output, allowOverlay: overlay, unfetchedPages: .blank,
         onUnfetched: { tallies.note("unfetched", $0) },
         onUnreadable: { tallies.note("unreadable", $0) }
@@ -506,14 +518,14 @@ func notebookPDFDrawsThePlaceholder(_ failure: FetchFailure) async throws {
     let (index, store) = document(ruledNotebook())
     let failures = ["doc/p\(lost).rm": failure]
     let tallies = Tallies()
-    let pdf = try await NotebookRenderer(blobs: FlakyBlobs(blobs: store, failures: failures)).renderPDF(
+    let pdf = try await NotebookRenderer(blobs: FlakyBlobs(blobs: store, failures: failures), spooling: failure.spooling).renderPDF(
         documentID: "doc", index: index,
         onUnfetched: { tallies.note("unfetched", $0) },
         onUnreadable: { tallies.note("unreadable", $0) }
     )
     #expect(tallies.calls("unfetched") == [1])
     #expect(tallies.calls("unreadable").isEmpty)
-    let blank = try await NotebookRenderer(blobs: FlakyBlobs(blobs: store, failures: failures))
+    let blank = try await NotebookRenderer(blobs: FlakyBlobs(blobs: store, failures: failures), spooling: failure.spooling)
         .renderPDF(documentID: "doc", index: index, unfetchedPages: .blank)
 
     let pages = try Raster.pages(pdf), blankPages = try Raster.pages(blank)
@@ -532,7 +544,7 @@ func notebookPDFDrawsThePlaceholder(_ failure: FetchFailure) async throws {
     let output = temporaryPDF()
     defer { try? FileManager.default.removeItem(at: output) }
     let fileTallies = Tallies()
-    try await NotebookRenderer(blobs: FlakyBlobs(blobs: store, failures: failures)).renderPDF(
+    try await NotebookRenderer(blobs: FlakyBlobs(blobs: store, failures: failures), spooling: failure.spooling).renderPDF(
         documentID: "doc", index: index, to: output, unfetchedPages: .placeholder,
         onUnfetched: { fileTallies.note("unfetched", $0) }
     )
@@ -600,7 +612,7 @@ func notebookStrictFails(_ failure: FetchFailure) async throws {
     let failures = ["doc/p\(lost).rm": failure]
     let tallies = Tallies()
     let error = await pageFetchError {
-        _ = try await NotebookRenderer(blobs: FlakyBlobs(blobs: store, failures: failures)).renderPDF(
+        _ = try await NotebookRenderer(blobs: FlakyBlobs(blobs: store, failures: failures), spooling: failure.spooling).renderPDF(
             documentID: "doc", index: index, unfetchedPages: .strict, onUnfetched: { tallies.note("unfetched", $0) }
         )
     }
@@ -613,7 +625,7 @@ func notebookStrictFails(_ failure: FetchFailure) async throws {
     let output = temporaryPDF()
     defer { try? FileManager.default.removeItem(at: output) }
     let fileError = await pageFetchError {
-        try await NotebookRenderer(blobs: FlakyBlobs(blobs: store, failures: failures)).renderPDF(
+        try await NotebookRenderer(blobs: FlakyBlobs(blobs: store, failures: failures), spooling: failure.spooling).renderPDF(
             documentID: "doc", index: index, to: output, unfetchedPages: .strict
         )
     }
@@ -623,18 +635,18 @@ func notebookStrictFails(_ failure: FetchFailure) async throws {
     // A parse fetches a page once: only a first fetch that fails fails it.
     if failure == .always {
         let imageError = await pageFetchError {
-            _ = try await NotebookRenderer(blobs: FlakyBlobs(blobs: store, failures: failures)).renderImages(
+            _ = try await NotebookRenderer(blobs: FlakyBlobs(blobs: store, failures: failures), spooling: failure.spooling).renderImages(
                 documentID: "doc", index: index, unfetchedPages: .strict
             )
         }
         #expect(imageError?.page == lost)
         let parseError = await pageFetchError {
-            _ = try await NotebookRenderer(blobs: FlakyBlobs(blobs: store, failures: failures))
+            _ = try await NotebookRenderer(blobs: FlakyBlobs(blobs: store, failures: failures), spooling: failure.spooling)
                 .parsed(documentID: "doc", index: index, unfetchedPages: .strict)
         }
         #expect(parseError?.page == lost)
         let inkError = await pageFetchError {
-            _ = try await NotebookRenderer(blobs: FlakyBlobs(blobs: store, failures: failures))
+            _ = try await NotebookRenderer(blobs: FlakyBlobs(blobs: store, failures: failures), spooling: failure.spooling)
                 .renderInkImages(documentID: "doc", index: index, pages: [0], unfetchedPages: .strict)
         }
         #expect(inkError?.page == lost)
@@ -668,14 +680,20 @@ func annotatedDrawsThePlaceholder(_ failure: FetchFailure, overlay: Bool) async 
         try? FileManager.default.removeItem(at: output)
         try? FileManager.default.removeItem(at: blank)
     }
-    try await AnnotatedPDFRenderer(blobs: FlakyBlobs(blobs: store, failures: failures)).renderPDF(
+    try await AnnotatedPDFRenderer(
+        blobs: FlakyBlobs(blobs: store, failures: failures), nativeRunPages: AnnotatedPDFRenderer.nativeRunPages,
+        spooling: failure.spooling
+    ).renderPDF(
         documentID: "doc", index: index, to: output, allowOverlay: overlay,
         onUnfetched: { tallies.note("unfetched", $0) },
         onUnreadable: { tallies.note("unreadable", $0) }
     )
     #expect(tallies.calls("unfetched") == [1])
     #expect(tallies.calls("unreadable").isEmpty)
-    try await AnnotatedPDFRenderer(blobs: FlakyBlobs(blobs: store, failures: failures)).renderPDF(
+    try await AnnotatedPDFRenderer(
+        blobs: FlakyBlobs(blobs: store, failures: failures), nativeRunPages: AnnotatedPDFRenderer.nativeRunPages,
+        spooling: failure.spooling
+    ).renderPDF(
         documentID: "doc", index: index, to: blank, allowOverlay: overlay, unfetchedPages: .blank
     )
     let written = try Data(contentsOf: output)
@@ -724,7 +742,10 @@ func annotatedStrictFails(_ failure: FetchFailure, overlay: Bool) async throws {
     let output = temporaryPDF()
     defer { try? FileManager.default.removeItem(at: output) }
     let error = await pageFetchError {
-        try await AnnotatedPDFRenderer(blobs: FlakyBlobs(blobs: store, failures: ["doc/p\(lost).rm": failure]))
+        try await AnnotatedPDFRenderer(
+        blobs: FlakyBlobs(blobs: store, failures: ["doc/p\(lost).rm": failure]), nativeRunPages: AnnotatedPDFRenderer.nativeRunPages,
+        spooling: failure.spooling
+    )
             .renderPDF(
                 documentID: "doc", index: index, to: output, allowOverlay: overlay, unfetchedPages: .strict,
                 onUnfetched: { tallies.note("unfetched", $0) }

@@ -9,11 +9,12 @@ import RMLines
 @testable import RMRender
 import Testing
 
-// A PDF export measures every page first and keeps nothing of it, then parses
-// each page again when it is drawn and lets it go. What these guard is that
-// the drawing holds no more than a window of parsed pages, that each page is
-// read once to be measured and once to be drawn, and that what comes out is
-// what drawing every page parsed up front made.
+// A PDF export measures every page first and keeps nothing of it parsed, then
+// parses each page again when it is drawn and lets it go. What these guard is
+// that the drawing holds no more than a window of parsed pages, that each
+// page is fetched once — measured, then drawn out of the bytes the measuring
+// kept (`PageSpool`) — and that what comes out is what drawing every page
+// parsed up front made.
 
 // MARK: - Fixtures
 
@@ -208,7 +209,7 @@ private func notebook(pages: Int) -> [(name: String, bytes: Data)] {
     return files + [("doc.content", cPages(ids, template: "Isometric"))]
 }
 
-@Test("A notebook's PDF reads each written page twice — measured, then drawn — and draws what the parse holds")
+@Test("A notebook's PDF fetches each written page once — measured, then drawn — and draws what the parse holds")
 func notebookPagesAreParsedWhenDrawn() async throws {
     let (index, store) = document(notebook(pages: 30))
     let fetches = Fetches()
@@ -216,7 +217,7 @@ func notebookPagesAreParsedWhenDrawn() async throws {
     let lazy = try await renderer.renderPDF(documentID: "doc", index: index)
 
     for page in 0..<30 where page != 5 {
-        #expect(fetches.count("doc/p\(page).rm") == (page == 3 ? 1 : 2), "page \(page)")
+        #expect(fetches.count("doc/p\(page).rm") == 1, "page \(page)")
     }
     #expect(fetches.count("doc/p5.rm") == 0)
 
@@ -250,6 +251,8 @@ private func annotatedDocument(pages: Int) throws -> [(name: String, bytes: Data
         + (0..<pages).filter { $0 != 2 }.map { ("doc/p\($0).rm", inkedPage($0)) }
 }
 
+// Seen through the fetches, so without a spool: the drawing then fetches each
+// page as it parses it, and how far ahead that is is the window.
 @Test("A redraw parses a page's marks when it comes to the page, never further ahead than the window")
 func redrawHoldsAWindowOfMarks() async throws {
     let pages = 40
@@ -258,7 +261,10 @@ func redrawHoldsAWindowOfMarks() async throws {
     let originalBytes = Int64(try #require(index.file(withExtension: "pdf")).size)
     let output = FileManager.default.temporaryDirectory.appending(path: "rmrender-lazy-\(UUID().uuidString).pdf")
     defer { try? FileManager.default.removeItem(at: output) }
-    try await AnnotatedPDFRenderer(blobs: CountingBlobs(blobs: store, fetches: fetches)).renderPDF(
+    try await AnnotatedPDFRenderer(
+        blobs: CountingBlobs(blobs: store, fetches: fetches), nativeRunPages: AnnotatedPDFRenderer.nativeRunPages,
+        spooling: nil
+    ).renderPDF(
         documentID: "doc", index: index, to: output, allowOverlay: false,
         onProgress: { completed, _ in
             if completed > originalBytes { fetches.drew(Int(completed - originalBytes)) }
@@ -270,7 +276,7 @@ func redrawHoldsAWindowOfMarks() async throws {
     #expect(try #require(CGPDFDocument(output as CFURL)).numberOfPages == pages)
 }
 
-@Test("The overlay reads each marked page twice and draws the redraw's marks")
+@Test("The overlay fetches each marked page once and draws the redraw's marks")
 func overlayParsesMarksWhenWritten() async throws {
     let pages = 12
     let files = try annotatedDocument(pages: pages)
@@ -285,7 +291,7 @@ func overlayParsesMarksWhenWritten() async throws {
     }
     try await renderer.renderPDF(documentID: "doc", index: index, to: overlaid)
     for page in 0..<pages where page != 2 {
-        #expect(fetches.count("doc/p\(page).rm") == 2, "page \(page)")
+        #expect(fetches.count("doc/p\(page).rm") == 1, "page \(page)")
     }
     // The overlay is an incremental update of the original: it has to be one.
     let original = try #require(files.first { $0.name == "doc.pdf" }).bytes

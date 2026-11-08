@@ -11,9 +11,18 @@ import RMLines
 /// them.
 public struct NotebookRenderer: Sendable {
     private let blobs: any PageBlobs
+    /// Where a PDF export keeps the bytes of its pages between measuring
+    /// and drawing them (`PageSpool`); `nil` for none, which fetches every
+    /// page again to draw it — for tests of the drawing without the bytes.
+    private let spooling: PageSpool.Configuration?
 
     public init(blobs: any PageBlobs) {
+        self.init(blobs: blobs, spooling: .standard)
+    }
+
+    init(blobs: any PageBlobs, spooling: PageSpool.Configuration?) {
         self.blobs = blobs
+        self.spooling = spooling
     }
 
     /// A document's PDF, from its index.
@@ -405,7 +414,8 @@ public struct NotebookRenderer: Sendable {
             onPageCount: onPageCount,
             onMissingImages: onMissingImages,
             onUnsupported: onUnsupported,
-            onUnreadable: onUnreadable
+            onUnreadable: onUnreadable,
+            spool: nil
         ) { $0 }
         Self.report(
             unfetched: work.unfetched, of: work, documentID: documentID, policy: unfetchedPages, to: onUnfetched
@@ -431,6 +441,10 @@ public struct NotebookRenderer: Sendable {
     /// it. Kept, every page stood parsed for the length of the render — about
     /// a quarter of a megabyte for a page written full, and a long notebook
     /// has thousands.
+    ///
+    /// The bytes are kept instead, in the walk's `PageSpool`, so that the
+    /// drawing parses them again without fetching them again: a caller with
+    /// no cache behind `PageBlobs` downloaded every page twice.
     private func measured(
         documentID: String,
         index: DocumentFiles,
@@ -453,7 +467,8 @@ public struct NotebookRenderer: Sendable {
             onPageCount: onPageCount,
             onMissingImages: onMissingImages,
             onUnsupported: onUnsupported,
-            onUnreadable: onUnreadable
+            onUnreadable: onUnreadable,
+            spool: spooling.map(PageSpool.init)
         ) { _ in }
     }
 
@@ -491,21 +506,27 @@ public struct NotebookRenderer: Sendable {
         let pageIDs: [String?]
         let documentPageCount: Int
         let total: Int
+        /// The bytes of the pages that parsed, kept for the drawing; `nil`
+        /// where the walk kept none.
+        let spool: PageSpool?
     }
 
     /// The page `source` names, as the walk had it: the same blank sheets,
-    /// and a page file parsed again. The bytes are the ones the walk read —
-    /// a blob is named by its hash — so a page that parsed then parses now;
-    /// one that does not fails the render rather than quietly turning into
-    /// a blank sheet the tallies never counted.
+    /// and a page file parsed again — out of `spool`, the bytes the walk
+    /// read, where it kept them. Where it did not, they are fetched again,
+    /// and are the same bytes — a blob is named by its hash. Either way a
+    /// page that parsed then parses now; one that does not fails the render
+    /// rather than quietly turning into a blank sheet the tallies never
+    /// counted.
     ///
-    /// Bytes that arrived for the walk and not now — a cache emptied in
-    /// between, a connection dropped — are the one exception: the page is
-    /// drawn as the walk draws a page whose bytes never came, and `unfetched`
-    /// says so, for the tally the caller is told once the drawing is done —
-    /// or, under `.strict`, the render fails with `PageFetchError`.
+    /// Bytes fetched again that do not arrive — a cache emptied in between,
+    /// a connection dropped — are the one exception: the page is drawn as
+    /// the walk draws a page whose bytes never came, and `unfetched` says
+    /// so, for the tally the caller is told once the drawing is done — or,
+    /// under `.strict`, the render fails with `PageFetchError`.
     private func page(
-        _ source: PageSource, documentID: String, position: Int, unfetchedPages: UnfetchedPagePolicy
+        _ source: PageSource, documentID: String, position: Int, spool: PageSpool?,
+        unfetchedPages: UnfetchedPagePolicy
     ) async throws -> (page: RMPage, unfetched: Bool) {
         switch source {
         case .blank(let template):
@@ -517,7 +538,11 @@ public struct NotebookRenderer: Sendable {
         case .file(let entry, let template):
             let data: Data
             do {
-                data = try await blobs.data(hash: entry.hash, name: entry.name, owner: documentID)
+                if let kept = spool?.data(at: position) {
+                    data = kept
+                } else {
+                    data = try await blobs.data(hash: entry.hash, name: entry.name, owner: documentID)
+                }
             } catch let error where !RenderWork.isCancellation(error) {
                 RMRenderLog.pageError("render: page \(position) did not arrive to be drawn: \(String(describing: error))")
                 if unfetchedPages == .strict {
@@ -564,7 +589,8 @@ public struct NotebookRenderer: Sendable {
         var unfetched: Set<Int> = []
         try await RenderWork.boundedConcurrentForEach(Array(sources.indices), limit: RenderWork.inkConcurrency) { [self] position in
             let drawn = try await page(
-                sources[position], documentID: documentID, position: position, unfetchedPages: unfetchedPages
+                sources[position], documentID: documentID, position: position, spool: work.spool,
+                unfetchedPages: unfetchedPages
             )
             // A placeholder has no page to prepare: `nil` stands for it.
             let placeholder = drawn.unfetched && unfetchedPages == .placeholder
@@ -612,6 +638,10 @@ public struct NotebookRenderer: Sendable {
     /// its declared sheet, its attachments, its lost blocks — is taken where
     /// the page is parsed, so a page `keep` lets go is gone before the next
     /// is read.
+    ///
+    /// `spool` keeps the bytes of every page that parsed, for a drawing that
+    /// parses them again (`page(_:documentID:position:spool:…)`), and goes
+    /// back with the walk.
     private func walk<Kept: Sendable>(
         documentID: String,
         index: DocumentFiles,
@@ -623,6 +653,7 @@ public struct NotebookRenderer: Sendable {
         onMissingImages: @Sendable (_ pages: Int, _ images: Int) -> Void,
         onUnsupported: @Sendable (_ pages: Int) -> Void,
         onUnreadable: @Sendable (_ pages: Int) -> Void,
+        spool: PageSpool?,
         keep: @escaping @Sendable (RMPage) -> Kept
     ) async throws -> Walk<Kept> {
         let pageEntries = index.files.filter { $0.fileExtension == "rm" }
@@ -661,7 +692,8 @@ public struct NotebookRenderer: Sendable {
                 fetchFailures: [:],
                 pageIDs: [nil],
                 documentPageCount: 0,
-                total: 1
+                total: 1,
+                spool: nil
             )
         }
 
@@ -761,6 +793,7 @@ public struct NotebookRenderer: Sendable {
                 // silence — the version travels back with it.
                 do {
                     let page = try await parse(data)
+                    spool?.put(data, at: job.position)
                     return (Measured(page.with(templateName: job.template), keep), nil)
                 } catch let error as CancellationError {
                     // Not a page that would not parse: the render was given
@@ -883,7 +916,8 @@ public struct NotebookRenderer: Sendable {
             fetchFailures: fetchFailures,
             pageIDs: layout.pages.map { $0.entry?.fileBaseName },
             documentPageCount: layout.documentPageCount,
-            total: total
+            total: total,
+            spool: spool
         )
     }
 
