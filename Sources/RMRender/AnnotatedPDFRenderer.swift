@@ -83,14 +83,19 @@ public struct AnnotatedPDFRenderer: Sendable {
     /// (`overlayUnits`): `Self.nativeRunPages`, unless a test asks for
     /// another — one, to draw every native Form alone, as a PDF of its own.
     private let nativeRunPages: Int
+    /// Where a render keeps the bytes of the marks between measuring and
+    /// drawing them (`PageSpool`); `nil` for none, which fetches them again
+    /// to draw them — for tests of the drawing without the bytes.
+    private let spooling: PageSpool.Configuration?
 
     public init(blobs: any PageBlobs) {
         self.init(blobs: blobs, nativeRunPages: Self.nativeRunPages)
     }
 
-    init(blobs: any PageBlobs, nativeRunPages: Int) {
+    init(blobs: any PageBlobs, nativeRunPages: Int, spooling: PageSpool.Configuration? = .standard) {
         self.blobs = blobs
         self.nativeRunPages = max(nativeRunPages, 1)
+        self.spooling = spooling
     }
 
     /// The document's pages, each the original page with its marks over it,
@@ -248,10 +253,15 @@ public struct AnnotatedPDFRenderer: Sendable {
         // Measured, not kept: every page's marks are parsed here for what the
         // drawing has to know before it starts — the sheet, whether there is
         // anything to draw, which attachments to fetch — and let go. They are
-        // parsed again when their page is drawn (`marks(of:at:owner:)`).
+        // parsed again when their page is drawn (`marks(of:at:owner:…)`).
         // Kept, every page's marks stood parsed for the length of the render
         // — about a quarter of a megabyte for a page marked all over, and a
-        // book has thousands of pages.
+        // book has thousands of pages. Their bytes are kept instead, in
+        // `spool`, so that the drawing — the overlay, the redraw, or both
+        // where the overlay declines part of the way — fetches none of them
+        // again: a caller with no cache behind `PageBlobs` downloaded every
+        // page twice.
+        let spool = spooling.map(PageSpool.init)
         let (pages, unfetched) = try await sheets(
             order: order,
             index: index,
@@ -260,6 +270,7 @@ public struct AnnotatedPDFRenderer: Sendable {
             onUnsupported: onUnsupported,
             onUnreadable: onUnreadable,
             unfetchedPages: unfetchedPages,
+            spool: spool,
             keep: MarkSummary.init
         )
         let total = originalBytes + Int64(pages.count)
@@ -286,7 +297,8 @@ public struct AnnotatedPDFRenderer: Sendable {
         let missed = PageLedger()
         let marks: @Sendable (Int) async throws -> RMPage? = { [self] position in
             try await self.marks(
-                of: pages[position], at: position, owner: documentID, missed: missed, unfetchedPages: unfetchedPages
+                of: pages[position], at: position, owner: documentID, spool: spool, missed: missed,
+                unfetchedPages: unfetchedPages
             )
         }
         // The pages drawn with the label: those whose marks did not arrive
@@ -320,7 +332,7 @@ public struct AnnotatedPDFRenderer: Sendable {
                     onCertificationDropped()
                 }
                 // An overlay that declined part of the way through may have
-                // missed pages the redraw now fetches afresh: what counts is
+                // missed pages the redraw now reads afresh: what counts is
                 // what the document that goes out lacks.
                 missed.clear()
                 try await Self.redraw(
@@ -686,18 +698,20 @@ public struct AnnotatedPDFRenderer: Sendable {
     }
 
     /// The marks of a page, parsed again for the drawing: the render measured
-    /// them once (`sheets`) and kept no more than a `MarkSummary`. The same
-    /// bytes parse the same way, so a page whose marks were read then are
-    /// read now; bytes that are no longer what they were fail the render
-    /// rather than quietly losing the ink.
+    /// them once (`sheets`) and kept no more than a `MarkSummary` — and their
+    /// bytes, in `spool`, where it could. Bytes the spool did not keep are
+    /// fetched again, and are the same bytes — a blob is named by its hash.
+    /// The same bytes parse the same way, so a page whose marks were read
+    /// then are read now; bytes that are no longer what they were fail the
+    /// render rather than quietly losing the ink.
     ///
-    /// Bytes that do not arrive at all — a cache emptied since the measuring,
-    /// a connection dropped — are the page's loss and no more: `nil`, with
-    /// the page put down in `missed` for the tally `renderPDF` reports —
-    /// unless `unfetchedPages` is `.strict`, when they are the render's
-    /// `PageFetchError`.
+    /// Bytes fetched again that do not arrive at all — a cache emptied since
+    /// the measuring, a connection dropped — are the page's loss and no
+    /// more: `nil`, with the page put down in `missed` for the tally
+    /// `renderPDF` reports — unless `unfetchedPages` is `.strict`, when they
+    /// are the render's `PageFetchError`.
     private func marks(
-        of sheet: Sheet<MarkSummary>, at position: Int, owner: String, missed: PageLedger,
+        of sheet: Sheet<MarkSummary>, at position: Int, owner: String, spool: PageSpool?, missed: PageLedger,
         unfetchedPages: UnfetchedPagePolicy
     ) async throws -> RMPage? {
         guard sheet.marks != nil, let entry = sheet.entry else {
@@ -705,7 +719,11 @@ public struct AnnotatedPDFRenderer: Sendable {
         }
         let data: Data
         do {
-            data = try await blob(entry, owner: owner)
+            if let kept = spool?.data(at: position) {
+                data = kept
+            } else {
+                data = try await blob(entry, owner: owner)
+            }
         } catch let error where !RenderWork.isCancellation(error) {
             RMRenderLog.pageError(
                 "annotated: marks on page \(position) did not arrive to be drawn: \(String(describing: error))"
@@ -1194,6 +1212,9 @@ public struct AnnotatedPDFRenderer: Sendable {
     /// turns the first such failure into the call's `PageFetchError`, and
     /// without a policy it is the whole call's as it stands, as it always
     /// was.
+    ///
+    /// `spool` keeps the bytes of every page whose marks parsed, by
+    /// position, for a drawing that parses them again.
     private func sheets<Marks: Sendable>(
         order: [PageOrder.Page],
         index: DocumentFiles,
@@ -1202,6 +1223,7 @@ public struct AnnotatedPDFRenderer: Sendable {
         onUnsupported: @escaping @Sendable (_ pages: Int) -> Void = { _ in },
         onUnreadable: @escaping @Sendable (_ pages: Int) -> Void = { _ in },
         unfetchedPages: UnfetchedPagePolicy? = nil,
+        spool: PageSpool? = nil,
         keep: @escaping @Sendable (RMPage) -> Marks
     ) async throws -> (sheets: [Sheet<Marks>], unfetched: Set<Int>) {
         // A record per page, found once. Searching the index for every page
@@ -1258,6 +1280,7 @@ public struct AnnotatedPDFRenderer: Sendable {
             // the original still goes out, only without its marks.
             do {
                 let page = try await parse(data)
+                spool?.put(data, at: job.position)
                 return ((keep(page), page.paperSize, page.skippedBlocks), nil)
             } catch let error as CancellationError {
                 // A render given up on, not marks that would not parse.

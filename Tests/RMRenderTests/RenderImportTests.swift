@@ -406,9 +406,11 @@ private func notebookDocument(pages count: Int) -> NotebookFixture {
 }
 
 /// Where a render reads its last page, and so where a test can hold it: a
-/// notebook's PDF, and an imported PDF's redraw, read every written page
+/// notebook's PDF, and an imported PDF's redraw, parse every written page
 /// twice — once to measure the document, and again as the drawing comes to
-/// it.
+/// it. The second parse reads the bytes the measuring kept (`PageSpool`),
+/// so a render held at the drawing's read is one without a spool, which
+/// fetches each page again to draw it.
 enum LastPageRead: Sendable {
     /// The measuring read. Nothing is drawn yet, and no drawing task exists.
     case measuring
@@ -421,6 +423,15 @@ enum LastPageRead: Sendable {
         switch self {
         case .measuring: 0
         case .drawing: 1
+        }
+    }
+
+    /// The spool a render held here keeps its pages in: none, where the
+    /// drawing has to read them.
+    var spooling: PageSpool.Configuration? {
+        switch self {
+        case .measuring: .standard
+        case .drawing: nil
         }
     }
 }
@@ -464,7 +475,9 @@ private func cancelledRender(
     }
     let unreadable = Flag()
     let render = Task {
-        try await body(NotebookRenderer(blobs: blobs), fixture.index) { _ in unreadable.raise() }
+        try await body(NotebookRenderer(blobs: blobs, spooling: read.spooling), fixture.index) { _ in
+            unreadable.raise()
+        }
     }
     await gate.waitForArrival()
     render.cancel()
@@ -656,7 +669,9 @@ func aCancelledAnnotatedRenderLeavesNothing(at read: LastPageRead) async throws 
     let render = Task {
         // The overlay switched off: it is the redraw that writes a file of its
         // own page by page, and the redraw that has to clean up after itself.
-        try await AnnotatedPDFRenderer(blobs: blobs).renderPDF(
+        try await AnnotatedPDFRenderer(
+            blobs: blobs, nativeRunPages: AnnotatedPDFRenderer.nativeRunPages, spooling: read.spooling
+        ).renderPDF(
             documentID: "doc-1",
             index: fixture.index,
             to: output,

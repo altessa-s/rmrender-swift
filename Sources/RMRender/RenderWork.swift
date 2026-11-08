@@ -52,9 +52,9 @@ enum RenderWork {
     /// where the page is fetched and parsed. Pages are handed to the drawing
     /// in their order, so one slow page holds back the window behind it; at
     /// eight pages a notebook written full kept half of fourteen cores busy,
-    /// and took twice as long as at one a core. The pages fetched here were
-    /// fetched once already to be measured, out of the caller's cache where
-    /// it keeps one.
+    /// and took twice as long as at one a core. The bytes of the pages
+    /// parsed here were fetched once already, to be measured, and are taken
+    /// back out of the render's `PageSpool` rather than fetched again.
     static let inkConcurrency = max(pageConcurrency, ProcessInfo.processInfo.activeProcessorCount)
 
     /// Heavy, actor-free computation, run so that cancelling the caller
